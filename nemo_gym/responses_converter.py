@@ -664,7 +664,14 @@ class ResponsesConverter(BaseModel):
 
         content = message_dict.get("content") or ""
         refusal = message_dict.get("refusal") or ""
-        if self.uses_reasoning_parser:
+        # Provider-parsed reasoning is already separate from visible content.
+        # Preserve it even when extracting inline think tags is disabled.
+        reasoning_content = message_dict.get("reasoning_content")
+        if not isinstance(reasoning_content, str):
+            reasoning_content = message_dict.get("reasoning")
+        if isinstance(reasoning_content, str):
+            reasoning_matches = [reasoning_content]
+        elif self.uses_reasoning_parser:
             reasoning_matches, content = self._extract_reasoning_from_content(content)
         else:
             reasoning_matches = []
