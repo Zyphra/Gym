@@ -1,0 +1,19 @@
+config_paths:
+  - resources_servers/terminus_judge/configs/terminus_judge_string_only.yaml
+
+# String-only Terminus grading with per-command scoring. Use in place of
+# terminus_judge_string_only.yaml; server and agent names are unchanged, so rows
+# with agent_ref terminus_judge_string_only_simple_agent are graded by this mode.
+#
+# - json_extraction terminus_2: the answer is the JSON object the Terminus-2 harness
+#   would execute, so code fences and surrounding prose no longer zero the reward.
+# - command_scoring command_match: each reference command must match a predicted
+#   command in order (threshold 0.9 per command, after whitespace and quote
+#   normalization), with at most 2 extra commands; a one-command reference also
+#   passes when the predicted first command matches it.
+terminus_judge_string_only_resources_server:
+  resources_servers:
+    terminus_judge:
+      json_extraction: terminus_2
+      command_scoring: command_match
+      command_match_max_extra_commands: 2

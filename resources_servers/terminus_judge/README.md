@@ -9,6 +9,21 @@ For each verification request, the agent's JSON output is validated through mult
 4. **Command Correctness**: The predicted keystrokes must exactly match the expected keystrokes in order
   - This is evaluated via string similarity and equivalency llm-as-judge
 
+Two options change steps 1 and 4; both default to the strict behaviour above.
+
+- `json_extraction: terminus_2` reads the JSON object the Terminus-2 harness would
+  execute: the first balanced top-level object, so code fences, leading prose and
+  trailing text are tolerated. Truncated or otherwise invalid JSON still fails.
+- `command_scoring: command_match` compares commands one by one instead of the
+  concatenated keystrokes. Keystrokes are normalized to shell tokens (whitespace and
+  equivalent quoting removed) and two commands match at `threshold` similarity. A
+  prediction passes when every reference command matches in order with at most
+  `command_match_max_extra_commands` (default 2) extra commands, or when the
+  reference is a single command and the predicted first command matches it.
+
+`configs/terminus_judge_string_only_command_match.yaml` enables both on the
+string-only server and replaces `configs/terminus_judge_string_only.yaml`.
+
 
 ## Supported Schemas
 

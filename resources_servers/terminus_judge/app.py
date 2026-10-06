@@ -15,10 +15,11 @@
 import asyncio
 import json
 import logging
+import shlex
 from contextlib import nullcontext
 from difflib import SequenceMatcher
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import FastAPI
 from openapi_schema_validator import validate as validate_against_schema_openapi
@@ -111,6 +112,123 @@ def command_similarity(gt: Dict[str, Any], pred: Dict[str, Any], separator: str 
     return text_similarity(gt_concat, pred_concat)
 
 
+def extract_json_object(text: str) -> Optional[Any]:
+    """Parse the JSON object a Terminus-2 harness would act on.
+
+    Whole-text JSON is used as is. Otherwise the first balanced top-level ``{...}``
+    is taken, scanning with string and escape awareness exactly like the Terminus-2
+    harness parser (``TerminusJSONPlainParser._extract_json_content``), so code
+    fences, leading prose and trailing text are tolerated. If that span does not
+    parse (an unbalanced quote in the prose shifts the scan), the first object with
+    a ``commands`` field that decodes from any ``{`` is used. Returns None when none
+    decodes; truncated objects are not repaired.
+    """
+    try:
+        whole = json.loads(text)
+    except json.JSONDecodeError:
+        whole = None
+    if isinstance(whole, dict):
+        return whole
+    start, depth, in_string, escaped = -1, 0, False, False
+    for i, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            in_string = not in_string
+        elif not in_string and char == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif not in_string and char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start : i + 1])
+                except json.JSONDecodeError:
+                    break
+    decoder = json.JSONDecoder()
+    position = text.find("{")
+    while position != -1:
+        try:
+            value, _ = decoder.raw_decode(text, position)
+        except json.JSONDecodeError:
+            position = text.find("{", position + 1)
+            continue
+        if isinstance(value, dict) and "commands" in value:
+            return value
+        position = text.find("{", position + 1)
+    return None
+
+
+def normalize_keystrokes(keystrokes: str) -> str:
+    """Shell-token form of one command: whitespace runs and equivalent quoting removed.
+
+    ``cat 'a b'``, ``cat "a b"`` and ``cat  a\\ b`` normalize alike, and operators
+    such as ``;`` or ``|`` become their own tokens regardless of spacing. Text the
+    shell lexer rejects (an unbalanced quote, a bare quote keystroke) falls back to
+    collapsed whitespace.
+    """
+    stripped = keystrokes.strip()
+    lexer = shlex.shlex(stripped, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        return "\x1f".join(lexer)
+    except ValueError:
+        return " ".join(stripped.split())
+
+
+ENTER = "<enter>"
+
+
+def command_list(data: Dict[str, Any]) -> List[str]:
+    """Normalized commands of a batch, as the terminal receives them.
+
+    Waits (keystrokes without a newline or text) are dropped. A bare Enter is sent
+    right after the previous keystrokes, so it joins the previous command
+    (``['"', '\\n']`` is ``['"\\n']``); at the start of a batch it is its own
+    ``<enter>`` command.
+    """
+    commands: List[str] = []
+    for keystrokes in extract_keystrokes(data):
+        if keystrokes.strip():
+            commands.append(normalize_keystrokes(keystrokes))
+        elif "\n" in keystrokes and not commands:
+            commands.append(ENTER)
+    return commands
+
+
+def command_match(gt: Dict[str, Any], pred: Dict[str, Any], threshold: float, max_extra_commands: int) -> bool:
+    """Per-command comparison of a predicted batch against the reference batch.
+
+    Commands come from ``command_list``. Two commands match when their
+    SequenceMatcher ratio is at least ``threshold``. A prediction that declares the
+    task complete when the reference does not never passes. Otherwise it passes when
+
+    - the reference issues no command and neither does the prediction; or
+    - every reference command matches a prediction command in order, and the
+      prediction adds at most ``max_extra_commands`` unmatched commands; or
+    - the reference is one command and the prediction's first command matches it.
+    """
+    if (pred.get("task_complete") or pred.get("is_task_complete")) and not (
+        gt.get("task_complete") or gt.get("is_task_complete")
+    ):
+        return False
+    gt_commands = command_list(gt)
+    pred_commands = command_list(pred)
+    if not gt_commands:
+        return not pred_commands
+    if len(gt_commands) == 1 and pred_commands and text_similarity(gt_commands[0], pred_commands[0]) >= threshold:
+        return True
+    matched = 0
+    for command in pred_commands:
+        if matched < len(gt_commands) and text_similarity(gt_commands[matched], command) >= threshold:
+            matched += 1
+    return matched == len(gt_commands) and len(pred_commands) - matched <= max_extra_commands
+
+
 def check_task_complete(pred: dict, expected_answer: dict) -> bool:
     """Check if task completion flags are properly set."""
     if "task_complete" in expected_answer and expected_answer["task_complete"]:
@@ -201,6 +319,19 @@ class TerminusJudgeResourcesServerConfig(BaseResourcesServerConfig):
     enable_string_similarity: bool = False
     string_similarity_threshold: float = 0.95
     enable_llm_judge: bool = True
+
+    # How the model's JSON answer is located in the text after </think>.
+    # - strict: the whole text must be one JSON value.
+    # - terminus_2: the object the Terminus-2 harness would execute (extract_json_object);
+    #   code fences, leading prose and trailing text are tolerated.
+    json_extraction: Literal["strict", "terminus_2"] = "strict"
+    # How string similarity compares command batches.
+    # - concatenated: one SequenceMatcher ratio over all keystrokes joined.
+    # - command_match: also pass batches that command_match accepts (threshold applied per
+    #   command); similarity_score stays the concatenated ratio.
+    command_scoring: Literal["concatenated", "command_match"] = "concatenated"
+    # command_match only: unmatched prediction commands allowed beside a full in-order match.
+    command_match_max_extra_commands: int = 2
 
 
 class TerminusJudgeRunRequest(BaseRunRequest):
@@ -350,9 +481,14 @@ class TerminusJudgeResourcesServer(SimpleResourcesServer):
             return _build_response(expected_str=expected, model_output_str=text)
 
         # Parse model prediction
-        try:
-            pred = json.loads(text)
-        except json.JSONDecodeError:
+        if self.config.json_extraction == "terminus_2":
+            pred = extract_json_object(text)
+        else:
+            try:
+                pred = json.loads(text)
+            except json.JSONDecodeError:
+                pred = None
+        if pred is None:
             logger.info(f"terminus_judge verify | uuid={body.uuid} model output is not valid JSON")
             failure_reason = FailureCode.MODEL_OUTPUT_INVALID
             return _build_response(expected_str=expected, model_output_str=text)
@@ -408,14 +544,20 @@ class TerminusJudgeResourcesServer(SimpleResourcesServer):
 
             # Step 1: String similarity check (if enabled)
             if self.config.enable_string_similarity:
-                similarity_score = command_similarity(expected_dict, pred)
                 threshold = body.threshold if body.threshold is not None else self.config.string_similarity_threshold
+                similarity_score = command_similarity(expected_dict, pred)
+                similarity_passed = similarity_score >= threshold
+                if not similarity_passed and self.config.command_scoring == "command_match":
+                    similarity_passed = command_match(
+                        expected_dict, pred, threshold, self.config.command_match_max_extra_commands
+                    )
                 logger.info(
                     f"terminus_judge verify | uuid={body.uuid} "
-                    f"string_similarity={similarity_score:.4f} threshold={threshold}"
+                    f"string_similarity={similarity_score:.4f} threshold={threshold} "
+                    f"command_scoring={self.config.command_scoring}"
                 )
 
-                if similarity_score >= threshold:
+                if similarity_passed:
                     # String similarity passed - reward 1.0, skip judge
                     string_similarity_passed = True
                     reward = 1.0
