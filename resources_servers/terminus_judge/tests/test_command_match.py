@@ -171,10 +171,6 @@ class TestCommandMatch:
         assert command_match(answer("\n"), answer(), 0.9, 2) is False
         assert command_match(answer("\n", "cat db/init.sql\n"), answer("C-c", "cat db/init.sql\n"), 0.9, 2) is False
 
-    def test_premature_task_complete_never_passes(self):
-        assert command_match(answer("ls\n"), answer("ls\n", task_complete=True), 0.9, 2) is False
-        assert command_match(answer(task_complete=True), answer(task_complete=True), 0.9, 2) is True
-
 
 class TestVerifyModes:
     @pytest.mark.asyncio
@@ -212,11 +208,37 @@ class TestVerifyModes:
         assert response.similarity_score >= 0.9
 
     @pytest.mark.asyncio
-    async def test_task_complete_still_required(self):
-        gt = answer(task_complete=True)
-        lenient = server(**COMMAND_MATCH)
-        response = await lenient.verify(request(json.dumps(answer()), gt))
+    @pytest.mark.parametrize(
+        "model_output",
+        [
+            "```json\n" + json.dumps(answer("ls\n", task_complete=True)) + "\n```",
+            json.dumps(answer("ls\n", task_complete=True)),
+            json.dumps(answer("ls\n", "cat f\n", task_complete=True)),
+        ],
+        ids=["fenced-exact", "exact", "superset"],
+    )
+    async def test_premature_task_complete_fails_every_scoring_path(self, model_output):
+        gt = answer("ls\n", task_complete=False)
+        response = await server(**COMMAND_MATCH).verify(request(model_output, gt))
+        assert response.reward == 0.0
+        assert response.task_complete_check_passed is False
         assert response.failure_reason == FailureCode.TASK_COMPLETE_CHECK_FAILED
+
+    @pytest.mark.asyncio
+    async def test_strict_mode_keeps_one_way_completion_check(self):
+        gt = answer("ls\n", task_complete=False)
+        response = await server().verify(request(json.dumps(answer("ls\n", task_complete=True)), gt))
+        assert response.reward == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", [{}, COMMAND_MATCH], ids=["strict", "command_match"])
+    async def test_reference_completion_requires_model_completion(self, mode):
+        gt = answer(task_complete=True)
+        missing = await server(**mode).verify(request(json.dumps(answer()), gt))
+        assert missing.reward == 0.0
+        assert missing.failure_reason == FailureCode.TASK_COMPLETE_CHECK_FAILED
+        both = await server(**mode).verify(request(json.dumps(answer(task_complete=True)), gt))
+        assert both.reward == 1.0
 
 
 def gt_keys(gt: dict) -> list[str]:

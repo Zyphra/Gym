@@ -204,18 +204,13 @@ def command_match(gt: Dict[str, Any], pred: Dict[str, Any], threshold: float, ma
     """Per-command comparison of a predicted batch against the reference batch.
 
     Commands come from ``command_list``. Two commands match when their
-    SequenceMatcher ratio is at least ``threshold``. A prediction that declares the
-    task complete when the reference does not never passes. Otherwise it passes when
+    SequenceMatcher ratio is at least ``threshold``. The prediction passes when
 
     - the reference issues no command and neither does the prediction; or
     - every reference command matches a prediction command in order, and the
       prediction adds at most ``max_extra_commands`` unmatched commands; or
     - the reference is one command and the prediction's first command matches it.
     """
-    if (pred.get("task_complete") or pred.get("is_task_complete")) and not (
-        gt.get("task_complete") or gt.get("is_task_complete")
-    ):
-        return False
     gt_commands = command_list(gt)
     pred_commands = command_list(pred)
     if not gt_commands:
@@ -229,14 +224,21 @@ def command_match(gt: Dict[str, Any], pred: Dict[str, Any], threshold: float, ma
     return matched == len(gt_commands) and len(pred_commands) - matched <= max_extra_commands
 
 
-def check_task_complete(pred: dict, expected_answer: dict) -> bool:
-    """Check if task completion flags are properly set."""
+def check_task_complete(pred: dict, expected_answer: dict, two_way: bool = False) -> bool:
+    """Check if task completion flags are properly set.
+
+    A reference that completes the task requires the prediction to complete it.
+    With ``two_way``, a prediction that completes the task also requires the
+    reference to complete it.
+    """
     if "task_complete" in expected_answer and expected_answer["task_complete"]:
         if "task_complete" not in pred or not pred["task_complete"]:
             return False
     elif "is_task_complete" in expected_answer and expected_answer["is_task_complete"]:
         if "is_task_complete" not in pred or not pred["is_task_complete"]:
             return False
+    elif two_way and (pred.get("task_complete") or pred.get("is_task_complete")):
+        return False
     return True
 
 
@@ -328,7 +330,8 @@ class TerminusJudgeResourcesServerConfig(BaseResourcesServerConfig):
     # How string similarity compares command batches.
     # - concatenated: one SequenceMatcher ratio over all keystrokes joined.
     # - command_match: also pass batches that command_match accepts (threshold applied per
-    #   command); similarity_score stays the concatenated ratio.
+    #   command); similarity_score stays the concatenated ratio. A prediction that declares
+    #   the task complete when the reference does not fails the task_complete check.
     command_scoring: Literal["concatenated", "command_match"] = "concatenated"
     # command_match only: unmatched prediction commands allowed beside a full in-order match.
     command_match_max_extra_commands: int = 2
@@ -529,8 +532,8 @@ class TerminusJudgeResourcesServer(SimpleResourcesServer):
             failure_reason = FailureCode.SCHEMA_CHECK_FAILED
             return _build_response(expected_str=expected, model_output_str=text)
 
-        # Task completion check (must pass)
-        if check_task_complete(pred, expected_dict):
+        # Task completion check (must pass); command_match also rejects premature completion
+        if check_task_complete(pred, expected_dict, two_way=self.config.command_scoring == "command_match"):
             task_complete_passed = True
         else:
             task_complete_passed = False
