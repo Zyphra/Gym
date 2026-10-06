@@ -26,7 +26,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.server_utils import BaseServerConfig, ServerClient
 from resources_servers.terminus_judge.app import (
     ENTER,
     FailureCode,
@@ -254,3 +254,47 @@ def test_command_match_config_overrides_string_only_server():
     config = TerminusJudgeResourcesServerConfig(host="h", port=1, name="n", **OmegaConf.to_container(fields))
     assert (config.json_extraction, config.command_scoring) == ("terminus_2", "command_match")
     assert config.string_similarity_threshold == 0.9 and not config.enable_llm_judge
+
+
+# The integrator's native verify controls for the premature-completion guard (job 148417):
+# one `ls` reference that does not complete the task, graded with a real ServerClient.
+GUARD_CASES = [
+    # (options, case, expected reward)
+    ({}, "plain_correct", 1.0),
+    ({}, "fenced_correct", 0.0),
+    ({}, "fenced_premature_completion", 0.0),
+    (COMMAND_MATCH, "plain_correct", 1.0),
+    (COMMAND_MATCH, "fenced_correct", 1.0),
+    (COMMAND_MATCH, "fenced_premature_completion", 0.0),
+    ({}, "strict_default_fenced_correct", 0.0),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("options", "case", "reward"),
+    GUARD_CASES,
+    ids=[("command_match-" if o else "strict-") + c for o, c, _ in GUARD_CASES],
+)
+async def test_native_verify_completion_guard_controls(options, case, reward):
+    expected = answer("ls\n")
+    text = json.dumps(answer("ls\n", task_complete=case == "fenced_premature_completion"))
+    if case != "plain_correct":
+        text = "```json\n" + text + "\n```"
+    config = TerminusJudgeResourcesServerConfig(
+        host="127.0.0.1",
+        port=21002,
+        entrypoint="",
+        name="terminus_guard",
+        enable_string_similarity=True,
+        string_similarity_threshold=0.9,
+        enable_llm_judge=False,
+        **(dict(options, command_match_max_extra_commands=2) if options else {}),
+    )
+    client = ServerClient(
+        head_server_config=BaseServerConfig(host="127.0.0.1", port=21001, entrypoint="", name="fixture_head"),
+        global_config_dict=OmegaConf.create({}),
+    )
+    result = await TerminusJudgeResourcesServer(config=config, server_client=client).verify(request(text, expected))
+    assert result.reward == reward
+    assert not result.judge_evaluations
