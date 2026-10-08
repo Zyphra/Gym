@@ -115,6 +115,12 @@ from tool_sandbox.roles.openai_api_user import OpenAIAPIUser  # noqa: E402
 from tool_sandbox.scenarios import named_scenarios  # noqa: E402
 
 
+class _AgentObservationRole(BaseRole):
+    """Use ToolSandbox's role visibility authority for policy observations."""
+
+    role_type = RoleType.AGENT
+
+
 # Smoke-test subset — same names upstream used with the ``--test_mode`` flag.
 _TEST_SCENARIO_NAMES = [
     "send_message_with_contact_content_cellular_off_multiple_user_turn",
@@ -307,14 +313,15 @@ class ToolSandboxResourcesServer(SimpleResourcesServer):
             .sort("sandbox_message_index")
         )
         obs: List[NeMoGymEasyInputMessage] = []
-        for row in db.to_dicts():
-            if row["sender"] == RoleType.SYSTEM:
+        messages = [Message(**row) for row in db.drop("sandbox_message_index").to_dicts()]
+        for message in _AgentObservationRole.filter_messages(messages):
+            if message.sender == RoleType.SYSTEM:
                 role = "system"
-            elif row["sender"] == RoleType.USER:
+            elif message.sender == RoleType.USER:
                 role = "user"
             else:
                 continue
-            obs.append(NeMoGymEasyInputMessage(role=role, content=row["content"]))
+            obs.append(NeMoGymEasyInputMessage(role=role, content=message.content))
         return obs
 
     def _seed_tools(self, ctx: ExecutionContext) -> List[FunctionToolParam]:
@@ -460,16 +467,17 @@ class ToolSandboxResourcesServer(SimpleResourcesServer):
             .sort("sandbox_message_index")
         )
         obs: List[Any] = []
-        for row in db.to_dicts():
-            if row["sender"] == RoleType.EXECUTION_ENVIRONMENT:
+        messages = [Message(**row) for row in db.drop("sandbox_message_index").to_dicts()]
+        for message in _AgentObservationRole.filter_messages(messages):
+            if message.sender == RoleType.EXECUTION_ENVIRONMENT:
                 obs.append(
                     NeMoGymFunctionCallOutput(
-                        call_id=row["openai_tool_call_id"] or "call",
-                        output=row["content"] or "",
+                        call_id=message.openai_tool_call_id or "call",
+                        output=message.content or "",
                     )
                 )
-            elif row["sender"] == RoleType.USER:
-                obs.append(NeMoGymEasyInputMessage(role="user", content=row["content"] or ""))
+            elif message.sender == RoleType.USER:
+                obs.append(NeMoGymEasyInputMessage(role="user", content=message.content or ""))
         return obs
 
     # ------------------------------------------------------------------
