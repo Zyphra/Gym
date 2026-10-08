@@ -136,7 +136,7 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
         # Once a seeded record is removed, reusing its ID does not restore its
         # identity. Track this per replay so delete/create order can also vary.
         for name, (frame, id_column) in _state_tables(tool_env).items():
-            if id_column is not None and action["name"].startswith(name + "_"):
+            if id_column is not None and action.get("name", "").startswith(name + "_"):
                 tool_env["stable_ids"][name].intersection_update(frame[id_column])
     return tool_env
 
