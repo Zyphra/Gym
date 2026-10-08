@@ -25,7 +25,7 @@ import jsonschema.validators
 from aiohttp import ClientConnectionError, ClientResponseError
 from fastapi import FastAPI, HTTPException, Request
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -36,12 +36,14 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import ModelServerRef
+from nemo_gym.judge import JudgeError, judge_failsafe
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY, get_response_json, raise_for_status, rollout_path_prefix
+from nemo_gym.telemetry.endpoints import traced_verify_endpoint
 
 
 TRAJECTORY_COMPLETE_INDICATOR = "###STOP###"
@@ -129,6 +131,22 @@ class ConversationalToolUseSimulationConfig(BaseResourcesServerConfig):
     enable_termination: bool = True
     verification_type: VerificationType = VerificationType.MESSAGE
     enforce_transfer_ground_truth: bool = False
+    enable_agent_step_verification: bool = False
+    agent_step_verdict_format: Literal["stock_schema", "evaluation_instance_v1"] = "stock_schema"
+    agent_step_verification_timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_agent_step_judge(self):
+        if not self.enable_agent_step_verification and self.agent_step_verdict_format != "stock_schema":
+            raise ValueError("Agent-step verdict format requires agent-step verification.")
+        if self.enable_agent_step_verification:
+            if self.judge_model_server is None or "judge_responses_create_params" not in self.model_fields_set:
+                raise ValueError("Agent-step verification requires explicit judge reference and settings.")
+            settings = self.judge_responses_create_params.model_dump()
+            fields = ("instructions", "previous_response_id", "prompt", "conversation")
+            if any(settings.get(key) is not None for key in fields) or settings.get("input"):
+                raise ValueError("Agent-step judge settings must be stateless and contain no context.")
+        return self
 
 
 class CustomerScenario(BaseModel):
@@ -221,6 +239,17 @@ class VerificationResult(BaseModel):
     judge_response: Optional[str] = None
     generation_error: Optional[str] = None
     responses: Optional[List[Dict[str, Any]]] = None
+
+
+class PreparedAgentStepJudge(BaseModel):
+    judge_params: Optional[NeMoGymResponseCreateParamsNonStreaming] = None
+    verification_result: Optional[VerificationResult] = None
+
+
+class AgentStepVerifyResponse(BaseVerifyResponse):
+    verification_result: VerificationResult
+    judge_request: Optional[NeMoGymResponseCreateParamsNonStreaming] = None
+    judge_settings: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentVerificationResult(BaseModel):
@@ -704,8 +733,215 @@ Return type in JSON Schema format: {return_type}
         app.post("/next_user_message")(self.next_user_message)
         app.post("/execute_agent_tool_call")(self.execute_agent_tool_call)
         app.post("/discard_session")(self.discard_session)
+        app.post("/verify_agent_step")(
+            traced_verify_endpoint(
+                judge_failsafe(self.verify_agent_step), static_attributes={"nemo.gym.server.name": self.config.name}
+            )
+        )
         app.post("/{tool_name}")(self.route_tool_call)
         return app
+
+    def mcp_tools(self, harvested, catchall):
+        tools = super().mcp_tools(harvested, catchall)
+        return None if tools is None else [tool for tool in tools if tool.name != "verify_agent_step"]
+
+    def prepare_agent_step_judge_request(self, body: BaseVerifyRequest) -> PreparedAgentStepJudge:
+        """Project one complete native turn into the stock current-step rubric.
+
+        Raw objects remain in the receipt. Argument JSON layout alone is canonicalized;
+        strings, units, numeric values and array order remain. Source schemas must be
+        reviewed: this endpoint reuses synchronous stock validation without hardening it.
+        """
+        if not self.config.enable_agent_step_verification:
+            raise HTTPException(status_code=404, detail="Agent-step verification is disabled.")
+        context = body.responses_create_params.model_dump(mode="json")
+        history = context.pop("input")
+        tools = context.pop("tools", None) or []
+        if not isinstance(history, list) or any(tool.get("type") != "function" for tool in tools):
+            raise JudgeError("Unsupported agent-step source context or tool representation.")
+        instructions = [item for item in history if item.get("role") in {"system", "developer"}]
+        policy = context | {"instruction_messages": instructions}
+        state = ConversationSessionState(
+            domain_name="",
+            policy="",
+            customer_scenario=CustomerScenario(),
+            tool_signatures=[ToolSignature(name=tool["name"], parameters=tool.get("parameters")) for tool in tools],
+        )
+        candidate = []
+        if body.response.status in {"failed", "incomplete", "in_progress"} or body.response.error is not None:
+            return PreparedAgentStepJudge(
+                verification_result=VerificationResult(reward=0, explanation="Incomplete or failed candidate action.")
+            )
+        for item in body.response.model_dump(mode="json")["output"]:
+            if item["type"] == "reasoning":
+                continue
+            if item["type"] == "function_call":
+                message = ConversationMessage(
+                    source=Source.AGENT,
+                    type=MessageType.TOOL_CALL,
+                    tool_name=item["name"],
+                    tool_call_id=item["call_id"],
+                    arguments=item["arguments"],
+                )
+                try:
+                    arguments = json.loads(item["arguments"], object_pairs_hook=self._agent_step_json_object)
+                    json.dumps(arguments, allow_nan=False)
+                except ValueError:
+                    return PreparedAgentStepJudge(
+                        verification_result=VerificationResult(
+                            reward=0, explanation="Invalid candidate JSON arguments."
+                        )
+                    )
+                if self._validate_tool_call_message(state, message):
+                    return PreparedAgentStepJudge(
+                        verification_result=VerificationResult(
+                            reward=0, explanation="Invalid candidate tool name or arguments."
+                        )
+                    )
+                item["arguments"] = arguments
+            elif item["type"] == "message":
+                # Empty text-only transport artifacts are not narration. Refusals,
+                # including empty refusal parts, remain explicit candidate evidence.
+                if all(part["type"] == "output_text" and not part["text"].strip() for part in item["content"]):
+                    continue
+            else:
+                return PreparedAgentStepJudge(
+                    verification_result=VerificationResult(reward=0, explanation="Invalid or empty candidate action.")
+                )
+            candidate.append(item)
+        if not candidate:
+            return PreparedAgentStepJudge(
+                verification_result=VerificationResult(reward=0, explanation="No visible action.")
+            )
+
+        def render(items):
+            steps = []
+            for item in items:
+                content = json.dumps(item, sort_keys=True, ensure_ascii=False)
+                if item.get("type") == "function_call":
+                    step = self.TOOL_CALL_MESSAGE_TEMPLATE.format(
+                        execution_id=item["call_id"], tool_name=item["name"], arguments=content
+                    )
+                elif item.get("type") == "function_call_output":
+                    step = self.TOOL_EXECUTION_MESSAGE_TEMPLATE.format(
+                        execution_id=item["call_id"], execution_result=content
+                    )
+                else:
+                    step = self.TEXT_MESSAGE_TEMPLATE.format(
+                        sender=item.get("role", "Representative"), content=content
+                    )
+                steps.append(step)
+            return "\n\n".join(steps)
+
+        system = self.AGENT_MESSAGE_EVALUATION_SYSTEM_MESSAGE_TEMPLATE.format(
+            policy=json.dumps(policy, sort_keys=True, ensure_ascii=False),
+            tool_definitions="\n".join(
+                "<tool>" + json.dumps(tool, sort_keys=True, ensure_ascii=False) + "</tool>" for tool in tools
+            ),
+            evaluation_schema=json.dumps(Evaluation.model_json_schema()),
+        )
+        if self.config.agent_step_verdict_format == "evaluation_instance_v1":
+            field_types = {
+                name: definition["type"] for name, definition in Evaluation.model_json_schema()["properties"].items()
+            }
+            system += (
+                "\nReturn exactly one JSON object instance with only these fields and types: "
+                + json.dumps(field_types, sort_keys=True)
+                + ". Do not return the JSON Schema itself, a properties wrapper, or additional text."
+            )
+        user = self.MESSAGE_CONVERSATION_TEMPLATE.format(
+            previous_steps=render(
+                [
+                    item
+                    for item in history
+                    if item.get("type") != "reasoning" and item.get("role") not in {"system", "developer"}
+                ]
+            ),
+            current_step=render(candidate),
+        )
+        params = self.config.judge_responses_create_params.model_copy(deep=True)
+        params.input = [
+            NeMoGymEasyInputMessage(role="system", content=system),
+            NeMoGymEasyInputMessage(role="user", content=user),
+        ]
+        params.tools, params.tool_choice, params.parallel_tool_calls = [], "none", False
+        return PreparedAgentStepJudge(judge_params=params)
+
+    @staticmethod
+    def _agent_step_json_object(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError("Duplicate JSON fields are unsupported.")
+        return value
+
+    def _parse_judge_evaluation(self, response: NeMoGymResponse, *, strict_agent_step=False):
+        if strict_agent_step:
+            visible = [item for item in response.output if item.type != "reasoning"]
+            if (
+                response.status != "completed"
+                or response.error is not None
+                or response.incomplete_details is not None
+                or len(visible) != 1
+            ):
+                raise ValueError("Judge response is not a completed supported verdict.")
+            message = visible[0]
+            if (
+                message.type != "message"
+                or message.status != "completed"
+                or len(message.content) != 1
+                or message.content[0].type != "output_text"
+            ):
+                raise ValueError("Unsupported judge output shape.")
+        text = self._strip_json_fence(self._last_text(response))
+        if strict_agent_step:
+            payload = json.loads(text, object_pairs_hook=self._agent_step_json_object)
+            if not isinstance(payload, dict) or set(payload) != {"success", "explanation"}:
+                raise ValueError("Unsupported verdict fields.")
+        return Evaluation.model_validate_json(text, strict=strict_agent_step), text
+
+    def parse_agent_step_judge_response(self, response: NeMoGymResponse) -> VerificationResult:
+        """Strict truth-grading policy, shared by live verification and offline replay."""
+        try:
+            evaluation, text = self._parse_judge_evaluation(response, strict_agent_step=True)
+        except (ValidationError, RuntimeError, ValueError) as exc:
+            raise JudgeError(
+                json.dumps({"reason": type(exc).__name__, "judge_response": response.model_dump(mode="json")})
+            ) from exc
+        return VerificationResult(
+            reward=int(evaluation.success),
+            explanation=evaluation.explanation,
+            judge_response=text,
+            responses=[response.model_dump(mode="json")],
+        )
+
+    async def verify_agent_step(self, body: BaseVerifyRequest) -> AgentStepVerifyResponse:
+        prepared = self.prepare_agent_step_judge_request(body)
+        result = prepared.verification_result
+        if result is None:
+            result = await self._generate_judge_evaluation(
+                Source.AGENT, "", strict_agent_step=True, prepared=prepared, rollout_id=body.capture_rollout_id
+            )
+        return AgentStepVerifyResponse(
+            **body.model_dump(),
+            episode_control=body.episode_control,
+            capture_rollout_id=body.capture_rollout_id,
+            reward=result.reward,
+            verification_result=result,
+            judge_request=prepared.judge_params,
+            judge_settings=self._agent_step_judge_settings(body.capture_rollout_id),
+        )
+
+    def _agent_step_judge_settings(self, rollout_id):
+        return {
+            "judge_model_server": self.config.judge_model_server.model_dump(),
+            "timeout_seconds": self.config.agent_step_verification_timeout_seconds,
+            "judge_provider_attempts": self.config.judge_provider_attempts,
+            "retry_initial_backoff_seconds": self.config.judge_provider_retry_initial_backoff_seconds,
+            "retry_max_backoff_seconds": self.config.judge_provider_retry_max_backoff_seconds,
+            "rollout_id": rollout_id,
+            "strict_agent_step": True,
+            "agent_step_verdict_format": self.config.agent_step_verdict_format,
+        }
 
     async def seed_session(
         self, request: Request, body: ConversationalToolUseSeedSessionRequest
@@ -1871,7 +2107,48 @@ Return type in JSON Schema format: {return_type}
         evaluation_type: Source | TrajectoryEvaluationType,
         user_message: str,
         state: Optional[ConversationSessionState] = None,
+        *,
+        strict_agent_step: bool = False,
+        prepared: Optional[PreparedAgentStepJudge] = None,
+        rollout_id: Optional[str] = None,
     ) -> VerificationResult:
+        if strict_agent_step:
+            if prepared is None or prepared.judge_params is None:
+                raise ValueError("Strict agent-step verification requires its prepared request.")
+            params = prepared.judge_params
+            response = None
+            try:
+                async with asyncio.timeout(self.config.agent_step_verification_timeout_seconds):
+                    response = await self._call_judge_model(
+                        model_server=self.config.judge_model_server,
+                        params=params,
+                        messages=params.input,
+                        rollout_id=rollout_id,
+                    )
+            except Exception as exc:
+                raise JudgeError(
+                    json.dumps(
+                        {
+                            "reason": type(exc).__name__,
+                            "judge_settings": self._agent_step_judge_settings(rollout_id),
+                            "judge_request": params.model_dump(mode="json"),
+                            "cause": str(exc),
+                        }
+                    )
+                ) from exc
+            try:
+                return self.parse_agent_step_judge_response(response)
+            except JudgeError as exc:
+                raise JudgeError(
+                    json.dumps(
+                        {
+                            "judge_request": params.model_dump(mode="json"),
+                            "judge_response": response.model_dump(mode="json"),
+                            "judge_settings": self._agent_step_judge_settings(rollout_id),
+                            "cause": str(exc),
+                        }
+                    )
+                ) from exc
         if self.config.judge_model_server is None:
             raise RuntimeError("judge_model_server is required for LLM trajectory verification.")
         if state is None:
@@ -1892,9 +2169,7 @@ Return type in JSON Schema format: {return_type}
                     rollout_id=state.rollout_id,
                 )
                 response_objects.append(response.model_dump())
-                response_text = self._last_text(response)
-                canonical_text = self._strip_json_fence(response_text)
-                judge_evaluation = Evaluation.model_validate_json(canonical_text)
+                judge_evaluation, canonical_text = self._parse_judge_evaluation(response)
                 reward = 1 if judge_evaluation.success else 0
                 return VerificationResult(
                     reward=reward,

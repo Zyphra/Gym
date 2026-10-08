@@ -1,0 +1,30 @@
+---
+title: "Stateless Agent-Step Verification"
+description: "Reuse the stock conversational current-step verifier for complete native Responses turns."
+position: 8
+---
+
+# Stateless Agent-Step Verification
+
+The conversational resource can verify one complete native Responses turn with its existing AGENT current-step rubric and Evaluation parser. Enable `enable_agent_step_verification: true` and provide explicit `judge_model_server` and empty-context `judge_responses_create_params`. The feature defaults off. `agent_step_verification_timeout_seconds` defaults to a positive finite 120 seconds; provider attempts/backoffs retain their existing explicit settings. Use one provider attempt when a replay requires at most one external call per row.
+
+`POST /verify_agent_step` accepts `BaseVerifyRequest` and returns `AgentStepVerifyResponse` with required stock `verification_result`, original native context/response, the effective typed `judge_request`, and judge settings. It does not create or modify sessions, execute tools, generate user messages, require conversation completion, or advertise the verifier over MCP. Whole-conversation verification retains its existing terminal and parsing behavior.
+
+`agent_step_verdict_format` defaults to `stock_schema`, preserving the existing current-step prompt. The opt-in `evaluation_instance_v1` appends a format clarification derived from stock `Evaluation` fields: return one object instance with the required field types, rather than the schema or a `properties` wrapper. The rubric, source evidence, sampling and strict parser stay the same. The effective format is recorded in `judge_settings`; this setting requires enabled agent-step verification.
+
+The evidence includes instructions and ordered system/developer messages, complete offered tool definitions, complete prior history, and the entire current output including narration, refusals and every call in order. Typed reasoning items and semantically empty text-only message artifacts are excluded from evidence and retained in the original receipt. Blank text artifacts alongside meaningful calls produce the same judge request as those calls alone; refusal parts are never filtered, and an all-empty turn remains policy zero. Candidate argument objects are JSON-decoded and object keys are sorted for equivalent JSON layouts. String/currency/unit content, numeric representations and array order are not normalized. Tool validation reuses the stock native validator. This feature does not provide bounded arbitrary JSONSchema validation or executable state checks; admit only reviewed source contracts. Source-ambiguous tasks require an explicit hold manifest rather than a binary truth label.
+
+Empty actions and invalid candidate names/arguments return policy reward zero without judge traffic. A completed, supported binary `success=false` verdict also returns zero. In this named next-step mode only, transport/timeout, failed or incomplete judge envelopes, unsupported output shapes and malformed verdicts raise native `JudgeError`. The endpoint's native failsafe emits HTTP200 `_ng_failure_class: judge_failed`, preserving the original body plus effective request/settings and actual typed reply in the failure cause. Delegates must inspect this sentinel before parsing a success model. The shared wrapper's judge-failure training mask remains a separate opt-in composition dependency.
+
+Offline calibration uses the production helpers, with no additional judging code:
+
+```python
+prepared = server.prepare_agent_step_judge_request(original_native_verify_request)
+if prepared.verification_result is not None:
+    result = prepared.verification_result  # deterministic policy zero, no judge request
+else:
+    # Submit exactly prepared.judge_params through the native Responses generation path.
+    result = server.parse_agent_step_judge_response(actual_native_judge_response)
+```
+
+`PreparedAgentStepJudge.judge_params` is the full typed effective request. The public strict parser returns stock `VerificationResult` with the actual typed reply retained. Production invokes the same builder/parser once per complete turn; malformed verdicts are not retried. Preserve original source bytes and source hashes outside typed serialization when claiming raw capture equality. Bind receipts to the executed resource source and effective configuration, and qualify the source-reviewed cohort with actual independent judge responses before claiming semantic improvement.
