@@ -500,8 +500,8 @@ class TestNeMoGymChatCompletionSchemas:
         params = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(payload)
         assert params.model_dump(exclude_unset=True) == payload
         assert params.model_dump_json(exclude_unset=True) == (
-            '{"messages":[{"role":"user","content":"Inspect the file."}],'
-            '"tools":[{"type":"function","function":{"name":"inspect"}}]}'
+            '{"messages":[{"content":"Inspect the file.","role":"user"}],'
+            '"tools":[{"function":{"name":"inspect"},"type":"function"}]}'
         )
 
     @pytest.mark.parametrize("response", [None, [], "string", 1, True])
