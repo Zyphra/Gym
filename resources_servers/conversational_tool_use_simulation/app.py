@@ -132,10 +132,12 @@ class ConversationalToolUseSimulationConfig(BaseResourcesServerConfig):
     verification_type: VerificationType = VerificationType.MESSAGE
     enforce_transfer_ground_truth: bool = False
     enable_agent_step_verification: bool = False
-    agent_step_verdict_format: Literal["stock_schema", "evaluation_instance_v1", "evaluation_instance_v3"] = (
-        "stock_schema"
-    )
-    agent_step_evidence_policy: Literal["stock", "grounded_complete_turn_v1", "grounded_complete_turn_v2"] = "stock"
+    agent_step_verdict_format: Literal[
+        "stock_schema", "evaluation_instance_v1", "evaluation_instance_v3", "evaluation_instance_v4"
+    ] = "stock_schema"
+    agent_step_evidence_policy: Literal[
+        "stock", "grounded_complete_turn_v1", "grounded_complete_turn_v2", "grounded_complete_turn_v3"
+    ] = "stock"
     agent_step_verification_timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
@@ -578,7 +580,7 @@ Please output the evaluation of the current step and an explanation for the eval
 {evaluation_schema}"""
     )
 
-    AGENT_MESSAGE_EVALUATION_SYSTEM_MESSAGE_TEMPLATE: ClassVar[str] = (
+    AGENT_MESSAGE_EVALUATION_RUBRIC_TEMPLATE: ClassVar[str] = (
         MESSAGE_SYSTEM_MESSAGE_PREFIX
         + """- The definitions of the tools that are available to the representative for execution are provided below between the <tools> and </tools> tags, with each tool definition appearing between <tool> and </tool> tags.
 
@@ -590,10 +592,12 @@ Please output the evaluation of the current step and an explanation for the eval
 - The representative can either send a message to the customer, or execute a tool.
 - The current step should be considered a success if the action taken by the representative is helpful in addressing the request from the customer.
 - The current step should be considered a failure if the action taken by the representative does not help to handle the customer's request, or is not consistent with the previous steps in the interaction or the policy for handling customer requests.
-- If the current step is the execution of a tool, then the current step should be considered a success if the tool to be executed helps to address the customer's request, the arguments for the tool execution conform to the tool definition, and the arguments are consistent with the previous steps in the conversation.  Otherwise, the current step should be considered a failure.
-
-Please output the evaluation of the current step and an explanation for the evaluation using the following JSON schema:
-{evaluation_schema}"""
+- If the current step is the execution of a tool, then the current step should be considered a success if the tool to be executed helps to address the customer's request, the arguments for the tool execution conform to the tool definition, and the arguments are consistent with the previous steps in the conversation.  Otherwise, the current step should be considered a failure."""
+    )
+    AGENT_MESSAGE_EVALUATION_SYSTEM_MESSAGE_TEMPLATE: ClassVar[str] = (
+        AGENT_MESSAGE_EVALUATION_RUBRIC_TEMPLATE
+        + "\n\nPlease output the evaluation of the current step and an explanation for the evaluation "
+        "using the following JSON schema:\n{evaluation_schema}"
     )
 
     ENVIRONMENT_MESSAGE_EVALUATION_SYSTEM_MESSAGE_TEMPLATE: ClassVar[str] = (
@@ -846,7 +850,12 @@ Return type in JSON Schema format: {return_type}
                 steps.append(step)
             return "\n\n".join(steps)
 
-        system = self.AGENT_MESSAGE_EVALUATION_SYSTEM_MESSAGE_TEMPLATE.format(
+        template = (
+            self.AGENT_MESSAGE_EVALUATION_RUBRIC_TEMPLATE
+            if self.config.agent_step_verdict_format == "evaluation_instance_v4"
+            else self.AGENT_MESSAGE_EVALUATION_SYSTEM_MESSAGE_TEMPLATE
+        )
+        system = template.format(
             policy=json.dumps(policy, sort_keys=True, ensure_ascii=False),
             tool_definitions="\n".join(
                 "<tool>" + json.dumps(tool, sort_keys=True, ensure_ascii=False) + "</tool>" for tool in tools
@@ -857,7 +866,7 @@ Return type in JSON Schema format: {return_type}
                 else json.dumps(Evaluation.model_json_schema())
             ),
         )
-        if self.config.agent_step_evidence_policy in {"grounded_complete_turn_v1", "grounded_complete_turn_v2"}:
+        if self.config.agent_step_evidence_policy != "stock":
             system += (
                 "\nEvaluate the complete current turn, including every nonempty message, refusal, and tool call. "
                 "Success requires every material part to respect the policy, permissions, ordering, and visible evidence. "
@@ -871,7 +880,7 @@ Return type in JSON Schema format: {return_type}
                 "permits them, but cannot replace a required authoritative value or evidence of completed execution. "
                 "Reject a material violation even when another part of the turn is helpful or schema-valid."
             )
-        if self.config.agent_step_evidence_policy == "grounded_complete_turn_v2":
+        if self.config.agent_step_evidence_policy in {"grounded_complete_turn_v2", "grounded_complete_turn_v3"}:
             system += (
                 "\nAudit all material parts of the current turn individually before deciding success. In the "
                 "explanation, identify each policy-sensitive argument or factual/completion claim, its actual support "
@@ -887,6 +896,29 @@ Return type in JSON Schema format: {return_type}
                 "unsupported task-specific claims, contradicted facts, arithmetic, or code invalidate the complete "
                 "turn even if its main action is appropriate. Explain such defects before setting success to false; "
                 "otherwise explain the support for the material claims before setting success to true."
+            )
+        if self.config.agent_step_evidence_policy == "grounded_complete_turn_v3":
+            system += (
+                "\nStart with the supplied system/developer instructions and tool definitions. They own policy "
+                "and argument requirements; earlier assistant claims do not override them. A tool parameter is "
+                "required only if the offered schema or an authoritative instruction requires it. Do not promote "
+                "an optional parameter to a requirement based on earlier assistant speculation. Check constraints "
+                "on the complete turn, including whether the policy prohibits combining narration with calls. "
+                "Then check every narrative and tool-argument content claim, not merely the main lookup. For each "
+                "material claim, cite its supplied support or identify the missing support in the explanation. "
+                "In particular, proposed arithmetic must support the claimed conclusion; a test message does not "
+                "establish future monitoring. Earlier assistant assertions and candidate assertions are evidence "
+                "of what was said, not independent authority that the asserted facts are true."
+            )
+        if self.config.agent_step_verdict_format == "evaluation_instance_v4":
+            fields = Evaluation.model_json_schema()["properties"]
+            names = ("explanation", "success")
+            description = ", ".join(f"{name} ({fields[name]['type']})" for name in names)
+            system += (
+                "\nReturn exactly one JSON object with root keys "
+                + description
+                + ", explanation first. Return the decision itself. Do not use an evaluation key, schema "
+                "metadata, wrappers, tags, or additional text."
             )
         if self.config.agent_step_verdict_format == "evaluation_instance_v3":
             system += (

@@ -508,3 +508,38 @@ def test_instance_v3_preserves_evidence_and_all_transport_fields():
     with pytest.raises(JudgeError):
         server.parse_agent_step_judge_response(judge('{"properties":{"success":true,"explanation":"x"}}'))
     assert server._agent_step_judge_settings(None)["agent_step_verdict_format"] == "evaluation_instance_v3"
+
+
+@pytest.mark.parametrize("policy", ["stock", "grounded_complete_turn_v2", "grounded_complete_turn_v3"])
+def test_instance_v4_preserves_rubric_evidence_transport_and_strict_parser(policy):
+    body = request([message("narration"), tool_call()])
+    original = body.model_dump(mode="json")
+    stock = make_server(agent_step_evidence_policy=policy).prepare_agent_step_judge_request(body).judge_params
+    server = make_server(agent_step_verdict_format="evaluation_instance_v4", agent_step_evidence_policy=policy)
+    prepared = server.prepare_agent_step_judge_request(body).judge_params
+    assert prepared.input[1:] == stock.input[1:]
+    assert prepared.model_dump(exclude={"input"}) == stock.model_dump(exclude={"input"})
+    assert body.model_dump(mode="json") == original
+    expected_rubric = stock.input[0].content.split("\n\nPlease output the evaluation", 1)[0]
+    assert prepared.input[0].content.startswith(expected_rubric + "\n")
+    assert "using the following JSON schema" not in prepared.input[0].content
+    assert server.parse_agent_step_judge_response(judge()).reward == 1
+    assert server.parse_agent_step_judge_response(judge('{"explanation":"violation","success":false}')).reward == 0
+    for text in ['{"evaluation":"x","success":true}', '<evaluation>x</evaluation>{"explanation":"x","success":true}']:
+        with pytest.raises(JudgeError):
+            server.parse_agent_step_judge_response(judge(text))
+
+
+def test_v3_authority_policy_preserves_optional_tool_parameter_and_source_evidence():
+    body = request()
+    tool = body.responses_create_params.tools[0]
+    tool["parameters"]["properties"]["api_key"] = {"type": "string"}
+    body.responses_create_params.input.insert(2, message("I believe all these tools require an API key."))
+    old = make_server(agent_step_evidence_policy="grounded_complete_turn_v2").prepare_agent_step_judge_request(body)
+    server = make_server(agent_step_evidence_policy="grounded_complete_turn_v3")
+    new = server.prepare_agent_step_judge_request(body)
+    assert new.judge_params.input[1:] == old.judge_params.input[1:]
+    assert new.judge_params.model_dump(exclude={"input"}) == old.judge_params.model_dump(exclude={"input"})
+    assert tool["parameters"]["required"] == ["value", "label"]
+    assert body.response.output[0].arguments == '{ "value": 1, "label": "USD 7" }'
+    assert server._agent_step_judge_settings(None)["agent_step_evidence_policy"] == "grounded_complete_turn_v3"
