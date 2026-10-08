@@ -475,3 +475,36 @@ def test_real_asgi_endpoint_uses_failsafe_before_catchall():
         result = client.post("/verify_agent_step", json=request().model_dump(mode="json"))
     assert result.status_code == 200 and result.json()["_ng_failure_class"] == "judge_failed"
     assert result.json()["response"] == request().response.model_dump(mode="json")
+
+
+def test_v2_evidence_audit_preserves_actual_evidence_and_default_settings():
+    body = request([message("all narration"), tool_call()])
+    initial = body.model_dump(mode="json")
+    old = make_server(agent_step_evidence_policy="grounded_complete_turn_v1")
+    new = make_server(agent_step_evidence_policy="grounded_complete_turn_v2")
+    a = old.prepare_agent_step_judge_request(body).judge_params
+    b = new.prepare_agent_step_judge_request(body).judge_params
+    assert b.input[1:] == a.input[1:]
+    assert b.model_dump(exclude={"input"}) == a.model_dump(exclude={"input"})
+    assert body.model_dump(mode="json") == initial
+    assert new._agent_step_judge_settings(None)["agent_step_evidence_policy"] == "grounded_complete_turn_v2"
+    assert make_server().config.agent_step_evidence_policy == "stock"
+    assert make_server().config.agent_step_verdict_format == "stock_schema"
+
+
+def test_instance_v3_preserves_evidence_and_all_transport_fields():
+    from resources_servers.conversational_tool_use_simulation.app import Evaluation
+
+    body = request([message("narration"), tool_call()])
+    original = body.model_dump(mode="json")
+    stock = make_server().prepare_agent_step_judge_request(body).judge_params
+    server = make_server(agent_step_verdict_format="evaluation_instance_v3")
+    prepared = server.prepare_agent_step_judge_request(body).judge_params
+    assert prepared.input[1:] == stock.input[1:]
+    assert prepared.model_dump(exclude={"input"}) == stock.model_dump(exclude={"input"})
+    assert body.model_dump(mode="json") == original
+    assert json.dumps(Evaluation.model_json_schema()) not in prepared.input[0].content
+    assert server.parse_agent_step_judge_response(judge()).reward == 1
+    with pytest.raises(JudgeError):
+        server.parse_agent_step_judge_response(judge('{"properties":{"success":true,"explanation":"x"}}'))
+    assert server._agent_step_judge_settings(None)["agent_step_verdict_format"] == "evaluation_instance_v3"

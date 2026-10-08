@@ -132,8 +132,10 @@ class ConversationalToolUseSimulationConfig(BaseResourcesServerConfig):
     verification_type: VerificationType = VerificationType.MESSAGE
     enforce_transfer_ground_truth: bool = False
     enable_agent_step_verification: bool = False
-    agent_step_verdict_format: Literal["stock_schema", "evaluation_instance_v1"] = "stock_schema"
-    agent_step_evidence_policy: Literal["stock", "grounded_complete_turn_v1"] = "stock"
+    agent_step_verdict_format: Literal["stock_schema", "evaluation_instance_v1", "evaluation_instance_v3"] = (
+        "stock_schema"
+    )
+    agent_step_evidence_policy: Literal["stock", "grounded_complete_turn_v1", "grounded_complete_turn_v2"] = "stock"
     agent_step_verification_timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
@@ -849,9 +851,13 @@ Return type in JSON Schema format: {return_type}
             tool_definitions="\n".join(
                 "<tool>" + json.dumps(tool, sort_keys=True, ensure_ascii=False) + "</tool>" for tool in tools
             ),
-            evaluation_schema=json.dumps(Evaluation.model_json_schema()),
+            evaluation_schema=(
+                "an Evaluation instance with an explanation string and a success boolean"
+                if self.config.agent_step_verdict_format == "evaluation_instance_v3"
+                else json.dumps(Evaluation.model_json_schema())
+            ),
         )
-        if self.config.agent_step_evidence_policy == "grounded_complete_turn_v1":
+        if self.config.agent_step_evidence_policy in {"grounded_complete_turn_v1", "grounded_complete_turn_v2"}:
             system += (
                 "\nEvaluate the complete current turn, including every nonempty message, refusal, and tool call. "
                 "Success requires every material part to respect the policy, permissions, ordering, and visible evidence. "
@@ -864,6 +870,29 @@ Return type in JSON Schema format: {return_type}
                 "actions are allowed. Clearly marked assumptions or conditional proposals are allowed when the policy "
                 "permits them, but cannot replace a required authoritative value or evidence of completed execution. "
                 "Reject a material violation even when another part of the turn is helpful or schema-valid."
+            )
+        if self.config.agent_step_evidence_policy == "grounded_complete_turn_v2":
+            system += (
+                "\nAudit all material parts of the current turn individually before deciding success. In the "
+                "explanation, identify each policy-sensitive argument or factual/completion claim, its actual support "
+                "in the supplied instructions or previous steps, and any contradiction or missing authority. The "
+                "candidate's own assertion is not independent support. An identifier used as a credential is not "
+                "automatically a different identifier required by a tool; tool definitions, instructions, or results "
+                "must establish that mapping. A required authoritative argument cannot be guessed merely to make a "
+                "tool call possible. Inspect narrative claims and the content of messages passed as tool arguments "
+                "as carefully as the tool name. Do not infer recurring service, completed execution, or external "
+                "policy from one successful test or from generally sensible advice. Distinguish a proposed helpful "
+                "lookup or clarification from an unsupported claim that the user's final goal is complete. Several "
+                "different useful next steps may be valid; efficiency preferences are not mandatory policy. Material "
+                "unsupported task-specific claims, contradicted facts, arithmetic, or code invalidate the complete "
+                "turn even if its main action is appropriate. Explain such defects before setting success to false; "
+                "otherwise explain the support for the material claims before setting success to true."
+            )
+        if self.config.agent_step_verdict_format == "evaluation_instance_v3":
+            system += (
+                "\nOutput exactly one JSON object with explanation followed by success. The explanation is a "
+                "string auditing the material claims, and success is a JSON boolean. Both keys are at the root. "
+                "Do not include schema keys, wrappers, tags, or additional text."
             )
         if self.config.agent_step_verdict_format == "evaluation_instance_v1":
             field_types = {
