@@ -168,7 +168,7 @@ def test_named_evidence_policy_requires_enabled_agent_step_mode():
 @pytest.mark.parametrize("status", [None, "queued", "cancelled", "in_progress", "incomplete", "failed"])
 def test_noncompleted_candidate_root_returns_zero_without_judge(status):
     body = request()
-    body.response = body.response.model_copy(update={"status": status})
+    body.response = response([tool_call()], status=status)
     prepared = make_server().prepare_agent_step_judge_request(body)
     assert prepared.judge_params is None and prepared.verification_result.reward == 0
 
