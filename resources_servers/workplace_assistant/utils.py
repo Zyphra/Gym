@@ -152,7 +152,7 @@ def _state_tables(tool_env):
     }
 
 
-def _canonical_rows(frame, id_column, stable_ids):
+def _canonical_rows(frame, id_column, stable_ids, table_name=None):
     """Match seeded records by ID and newly created records by complete content.
 
     Workplace tables have no foreign keys between generated records. Generated
@@ -168,6 +168,14 @@ def _canonical_rows(frame, id_column, stable_ids):
         for column, value in zip(columns, values):
             if pd.isna(value):
                 value = None
+            elif table_name == "calendar" and column in {"event_start", "duration"}:
+                # Calendar APIs validate these values with Timestamp/int but
+                # retain the caller's spelling. Compare their validated meaning.
+                try:
+                    value = pd.Timestamp(value) if column == "event_start" else int(value)
+                except (ValueError, TypeError, OverflowError):
+                    # Invalid persisted values retain their exact representation.
+                    pass
             elif isinstance(value, str) and column not in {"status", "list_name", "board"}:
                 value = value.lower()
             if column == id_column and value not in stable_ids:
@@ -203,8 +211,8 @@ def is_correct(predicted_actions: Dict[str, str], ground_truth_actions: Dict[str
     predicted = _state_tables(predicted_env)
     reference = _state_tables(reference_env)
     for name, (reference_frame, id_column) in reference.items():
-        predicted_rows = _canonical_rows(predicted[name][0], id_column, predicted_env["stable_ids"][name])
-        reference_rows = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name])
+        predicted_rows = _canonical_rows(predicted[name][0], id_column, predicted_env["stable_ids"][name], name)
+        reference_rows = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
         if predicted_rows is None or reference_rows is None or predicted_rows != reference_rows:
             return False
     return True

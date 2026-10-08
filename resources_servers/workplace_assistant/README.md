@@ -40,6 +40,11 @@ independent forwards, creations and plots in either order while rejecting wrong
 recipients, record IDs, fields, omitted writes and unintended changes. Final
 answers and evidence-read order remain outside the state grader.
 
+Calendar start times and durations compare their validated `Timestamp` and
+integer-minute values, so equivalent ISO timestamps and leading-zero durations
+are accepted. Naive and timezone-aware timestamps remain distinct; different
+times or durations still fail.
+
 ## Generating Additional Training Data
 
 To generate your own training JSONL for this environment using NeMo Data Designer, see the [synthetic data generation example](notebooks/synthetic-data-generation/).

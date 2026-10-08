@@ -82,6 +82,37 @@ def test_generated_calendar_ids_follow_content_after_reordered_creation():
     assert not is_correct([*reversed(gold), update_first], [*gold, update_first], None)
 
 
+def test_calendar_creation_compares_validated_time_and_duration():
+    gold = calendar_creations()[1:]
+    args = json.loads(gold[0]["arguments"])
+    legal = action("calendar_create_event", **{**args, "event_start": "2023-12-02T11:00:00", "duration": "060"})
+    assert is_correct([legal], gold, None)
+    for changed in [{"event_start": "2023-12-02T11:30:00"}, {"duration": "61"}]:
+        assert not is_correct([action("calendar_create_event", **{**args, **changed})], gold, None)
+    # An explicit timezone does not turn a naive wall-clock request into UTC.
+    aware = action("calendar_create_event", **{**args, "event_start": "2023-12-02T11:00:00+00:00"})
+    assert not is_correct([aware], gold, None)
+
+
+def test_calendar_updates_compare_validated_time_and_duration():
+    seed = execute_actions_and_reset_state([])["containers"]["calendar"]._calendar_events
+    event_id = seed.iloc[0]["event_id"]
+    gold = [
+        action("calendar_update_event", event_id=event_id, field="event_start", new_value="2023-12-02 11:00:00"),
+        action("calendar_update_event", event_id=event_id, field="duration", new_value="60"),
+    ]
+    legal = [
+        action("calendar_update_event", event_id=event_id, field="duration", new_value="060"),
+        action("calendar_update_event", event_id=event_id, field="event_start", new_value="2023-12-02T11:00:00"),
+    ]
+    assert is_correct(legal, gold, None)
+    wrong = [
+        *legal[:1],
+        action("calendar_update_event", event_id=event_id, field="event_start", new_value="2023-12-02T12:00:00"),
+    ]
+    assert not is_correct(wrong, gold, None)
+
+
 def test_duplicate_generated_identity_is_invalid():
     gold = [
         action(
