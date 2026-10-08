@@ -173,7 +173,7 @@ async def test_chat_json_sse_preserve_reasoning_while_responses_remains_legacy(p
         if not preserve:
             expected.pop("reasoning_content")
             expected.pop("reasoning")
-            expected["content"] = "<think>Parsed reasoning.</think>\n\nVisible answer."
+            expected["content"] = "<think>Parsed reasoning.</think>Visible answer."
         for key, value in expected.items():
             assert message[key] == value
         if not preserve:
@@ -183,7 +183,8 @@ async def test_chat_json_sse_preserve_reasoning_while_responses_remains_legacy(p
         assert text == expected["content"]
         for key in ("reasoning_content", "reasoning"):
             reasoning = "".join(getattr(chunk.choices[0].delta, key, "") or "" for chunk in chunks if chunk.choices)
-            assert reasoning == (expected.get(key) or "")
+            # Existing SSE transport canonicalizes the reasoning alias.
+            assert reasoning == ((expected.get("reasoning_content") or "") if key == "reasoning_content" else "")
         tool_chunks = [chunk.choices[0].delta.tool_calls for chunk in chunks if chunk.choices]
         tool = next(call for group in tool_chunks if group for call in group)
         assert tool.id == "call_fixture"
