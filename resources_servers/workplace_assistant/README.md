@@ -25,6 +25,21 @@ gym eval run --no-serve \
    --limit 1
 ```
 
+## State equivalence
+
+The `workplace-state-equivalence-v1` grader compares all final tables as row
+multisets, preserving every field and duplicate-row count. Seeded records retain
+their IDs. Newly created records match by content because creation order changes
+their generated IDs. Replay tracks removed seeded identities so a later reused
+ID remains a new record. Duplicate IDs are invalid. These tables have no foreign
+keys between generated records; adding such links requires extending the mapping.
+
+The existing case rules remain: `status`, `list_name` and `board` are case
+sensitive; other strings are compared in lowercase. This change accepts
+independent forwards, creations and plots in either order while rejecting wrong
+recipients, record IDs, fields, omitted writes and unintended changes. Final
+answers and evidence-read order remain outside the state grader.
+
 ## Generating Additional Training Data
 
 To generate your own training JSONL for this environment using NeMo Data Designer, see the [synthetic data generation example](notebooks/synthetic-data-generation/).
