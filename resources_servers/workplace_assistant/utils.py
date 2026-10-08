@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+from collections import Counter
 from typing import Dict, List
+
+import pandas as pd
 
 from resources_servers.workplace_assistant.workplace_assistant_tools.analytics import (
     AnalyticsTool,
@@ -119,6 +122,10 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
         "customer_relationship_manager",
     ]
     tool_env = get_tools(toolkits)
+    tool_env["stable_ids"] = {
+        name: set(frame[id_column]) if id_column is not None else set()
+        for name, (frame, id_column) in _state_tables(tool_env).items()
+    }
 
     # Execute the actions
     for action in actions:
@@ -126,8 +133,56 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
             tool_env["functions"][action["name"]](**json.loads(action["arguments"]))
         except Exception as e:
             print("Error executing tool: ", e)
-            continue
+        # Once a seeded record is removed, reusing its ID does not restore its
+        # identity. Track this per replay so delete/create order can also vary.
+        for name, (frame, id_column) in _state_tables(tool_env).items():
+            if id_column is not None and action.get("name", "").startswith(name + "_"):
+                tool_env["stable_ids"][name].intersection_update(frame[id_column])
     return tool_env
+
+
+def _state_tables(tool_env):
+    containers = tool_env["containers"]
+    return {
+        "calendar": (containers["calendar"]._calendar_events, "event_id"),
+        "email": (containers["email"]._emails, "email_id"),
+        "analytics": (containers["analytics"]._plots_data, None),
+        "project_management": (containers["project_management"]._project_tasks, "task_id"),
+        "customer_relationship_manager": (containers["customer_relationship_manager"]._crm_data, "customer_id"),
+    }
+
+
+def _canonical_rows(frame, id_column, stable_ids, table_name=None):
+    """Match seeded records by ID and newly created records by complete content.
+
+    Workplace tables have no foreign keys between generated records. Generated
+    IDs identify rows only within a replay and can differ with creation order.
+    Keep row multiplicity, every other field, and the original case rules.
+    """
+    columns = tuple(sorted(frame.columns))
+    if id_column is not None and frame[id_column].duplicated().any():
+        return None
+    rows = []
+    for values in frame.loc[:, columns].itertuples(index=False, name=None):
+        row = []
+        for column, value in zip(columns, values):
+            if pd.isna(value):
+                value = None
+            elif table_name == "calendar" and column in {"event_start", "duration"}:
+                # Calendar APIs validate these values with Timestamp/int but
+                # retain the caller's spelling. Compare their validated meaning.
+                try:
+                    value = pd.Timestamp(value) if column == "event_start" else int(value)
+                except (ValueError, TypeError, OverflowError):
+                    # Invalid persisted values retain their exact representation.
+                    pass
+            elif isinstance(value, str) and column not in {"status", "list_name", "board"}:
+                value = value.lower()
+            if column == id_column and value not in stable_ids:
+                value = ("generated_id",)
+            row.append(value)
+        rows.append(tuple(row))
+    return columns, Counter(rows)
 
 
 def is_correct(predicted_actions: Dict[str, str], ground_truth_actions: Dict[str, str], error: str) -> bool:
@@ -151,44 +206,13 @@ def is_correct(predicted_actions: Dict[str, str], ground_truth_actions: Dict[str
     """
     if error:
         return False
-    predict_env = execute_actions_and_reset_state(predicted_actions)
-    ground_truth_env = execute_actions_and_reset_state(ground_truth_actions)
-
-    def convert_strs_to_lowercase(df):
-        # For some fields the case matters, so we don't convert them to lowercase
-        fields_not_to_convert = ["status", "list_name", "board"]
-        for col in df.columns:
-            if col not in fields_not_to_convert:
-                df[col] = df[col].str.lower()
-        return df
-
-    # We allow for case-insensitive comparison of strings for most fields
-    predicted_calendar_state = convert_strs_to_lowercase(predict_env["containers"]["calendar"]._calendar_events)
-    predicted_email_state = convert_strs_to_lowercase(predict_env["containers"]["email"]._emails)
-    predicted_analytics_state = convert_strs_to_lowercase(predict_env["containers"]["analytics"]._plots_data)
-    predicted_project_management_state = convert_strs_to_lowercase(
-        predict_env["containers"]["project_management"]._project_tasks
-    )
-    predicted_customer_relationship_manager_state = convert_strs_to_lowercase(
-        predict_env["containers"]["customer_relationship_manager"]._crm_data
-    )
-
-    ground_truth_calendar_state = convert_strs_to_lowercase(
-        ground_truth_env["containers"]["calendar"]._calendar_events
-    )
-    ground_truth_email_state = convert_strs_to_lowercase(ground_truth_env["containers"]["email"]._emails)
-    ground_truth_analytics_state = convert_strs_to_lowercase(ground_truth_env["containers"]["analytics"]._plots_data)
-    ground_truth_project_management_state = convert_strs_to_lowercase(
-        ground_truth_env["containers"]["project_management"]._project_tasks
-    )
-    ground_truth_customer_relationship_manager_state = convert_strs_to_lowercase(
-        ground_truth_env["containers"]["customer_relationship_manager"]._crm_data
-    )
-
-    return (
-        predicted_calendar_state.equals(ground_truth_calendar_state)
-        and predicted_email_state.equals(ground_truth_email_state)
-        and predicted_analytics_state.equals(ground_truth_analytics_state)
-        and predicted_project_management_state.equals(ground_truth_project_management_state)
-        and predicted_customer_relationship_manager_state.equals(ground_truth_customer_relationship_manager_state)
-    )
+    predicted_env = execute_actions_and_reset_state(predicted_actions)
+    reference_env = execute_actions_and_reset_state(ground_truth_actions)
+    predicted = _state_tables(predicted_env)
+    reference = _state_tables(reference_env)
+    for name, (reference_frame, id_column) in reference.items():
+        predicted_rows = _canonical_rows(predicted[name][0], id_column, predicted_env["stable_ids"][name], name)
+        reference_rows = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
+        if predicted_rows is None or reference_rows is None or predicted_rows != reference_rows:
+            return False
+    return True
