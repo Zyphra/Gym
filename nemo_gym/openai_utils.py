@@ -14,9 +14,12 @@
 # limitations under the License.
 import json
 from asyncio import sleep
+from functools import partial
 from typing import (
     Annotated,
     Any,
+    Awaitable,
+    Callable,
     Dict,
     List,
     Literal,
@@ -1370,6 +1373,18 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         )
         self._raise_permanent_error()
 
+    _request_attempt_admission: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = PrivateAttr(default=None)
+
+    def set_request_attempt_admission(self, callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]) -> None:
+        """Install optional per-attempt admission without changing existing retry decisions.
+
+        The callback receives the unchanged JSON request body. Its failure or
+        cancellation propagates before dispatch and is never retried here.
+        """
+        if callback is not None and not callable(callback):
+            raise TypeError("request attempt admission must be callable or None")
+        self._request_attempt_admission = callback
+
     async def _request(self, **request_kwargs: Dict) -> ClientResponse:
         if self._permanent_trip is not None:
             self._raise_permanent_error()
@@ -1383,6 +1398,15 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
             "_internal": self.internal,
             "_max_connection_retries": self.max_connection_retries,
         }
+        if self._request_attempt_admission is not None:
+            # Only model POSTs have no hidden aiohttp idempotent-method recovery.
+            # Disable automatic redirects so every wire request uses the retry owner.
+            if request_kwargs.get("method", "GET").upper() != "POST":
+                raise ValueError("request rate admission supports model POST requests only")
+            request_kwargs["allow_redirects"] = False
+            request_kwargs["_before_attempt"] = partial(
+                self._request_attempt_admission, request_kwargs.get("json", {})
+            )
         return await self._request_with_retry(**request_kwargs)
 
     async def _request_with_retry(self, **request_kwargs: Dict) -> ClientResponse:
