@@ -72,13 +72,23 @@ def test_generated_calendar_ids_follow_content_after_reordered_creation():
 
 
 def test_duplicate_generated_identity_is_invalid():
-    gold = calendar_creations()
-    seed = execute_actions_and_reset_state([])["containers"]["calendar"]._calendar_events
-    first_id = str(int(seed["event_id"].max()) + 1).zfill(8)
+    gold = [
+        action(
+            "project_management_create_task",
+            task_name=name,
+            assigned_to_email="aisha.chen@atlas.com",
+            board="Back end",
+            list_name="Backlog",
+            due_date="2023-12-06",
+        )
+        for name in ["Handoff A", "Handoff B"]
+    ]
+    seed = execute_actions_and_reset_state([])["containers"]["project_management"]._project_tasks
+    first_id = str(int(seed["task_id"].max()) + 1).zfill(8)
     second_id = str(int(first_id) + 1).zfill(8)
-    duplicate = action("calendar_update_event", event_id=second_id, field="event_id", new_value=first_id)
-    state = execute_actions_and_reset_state([*gold, duplicate])["containers"]["calendar"]._calendar_events
-    assert state["event_id"].duplicated().any()
+    duplicate = action("project_management_update_task", task_id=second_id, field="task_id", new_value=first_id)
+    state = execute_actions_and_reset_state([*gold, duplicate])["containers"]["project_management"]._project_tasks
+    assert state["task_id"].duplicated().any()
     assert not is_correct([*gold, duplicate], gold, None)
 
 
