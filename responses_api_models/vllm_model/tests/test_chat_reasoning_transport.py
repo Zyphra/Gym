@@ -135,14 +135,25 @@ async def _local_model(preserve):
         listener.close()
         await close_global_aiohttp_client()
         await runner.cleanup()
+        assert task.done() and listener.fileno() == -1 and backend_listener.fileno() == -1
+        print({"frontend_port": port, "backend_port": backend_port, "owned_sockets_closed": True})
 
 
 def _sdk_calls(base_url):
     with OpenAI(base_url=base_url, api_key="fixture", timeout=10, max_retries=0) as client:
-        params = {"model": "fixture", "messages": [{"role": "user", "content": "Inspect memo.txt."}]}
+        schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+        params = {
+            "model": "fixture",
+            "messages": [{"role": "user", "content": "Inspect memo.txt."}],
+            "tools": [{"type": "function", "function": {"name": "inspect", "parameters": schema}}],
+        }
         completion = client.chat.completions.create(**params)
         chunks = list(client.chat.completions.create(**params, stream=True, stream_options={"include_usage": True}))
-        response = client.responses.create(model="fixture", input="Inspect memo.txt.")
+        response = client.responses.create(
+            model="fixture",
+            input="Inspect memo.txt.",
+            tools=[{"type": "function", "name": "inspect", "parameters": schema}],
+        )
     return completion, chunks, response
 
 
@@ -152,7 +163,11 @@ async def test_chat_json_sse_preserve_reasoning_while_responses_remains_legacy(p
     async with _local_model(preserve) as (base_url, calls):
         completion, chunks, response = await asyncio.to_thread(_sdk_calls, base_url)
         assert len(calls) == 3
-        assert all(call["messages"] == [{"role": "user", "content": "Inspect memo.txt."}] for call in calls)
+        assert calls[0]["messages"] == calls[1]["messages"] == [{"role": "user", "content": "Inspect memo.txt."}]
+        assert calls[2]["messages"] == [
+            {"role": "user", "content": [{"type": "text", "text": "Inspect memo.txt."}]}
+        ], calls[2]
+        assert calls[0]["tools"] == calls[1]["tools"] == calls[2]["tools"]
         message = completion.choices[0].message.model_dump(exclude_unset=True)
         expected = deepcopy(_MESSAGE)
         if not preserve:
