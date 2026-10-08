@@ -133,12 +133,15 @@ class ConversationalToolUseSimulationConfig(BaseResourcesServerConfig):
     enforce_transfer_ground_truth: bool = False
     enable_agent_step_verification: bool = False
     agent_step_verdict_format: Literal["stock_schema", "evaluation_instance_v1"] = "stock_schema"
+    agent_step_evidence_policy: Literal["stock", "grounded_complete_turn_v1"] = "stock"
     agent_step_verification_timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_agent_step_judge(self):
         if not self.enable_agent_step_verification and self.agent_step_verdict_format != "stock_schema":
             raise ValueError("Agent-step verdict format requires agent-step verification.")
+        if not self.enable_agent_step_verification and self.agent_step_evidence_policy != "stock":
+            raise ValueError("Agent-step evidence policy requires agent-step verification.")
         if self.enable_agent_step_verification:
             if self.judge_model_server is None or "judge_responses_create_params" not in self.model_fields_set:
                 raise ValueError("Agent-step verification requires explicit judge reference and settings.")
@@ -768,13 +771,21 @@ Return type in JSON Schema format: {return_type}
             tool_signatures=[ToolSignature(name=tool["name"], parameters=tool.get("parameters")) for tool in tools],
         )
         candidate = []
-        if body.response.status in {"failed", "incomplete", "in_progress"} or body.response.error is not None:
+        if (
+            body.response.status != "completed"
+            or body.response.error is not None
+            or body.response.incomplete_details is not None
+        ):
             return PreparedAgentStepJudge(
                 verification_result=VerificationResult(reward=0, explanation="Incomplete or failed candidate action.")
             )
         for item in body.response.model_dump(mode="json")["output"]:
             if item["type"] == "reasoning":
                 continue
+            if item.get("status") not in {None, "completed"}:
+                return PreparedAgentStepJudge(
+                    verification_result=VerificationResult(reward=0, explanation="Incomplete candidate output item.")
+                )
             if item["type"] == "function_call":
                 message = ConversationMessage(
                     source=Source.AGENT,
@@ -840,6 +851,20 @@ Return type in JSON Schema format: {return_type}
             ),
             evaluation_schema=json.dumps(Evaluation.model_json_schema()),
         )
+        if self.config.agent_step_evidence_policy == "grounded_complete_turn_v1":
+            system += (
+                "\nEvaluate the complete current turn, including every nonempty message, refusal, and tool call. "
+                "Success requires every material part to respect the policy, permissions, ordering, and visible evidence. "
+                "A proposed tool call can be a correct next step without a prior execution receipt. However, claims "
+                "that actions completed, exact tool execution logs, authoritative task-specific inputs such as current "
+                "time or observed prices, and ongoing services require support in the instructions, history, or tool "
+                "results. Do not assume missing authority or execution; unresolved placeholders do not supply concrete "
+                "task values. Check material arithmetic and supplied code logic for contradictions visible in the turn. "
+                "Useful partial progress, clarification, reasoning, general knowledge, and legitimate alternative "
+                "actions are allowed. Clearly marked assumptions or conditional proposals are allowed when the policy "
+                "permits them, but cannot replace a required authoritative value or evidence of completed execution. "
+                "Reject a material violation even when another part of the turn is helpful or schema-valid."
+            )
         if self.config.agent_step_verdict_format == "evaluation_instance_v1":
             field_types = {
                 name: definition["type"] for name, definition in Evaluation.model_json_schema()["properties"].items()
@@ -941,6 +966,7 @@ Return type in JSON Schema format: {return_type}
             "rollout_id": rollout_id,
             "strict_agent_step": True,
             "agent_step_verdict_format": self.config.agent_step_verdict_format,
+            "agent_step_evidence_policy": self.config.agent_step_evidence_policy,
         }
 
     async def seed_session(

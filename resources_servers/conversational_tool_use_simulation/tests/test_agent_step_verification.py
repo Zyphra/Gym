@@ -143,6 +143,57 @@ def test_named_instance_format_requires_enabled_agent_step_mode():
         make_server(enable_agent_step_verification=False, agent_step_verdict_format="evaluation_instance_v1")
 
 
+def test_named_evidence_policy_preserves_evidence_and_format_is_independent():
+    stock = make_server()
+    grounded = make_server(agent_step_evidence_policy="grounded_complete_turn_v1")
+    body = request([message("narration"), tool_call()])
+    original = body.model_dump(mode="json")
+    stock_params = stock.prepare_agent_step_judge_request(body).judge_params
+    grounded_params = grounded.prepare_agent_step_judge_request(body).judge_params
+    assert grounded_params.input[0].content.startswith(stock_params.input[0].content + "\n")
+    assert grounded_params.input[1:] == stock_params.input[1:]
+    assert grounded_params.model_dump(exclude={"input"}) == stock_params.model_dump(exclude={"input"})
+    assert body.model_dump(mode="json") == original
+    settings = grounded._agent_step_judge_settings(None)
+    assert settings["agent_step_evidence_policy"] == "grounded_complete_turn_v1"
+    assert settings["agent_step_verdict_format"] == "stock_schema"
+    assert stock._agent_step_judge_settings(None)["agent_step_evidence_policy"] == "stock"
+
+
+def test_named_evidence_policy_requires_enabled_agent_step_mode():
+    with pytest.raises(ValidationError, match="evidence policy requires agent-step verification"):
+        make_server(enable_agent_step_verification=False, agent_step_evidence_policy="grounded_complete_turn_v1")
+
+
+@pytest.mark.parametrize("status", [None, "queued", "cancelled", "in_progress", "incomplete", "failed"])
+def test_noncompleted_candidate_root_returns_zero_without_judge(status):
+    body = request()
+    body.response = body.response.model_copy(update={"status": status})
+    prepared = make_server().prepare_agent_step_judge_request(body)
+    assert prepared.judge_params is None and prepared.verification_result.reward == 0
+
+
+def test_candidate_incomplete_details_returns_zero_without_judge():
+    body = request()
+    body.response = response([tool_call()], incomplete_details=dict(reason="max_output_tokens"))
+    prepared = make_server().prepare_agent_step_judge_request(body)
+    assert prepared.judge_params is None and prepared.verification_result.reward == 0
+
+
+@pytest.mark.parametrize("kind", ["message", "function_call"])
+@pytest.mark.parametrize("status", ["in_progress", "incomplete"])
+def test_incomplete_visible_candidate_item_returns_zero_without_judge(kind, status):
+    item = message() if kind == "message" else tool_call()
+    item["status"] = status
+    prepared = make_server().prepare_agent_step_judge_request(request([item]))
+    assert prepared.judge_params is None and prepared.verification_result.reward == 0
+
+
+def test_completed_root_with_omitted_native_call_status_remains_supported():
+    prepared = make_server().prepare_agent_step_judge_request(request([tool_call()]))
+    assert prepared.judge_params is not None and prepared.verification_result is None
+
+
 @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
 def test_timeout_is_positive_finite(timeout):
     with pytest.raises(ValidationError):
