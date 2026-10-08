@@ -152,7 +152,7 @@ def _sdk_calls(base_url):
         response = client.responses.create(
             model="fixture",
             input="Inspect memo.txt.",
-            tools=[{"type": "function", "name": "inspect", "parameters": schema}],
+            tools=[{"type": "function", "name": "inspect", "parameters": schema, "strict": False}],
         )
     return completion, chunks, response
 
