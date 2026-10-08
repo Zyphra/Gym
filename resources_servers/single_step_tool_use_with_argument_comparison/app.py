@@ -106,8 +106,9 @@ class SingleStepToolUseArgumentComparisonResourcesServer(SimpleResourcesServer):
         payload = body.model_dump(mode="json")
         if rollout_id is not None:
             payload["_ng_rollout_id"] = rollout_id
-        if body.episode_control is not None:
-            payload["_ng_episode_control"] = body.episode_control
+        episode_control = getattr(body, "episode_control", None)
+        if episode_control is not None:
+            payload["_ng_episode_control"] = episode_control
         try:
             async with asyncio.timeout(self.config.agent_step_verifier_timeout_seconds):
                 reply = await call_judge(

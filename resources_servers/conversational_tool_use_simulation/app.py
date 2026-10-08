@@ -948,7 +948,7 @@ Return type in JSON Schema format: {return_type}
             )
         return AgentStepVerifyResponse(
             **body.model_dump(),
-            episode_control=body.episode_control,
+            episode_control=getattr(body, "episode_control", None),
             capture_rollout_id=body.capture_rollout_id,
             reward=result.reward,
             verification_result=result,

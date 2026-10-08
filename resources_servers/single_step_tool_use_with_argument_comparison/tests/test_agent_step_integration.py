@@ -202,6 +202,16 @@ async def post_outer(client, payload, path="/verify"):
     return await response.json()
 
 
+def assert_episode_control_forwarded(original, observed):
+    body = SingleStepToolUseArgumentComparisonVerifyRequest.model_validate(original)
+    if "episode_control" in type(body).model_fields:
+        assert body.episode_control == original["_ng_episode_control"] == observed["_ng_episode_control"]
+    else:
+        # Clean upstream has no optional episode-control contract. The wrapper's
+        # bounded-lifecycle composition adds it and must preserve its exact value.
+        assert "_ng_episode_control" not in observed
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("success", [True, False])
 async def test_real_fastapi_union_preserves_receipt_reward_and_explicit_controls(monkeypatch, success):
@@ -226,7 +236,7 @@ async def test_real_fastapi_union_preserves_receipt_reward_and_explicit_controls
         assert len(observed) == len(calls) == 1
         assert observed[0]["path"] == "/ng-rollout/explicit-id/verify_agent_step"
         assert observed[0]["body"]["_ng_rollout_id"] == "explicit-id"
-        assert observed[0]["body"]["_ng_episode_control"] == "fixture-control"
+        assert_episode_control_forwarded(payload, observed[0]["body"])
         assert calls[0]["path"] == "/ng-rollout/explicit-id/v1/responses"
         assert nested["judge_request"] == calls[0]["body"]
         assert nested["judge_request"]["temperature"] == 0 and nested["judge_request"]["max_output_tokens"] == 4000
@@ -251,7 +261,7 @@ async def test_real_fastapi_rollout_path_supplies_context_fallback_without_mutat
         result = await post_outer(client, payload, path="/ng-rollout/context-id/verify")
         assert result["reward"] == 1
         assert observed[0]["body"]["_ng_rollout_id"] == "context-id"
-        assert observed[0]["body"]["_ng_episode_control"] == "fixture-control"
+        assert_episode_control_forwarded(payload, observed[0]["body"])
         assert observed[0]["path"] == "/ng-rollout/context-id/verify_agent_step"
         assert calls[0]["path"] == "/ng-rollout/context-id/v1/responses"
         assert result["agent_step_verification"]["judge_settings"]["rollout_id"] == "context-id"
@@ -273,14 +283,14 @@ async def test_original_native_typed_request_is_unchanged_by_delegation_with_con
     ):
         body = SingleStepToolUseArgumentComparisonVerifyRequest.model_validate(original_payload())
         untouched = body.model_dump(mode="json")
-        controls = (body.capture_rollout_id, body.episode_control)
+        controls = (body.capture_rollout_id, getattr(body, "episode_control", None))
         with rollout_context("typed-context-id"):
             result = await outer.verify(body)
         assert result.reward == 1
         assert body.model_dump(mode="json") == untouched
-        assert (body.capture_rollout_id, body.episode_control) == controls
+        assert (body.capture_rollout_id, getattr(body, "episode_control", None)) == controls
         assert observed[0]["body"]["_ng_rollout_id"] == "typed-context-id"
-        assert observed[0]["body"]["_ng_episode_control"] == body.episode_control
+        assert observed[0]["body"].get("_ng_episode_control") == controls[1]
         assert result.agent_step_verification["judge_settings"]["rollout_id"] == "typed-context-id"
         assert len(calls) == 1 and inner.session_id_to_state == {}
 
@@ -305,5 +315,5 @@ async def test_real_fastapi_failed_envelope_survives_outer_failsafe_as_native_se
         assert failure["judge_response"] == reply.model_dump(mode="json")
         assert failure["judge_request"] == calls[0]["body"]
         assert failure["judge_settings"]["rollout_id"] == "failure-id"
-        assert observed[0]["body"]["_ng_episode_control"] == "fixture-control"
+        assert_episode_control_forwarded(payload, observed[0]["body"])
         assert len(calls) == 1 and inner.session_id_to_state == {}
