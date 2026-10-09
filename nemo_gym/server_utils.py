@@ -85,6 +85,8 @@ from nemo_gym.telemetry.span_groups import GymSpanGroup
 _GLOBAL_AIOHTTP_CLIENT: Union[None, ClientSession] = None
 _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG: bool = False
 _UPSTREAM_ERROR_LOG_BODY_CHARS = 2000
+# The agent route that runs one whole episode.
+EPISODE_RUN_PATH = "/run"
 
 NEMO_GYM_MODEL_SERVER_NAME_ENV_VAR_NAME = "NEMO_GYM_MODEL_SERVER_NAME"
 NEMO_GYM_MODEL_SERVER_BASE_URL_ENV_VAR_NAME = "NEMO_GYM_MODEL_SERVER_BASE_URL"
@@ -115,6 +117,18 @@ class GlobalAIOHTTPAsyncClientConfig(BaseModel):
         default=3,
         description=("TCP_KEEPCNT: number of unanswered probes before the kernel drops the connection."),
     )
+    global_aiohttp_sock_read_timeout_s: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Seconds a request may wait for its next response bytes before it fails with "
+            "aiohttp.ServerTimeoutError. None waits forever. An agent `/run` call made through "
+            "ServerClient spans a whole episode and is exempt; its caller owns that deadline."
+        ),
+    )
+
+    def client_timeout(self) -> ClientTimeout:
+        return ClientTimeout(sock_read=self.global_aiohttp_sock_read_timeout_s)
 
 
 def get_global_aiohttp_client(
@@ -174,7 +188,7 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
                 probes=cfg.global_aiohttp_tcp_keepalive_probes,
             ),
         ),
-        timeout=ClientTimeout(),
+        timeout=cfg.client_timeout(),
         cookie_jar=DummyCookieJar(),
     )
 
@@ -498,6 +512,11 @@ class ServerClient(BaseModel):
             base_url = model_server_base_url.rstrip("/")
         else:
             base_url = self._resolve_base_url(server_name)
+
+        if url_path.partition("?")[0] == EPISODE_RUN_PATH:
+            # An episode's /run returns only when the episode ends, so a per-read
+            # bound would cut every long episode. Its caller bounds the episode.
+            kwargs.setdefault("timeout", ClientTimeout())
 
         json_obj = kwargs.get("json")
         if "json" in kwargs:
