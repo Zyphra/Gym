@@ -117,6 +117,13 @@ The seed/verify episode protocol does not itself define how the Agent acts on th
 5. The Resources Server's response becomes a `function_call_output` associated with the same `call_id`.
 6. `responses()` sends the updated trajectory back to the model and repeats until the model returns a final response or the step limit is reached.
 
+Set `presented_tools_only: true` in the `simple_agent` configuration to restrict
+dispatch to function names declared in that request's `tools`. An unpresented
+name produces a normal tool error with the original `call_id`, without calling
+the Resources Server. The model can continue using a declared tool. An empty
+tool list permits no function calls. This option defaults to `false`; enable it
+when the presented schemas define the available actions for the episode.
+
 The tool name in the input schema must match the Resources Server route:
 
 ```python

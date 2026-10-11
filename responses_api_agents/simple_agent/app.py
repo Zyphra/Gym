@@ -60,6 +60,7 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
     max_steps: int = None
+    presented_tools_only: bool = False
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -72,6 +73,10 @@ class SimpleAgentVerifyRequest(BaseVerifyRequest):
 
 class SimpleAgentVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
+
+
+class _UnpresentedToolError(ValueError):
+    """A model requested a function outside the episode tool schemas."""
 
 
 class SimpleAgent(SimpleResponsesAPIAgent):
@@ -93,6 +98,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         turns: list[TrajectoryTurn] = []
         trajectory_gaps: list[ObservationGap] = []
         body = body.model_copy(deep=True)
+        presented_tools = {tool["name"] for tool in body.tools if tool["type"] == "function"}
 
         if isinstance(body.input, str):
             body.input = [NeMoGymEasyInputMessage(role="user", content=body.input)]
@@ -176,7 +182,16 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     started_at = time()
                     started_monotonic = perf_counter()
                 try:
+                    if self.config.presented_tools_only and output_function_call.name not in presented_tools:
+                        raise _UnpresentedToolError(
+                            f"Tool {output_function_call.name!r} was not presented in this request."
+                        )
                     parsed_arguments = json.loads(output_function_call.arguments)
+                except _UnpresentedToolError as e:
+                    tool_output = json.dumps({"error": str(e)})
+                    if collect_trajectory:
+                        error_type = "unpresented_tool"
+                        tool_status = "failed"
                 except (json.JSONDecodeError, TypeError) as e:
                     tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})
                     if collect_trajectory:
