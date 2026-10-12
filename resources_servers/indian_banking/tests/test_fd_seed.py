@@ -121,3 +121,16 @@ async def test_server_reset_selects_seed_before_another_servers_global_setting(s
     assert new["db"]["customers"][CUSTOMER]["deposits"]["FD_SEED_quarterly"]["maturity_amount"] == 20000
     assert old["db"]["customers"][CUSTOMER]["accounts"] == new["db"]["customers"][CUSTOMER]["accounts"]
     assert path.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_empty_gold_db_reference_uses_episode_seed_not_later_global(seeded, enabled):
+    path, source_bytes, original = seeded
+    episode = engine.seed_world(CUSTOMER, fd_payout_consistency=enabled)
+    engine.configure(db_path=str(path), kb_path=engine._KB_PATH, fd_payout_consistency=not enabled)
+    store = {reward_mod.WORLD_KEY: episode, reward_mod.TASK_KEY: {
+        "customer": CUSTOMER, "evaluation_criteria": {"reward_basis": ["DB"], "actions": []}},
+        "nl_history": [{"role": "assistant", "content": "No deposit changes were made."}]}
+    assert reward_mod.score_trajectory(store)["strict"] == 1
+    assert engine.get_base_db() == original
+    assert path.read_bytes() == source_bytes

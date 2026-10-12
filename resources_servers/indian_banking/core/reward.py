@@ -406,7 +406,10 @@ def score_trajectory(store: dict, judge_score: float | None = None) -> dict:
             arg_frac = (1.0 - A_SEQ) * action_frac + A_SEQ * seq_frac
         task_parts.append((W_ACTION, A_NAME * name_frac + (1.0 - A_NAME) * arg_frac))
     if "DB" in basis:
-        components["DB"] = _db_reward(world, gold_world if gold_world is not None else engine.seed_world(customer))
+        reference = gold_world if gold_world is not None else engine.seed_world(
+            customer, fd_payout_consistency=world.get("fd_payout_consistency", False)
+        )
+        components["DB"] = _db_reward(world, reference)
         # Read-only-gold tasks: gate dense DB credit on engagement (a do-nothing agent trivially leaves the DB unchanged).
         gold_has_write = any(g["name"] in engine.WRITE_TOOLS for g in gold_actions)
         if gold_actions and not gold_has_write:
