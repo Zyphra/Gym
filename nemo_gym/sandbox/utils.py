@@ -14,6 +14,12 @@
 
 """Sandbox utility helpers."""
 
+import os
+import shutil
+import stat
+from pathlib import Path
+
+
 # Parallelism caps for CPU-limited sandboxes, each set by cpu_cap_env() to the
 # floored CPU limit (min 1). Tools size worker pools by host core count, not
 # the cgroup limit — Python's multiprocessing.cpu_count(), BLAS/OpenMP thread
@@ -65,3 +71,21 @@ def rewrite_image(image: str | None, rewrites: list[dict[str, str]]) -> str | No
         if image.startswith(from_prefix):
             return to_prefix + image[len(from_prefix) :]
     return image
+
+
+def remove_private_directory(path: Path) -> None:
+    """Remove provider-owned storage after its processes have drained.
+
+    Restore owner access to directories before traversal; never follow links
+    into files or directories outside the private tree.
+    """
+    directories = [path]
+    while directories:
+        directory = directories.pop()
+        mode = directory.lstat().st_mode
+        if not stat.S_ISDIR(mode):
+            raise ValueError(f"private cleanup expected a directory: {directory}")
+        os.chmod(directory, mode | stat.S_IRWXU, follow_symlinks=False)
+        with os.scandir(directory) as entries:
+            directories.extend(Path(entry.path) for entry in entries if entry.is_dir(follow_symlinks=False))
+    shutil.rmtree(path)
