@@ -30,6 +30,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
 )
+from nemo_gym.response_instructions import fold_instructions_into_messages
 
 
 class SimpleModelServerConfig(BaseResponsesAPIModelConfig):
@@ -80,6 +81,11 @@ class SimpleModelServer(SimpleResponsesAPIModel):
     async def responses(self, body: NeMoGymResponseCreateParamsNonStreaming = Body()) -> NeMoGymResponse:
         body_dict = self.config.extra_body | body.model_dump(exclude_unset=True)
         body_dict["model"] = self.config.openai_model
+        if body_dict.get("instructions"):
+            input_items = body_dict["input"]
+            if isinstance(input_items, str):
+                input_items = [{"role": "user", "content": input_items}]
+            body_dict["input"] = fold_instructions_into_messages(body_dict.pop("instructions"), input_items)
         if self.config.drop_input_reasoning_items:
             input_items = body_dict.get("input")
             if isinstance(input_items, list):
