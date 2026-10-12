@@ -108,6 +108,8 @@ class IndianBankingResourcesServerConfig(BaseResourcesServerConfig):
     # Mixed text+tool-call turns end the episode when true. Needed by on-policy trainers
     # whose chat template cannot re-render such a turn byte-identically.
     strict_turn_protocol: bool = False
+    # Opt in to calculator-consistent booking for monthly/quarterly FD payouts.
+    fd_payout_consistency: bool = False
 
     max_user_turns: int = Field(8, ge=1)
     max_tool_rounds: int = Field(12, ge=1)
@@ -125,7 +127,11 @@ class IndianBankingResourcesServer(GymnasiumServer):
 
     def model_post_init(self, context: Any) -> None:
         super().model_post_init(context)
-        engine.configure(db_path=self.config.db_fpath, kb_path=self.config.kb_fpath)
+        engine.configure(
+            db_path=self.config.db_fpath,
+            kb_path=self.config.kb_fpath,
+            fd_payout_consistency=self.config.fd_payout_consistency,
+        )
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -134,6 +140,7 @@ class IndianBankingResourcesServer(GymnasiumServer):
     async def reset(self, metadata: dict, session_id: Optional[str] = None) -> tuple[Optional[str], dict]:
         customer = metadata.get("customer")
         world = engine.seed_world(customer)
+        world["fd_payout_consistency"] = self.config.fd_payout_consistency
 
         initial_state = metadata.get("initial_state") or {}
         init_errors = []

@@ -91,12 +91,16 @@ def _dict_hash(obj: Any) -> str:
 
 
 # ---- ACTION -----------------------------------------------------------------
-def _replay_gold(customer, gold_actions: list[dict]) -> tuple[dict, list[bool]]:
+def _replay_gold(
+    customer, gold_actions: list[dict], *, fd_payout_consistency: bool | None = None
+) -> tuple[dict, list[bool]]:
     """Replay gold actions on a fresh seed; returns (gold_world, per-action error flags).
 
     The DB hash comparison reads the replayed world; the error flags exist for data
     integrity checks (every flagged action must carry an explicit ``expect_error``)."""
     gold_world = engine.seed_world(customer)
+    if fd_payout_consistency is not None:
+        gold_world["fd_payout_consistency"] = fd_payout_consistency
     errors = []
     for a in gold_actions:
         engine.apply_tool(gold_world, a["name"], dict(a.get("arguments") or {}))
@@ -390,7 +394,9 @@ def score_trajectory(store: dict, judge_score: float | None = None) -> dict:
     bad_writes = n_writes = 0
     gold_world = None
     if gold_actions and ("ACTION" in basis or "DB" in basis):
-        gold_world, _ = _replay_gold(customer, gold_actions)
+        gold_world, _ = _replay_gold(
+            customer, gold_actions, fd_payout_consistency=world.get("fd_payout_consistency", False)
+        )
     if "ACTION" in basis:
         a = _action_reward(calls, gold_actions)
         action_frac, name_frac = a["action_frac"], a["name_frac"]

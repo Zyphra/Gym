@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import random
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Literal, Optional
 
@@ -75,6 +76,21 @@ def reset_db(token_db: Any, token_cid: Any) -> None:
 # rollout and the gold replay produce identical timestamps and content-hashed ids.
 SIM_CLOCK: Optional[str] = None
 SIM_SEED: Optional[str] = None
+
+_FD_PAYOUT_CONSISTENCY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "indian_banking_fd_payout_consistency", default=False
+)
+
+
+@contextmanager
+def fd_payout_consistency(enabled: bool):
+    """Scope corrected FD maturity to the current episode's tool execution."""
+    token = _FD_PAYOUT_CONSISTENCY.set(enabled)
+    try:
+        yield
+    finally:
+        _FD_PAYOUT_CONSISTENCY.reset(token)
+
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 # Overridden by ``engine`` to point at resources_servers/indian_banking/data/.
@@ -982,7 +998,12 @@ def create_fd(
     debit_err = _debit_account(cust, source_account, principal_amount, "FD booking", "internal")
     if debit_err:
         return debit_err
-    maturity = principal_amount * (1 + rate / 100 / 4) ** (4 * tenure_months / 12)
+    if _FD_PAYOUT_CONSISTENCY.get():
+        maturity = json.loads(calculate_fd_maturity(principal_amount, rate, tenure_months, payout_type))[
+            "maturity_amount"
+        ]
+    else:
+        maturity = principal_amount * (1 + rate / 100 / 4) ** (4 * tenure_months / 12)
     start = _now()
     maturity_date = start + timedelta(days=int(tenure_months * 30.4375))
     fd_id = _ref(
