@@ -19,16 +19,17 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from omegaconf import OmegaConf
 from pytest import fixture
 
-from nemo_gym.config_types import ModelServerRef
+from nemo_gym.config_types import BaseServerConfig, ModelServerRef
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import ServerClient
 from resources_servers.indian_banking.app import (
     IndianBankingResourcesServer,
     IndianBankingResourcesServerConfig,
 )
-from resources_servers.indian_banking.core import engine, judge, user_sim
+from resources_servers.indian_banking.core import banking_tools, engine, judge, user_sim
 from resources_servers.indian_banking.core import reward as reward_mod
 from resources_servers.indian_banking.core.state_normalize import normalize_state
 from resources_servers.indian_banking.core.tool_schemas import TOOL_SCHEMAS
@@ -147,6 +148,95 @@ def _config(**overrides: Any) -> IndianBankingResourcesServerConfig:
     )
     kwargs.update(overrides)
     return IndianBankingResourcesServerConfig(**kwargs)
+
+
+class TestFdPayoutConsistency:
+    async def test_server_reset_uses_its_own_setting(self, configured_engine):
+        client = ServerClient(
+            head_server_config=BaseServerConfig(host="127.0.0.1", port=8080, name="head", entrypoint=""),
+            global_config_dict=OmegaConf.create({}),
+        )
+        legacy = IndianBankingResourcesServer(
+            config=_config(db_fpath=engine._DB_PATH, kb_fpath=engine._KB_PATH), server_client=client
+        )
+        corrected = IndianBankingResourcesServer(
+            config=_config(db_fpath=engine._DB_PATH, kb_fpath=engine._KB_PATH, fd_payout_consistency=True),
+            server_client=client,
+        )
+        metadata = {"customer": CUSTOMER, "opening_message": "Please book a monthly-payout deposit."}
+        await legacy.reset(metadata, session_id="legacy")
+        await corrected.reset(metadata, session_id="corrected")
+        args = dict(principal_amount=20000, tenure_months=12, source_account="SB0000000001", payout_type="monthly")
+        assert (
+            json.loads(engine.apply_tool(legacy.session_state["legacy"][reward_mod.WORLD_KEY], "create_fd", args))[
+                "maturity_amount"
+            ]
+            > 20000
+        )
+        assert (
+            json.loads(
+                engine.apply_tool(corrected.session_state["corrected"][reward_mod.WORLD_KEY], "create_fd", args)
+            )["maturity_amount"]
+            == 20000
+        )
+
+    @pytest.mark.parametrize("enabled", [False, True])
+    @pytest.mark.parametrize("payout", ["cumulative", "monthly", "quarterly"])
+    @pytest.mark.parametrize("senior", [False, True])
+    def test_booking_matches_selected_semantics(self, configured_engine, enabled, payout, senior):
+        engine.configure(db_path=engine._DB_PATH, kb_path=engine._KB_PATH, fd_payout_consistency=enabled)
+        episode = engine.seed_world(CUSTOMER)
+        episode["db"]["customers"][CUSTOMER]["profile"]["senior_citizen"] = senior
+        args = dict(principal_amount=20000, tenure_months=12, source_account="SB0000000001", payout_type=payout)
+        booked = json.loads(engine.apply_tool(episode, "create_fd", args))
+        assert booked["status"] == "BOOKED"
+        selected_payout = payout if enabled else "cumulative"
+        expected = json.loads(banking_tools.calculate_fd_maturity(20000, booked["rate"], 12, selected_payout))
+        assert booked["maturity_amount"] == expected["maturity_amount"]
+        customer = episode["db"]["customers"][CUSTOMER]
+        assert customer["deposits"][booked["deposit_id"]]["maturity_amount"] == expected["maturity_amount"]
+        assert customer["accounts"]["SB0000000001"]["available_balance"] == 30000
+        assert booked["rate"] == (7.3 if senior else 6.8)
+        if enabled and payout != "cumulative":
+            assert booked["maturity_amount"] == 20000
+
+    @pytest.mark.parametrize("payout", ["cumulative", "monthly", "quarterly"])
+    def test_native_db_rejects_wrong_maturity(self, configured_engine, payout):
+        engine.configure(db_path=engine._DB_PATH, kb_path=engine._KB_PATH, fd_payout_consistency=True)
+        episode = engine.seed_world(CUSTOMER)
+        args = dict(principal_amount=20000, tenure_months=12, source_account="SB0000000001", payout_type=payout)
+        booked = json.loads(engine.apply_tool(episode, "create_fd", args))
+        task = {
+            "customer": CUSTOMER,
+            "evaluation_criteria": {
+                "reward_basis": ["ACTION", "DB"],
+                "actions": [{"name": "create_fd", "arguments": args}],
+            },
+        }
+        store = {
+            reward_mod.WORLD_KEY: episode,
+            reward_mod.TASK_KEY: task,
+            "nl_history": [{"role": "assistant", "content": "Your deposit is booked."}],
+        }
+        # Later configuration must not change this episode's tool or gold semantics.
+        engine.configure(db_path=engine._DB_PATH, kb_path=engine._KB_PATH)
+        assert reward_mod.score_trajectory(store)["strict"] == 1
+        wrong_payout = "monthly" if payout == "cumulative" else "cumulative"
+        wrong = json.loads(banking_tools.calculate_fd_maturity(20000, booked["rate"], 12, wrong_payout))
+        episode["db"]["customers"][CUSTOMER]["deposits"][booked["deposit_id"]]["maturity_amount"] = wrong[
+            "maturity_amount"
+        ]
+        assert reward_mod.score_trajectory(store)["strict"] == 0
+        assert reward_mod.score_trajectory(store)["db"] == 0
+
+    def test_world_settings_are_isolated(self, configured_engine):
+        legacy = engine.seed_world(CUSTOMER)
+        engine.configure(db_path=engine._DB_PATH, kb_path=engine._KB_PATH, fd_payout_consistency=True)
+        corrected = engine.seed_world(CUSTOMER)
+        args = dict(principal_amount=20000, tenure_months=12, source_account="SB0000000001", payout_type="monthly")
+        assert json.loads(engine.apply_tool(corrected, "create_fd", args))["maturity_amount"] == 20000
+        assert json.loads(engine.apply_tool(legacy, "create_fd", args))["maturity_amount"] > 20000
+        assert _config().fd_payout_consistency is False
 
 
 class TestApp:

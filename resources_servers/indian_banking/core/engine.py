@@ -102,15 +102,20 @@ _BASE_DB: Optional[dict[str, Any]] = None
 _BASE_DB_PICKLE: Optional[bytes] = None
 # search_knowledge_base is deterministic and state-free: memoized by argument JSON.
 _KB_CACHE: dict[str, str] = {}
+_FD_PAYOUT_CONSISTENCY = False
 
 
-def configure(db_path: Optional[str] = None, kb_path: Optional[str] = None) -> None:
+def configure(
+    db_path: Optional[str] = None, kb_path: Optional[str] = None, *, fd_payout_consistency: bool = False
+) -> None:
     """Point the engine at a customer DB / knowledge base and reset all caches.
 
     Called once by the resources server at startup (and by tests). Paths default
     to data/db.json and data/kb.json next to this package.
     """
     global _DB_PATH, _KB_PATH, _CONFIGURED, _BASE_DB, _BASE_DB_PICKLE
+    global _FD_PAYOUT_CONSISTENCY
+    _FD_PAYOUT_CONSISTENCY = fd_payout_consistency
     _DB_PATH = db_path or DEFAULT_DB_PATH
     _KB_PATH = kb_path or DEFAULT_KB_PATH
     banking_tools.CUSTOMER_DB_PATH = _DB_PATH
@@ -164,6 +169,7 @@ def seed_world(active_customer: Optional[str]) -> dict[str, Any]:
         "customer": active_customer,
         "calls": [],  # [{name, arguments, result, error}]
         "transferred": False,
+        "fd_payout_consistency": _FD_PAYOUT_CONSISTENCY,
     }
 
 
@@ -201,7 +207,8 @@ def apply_tool(world: dict[str, Any], name: str, arguments: dict[str, Any]) -> s
     db_snapshot = pickle.dumps(world["db"]) if name in WRITE_TOOLS or name in SOFT_WRITE_TOOLS else None
     try:
         try:
-            result = str(fn(**arguments))
+            with banking_tools.fd_payout_consistency(world.get("fd_payout_consistency", False)):
+                result = str(fn(**arguments))
             error = _looks_like_error(result)
         except TypeError as exc:  # bad/missing kwargs, surface like the server would
             result = json.dumps({"error_code": "VALIDATION_ERROR", "error_message": str(exc)})

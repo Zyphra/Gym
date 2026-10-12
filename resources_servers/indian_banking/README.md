@@ -26,6 +26,13 @@ Read tools never change state. Write tools (`create_fd`, `create_rd`, `close_dep
 
 ### Per-episode isolation
 
+Set the resources-server config `fd_payout_consistency: true` to make `create_fd`
+use the same maturity calculation as `calculate_fd_maturity`. Monthly and quarterly
+interest payouts then leave only the principal payable at maturity; cumulative
+deposits retain quarterly compounding. This option defaults to `false` and applies
+to newly booked deposits. It does not rewrite existing deposit records. Each
+episode keeps its selected setting even if the engine is later reconfigured.
+
 `reset()` clones the base database (`data/db.json`) for the session; all tool calls in that episode read and write the clone, which is bound per asyncio task via `contextvars`, so concurrent rollouts in one process never see each other's state. Product catalogues and rate cards are module constants shared by every episode. The clone is discarded when the episode ends.
 
 ## User simulator
