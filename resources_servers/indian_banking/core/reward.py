@@ -98,9 +98,7 @@ def _replay_gold(
 
     The DB hash comparison reads the replayed world; the error flags exist for data
     integrity checks (every flagged action must carry an explicit ``expect_error``)."""
-    gold_world = engine.seed_world(customer)
-    if fd_payout_consistency is not None:
-        gold_world["fd_payout_consistency"] = fd_payout_consistency
+    gold_world = engine.seed_world(customer, fd_payout_consistency=fd_payout_consistency)
     errors = []
     for a in gold_actions:
         engine.apply_tool(gold_world, a["name"], dict(a.get("arguments") or {}))
