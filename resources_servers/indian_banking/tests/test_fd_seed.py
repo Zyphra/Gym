@@ -83,7 +83,8 @@ def test_native_matured_payout_and_gold_keep_seed_flag_after_reconfigure(seeded,
     assert account["transactions"][-1]["amount"] == 20000
     task = {"customer": CUSTOMER, "evaluation_criteria": {
         "reward_basis": ["ACTION", "DB"], "actions": [{"name": "close_deposit", "arguments": arguments}]}}
-    store = {reward_mod.WORLD_KEY: episode, reward_mod.TASK_KEY: task, "nl_history": []}
+    store = {reward_mod.WORLD_KEY: episode, reward_mod.TASK_KEY: task,
+             "nl_history": [{"role": "assistant", "content": f"Deposit {deposit_id} is closed; INR 20000 was paid to SB0000000001."}]}
     assert reward_mod.score_trajectory(store)["strict"] == 1
     noop = engine.seed_world(CUSTOMER, fd_payout_consistency=True)
     assert reward_mod.score_trajectory(store | {reward_mod.WORLD_KEY: noop})["strict"] == 0
