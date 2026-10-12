@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 from typing import Any, Dict, Literal, Optional
 
 from nemo_gym.base_resources_server import (
@@ -204,14 +203,16 @@ def _parse_judge_verdict(judge_response_text: str, judge_protocol: JudgeProtocol
     if not text:
         raise JudgeError("empty judge response")
 
+    from core.grading.tool_use import GradingProtocolError, parse_json_object
+
     try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as error:
+        payload = parse_json_object(text)
+    except GradingProtocolError as error:
         raise JudgeError("AA-LCR v1.1 judge response is not valid JSON") from error
     if not isinstance(payload, dict) or set(payload) != {"verdict"}:
         raise JudgeError("AA-LCR v1.1 judge response must contain only a verdict field")
     verdict = payload["verdict"]
-    if verdict not in {"CORRECT", "INCORRECT"}:
+    if not isinstance(verdict, str) or verdict not in {"CORRECT", "INCORRECT"}:
         raise JudgeError("AA-LCR v1.1 judge verdict must be CORRECT or INCORRECT")
     return verdict
 

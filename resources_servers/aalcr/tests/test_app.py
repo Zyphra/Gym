@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -187,6 +189,8 @@ Reply as JSON, with a verdict of CORRECT or INCORRECT."""
         [
             ('{"verdict": "CORRECT"}', "CORRECT"),
             ('{"verdict": "INCORRECT"}', "INCORRECT"),
+            ('```json\n{"verdict": "CORRECT"}\n```', "CORRECT"),
+            ('```\n{"verdict": "INCORRECT"}\n```', "INCORRECT"),
         ],
     )
     def test_v1_1_parser_accepts_official_json_verdict(self, text: str, expected: str) -> None:
@@ -200,6 +204,13 @@ Reply as JSON, with a verdict of CORRECT or INCORRECT."""
             '{"verdict": "CORRECT", "reason": "extra"}',
             "",
             " \n",
+            '{"verdict": "CORRECT", "verdict": "INCORRECT"}',
+            '{"verdict": NaN}',
+            '{"verdict": Infinity}',
+            '```json\n{"verdict":"CORRECT"}\n```\n```json\n{"verdict":"INCORRECT"}\n```',
+            '```json\n{"verdict":"CORRECT", "reason":"extra"}\n```',
+            '{"verdict": ["CORRECT"]}',
+            '[{"verdict": "CORRECT"}]',
         ],
     )
     def test_v1_1_parser_rejects_non_protocol_responses(self, text: str) -> None:
@@ -241,6 +252,32 @@ Reply as JSON, with a verdict of CORRECT or INCORRECT."""
 
         with pytest.raises(ValueError, match="dataset and judge protocol mismatch"):
             await server.verify(_request(LEGACY_JUDGE_PROTOCOL))
+
+    async def test_saved_fenced_correct_witness_reaches_native_reward(self) -> None:
+        fixture = json.loads((Path(__file__).parent / "fixtures/fenced_correct.json").read_text())
+        judge_response = NeMoGymResponse.model_validate({"model": "captured-judge", **fixture["judge_response"]})
+        request = _request(V1_1_JUDGE_PROTOCOL).model_copy(
+            update={
+                "question": fixture["question"],
+                "answer": fixture["answer"],
+                "response": NeMoGymResponse.model_validate(
+                    {"model": "captured-policy", **fixture["candidate_response"]}
+                ),
+            }
+        )
+        http_response = MagicMock()
+        http_response.ok = True
+        http_response.read = AsyncMock(return_value=json.dumps(judge_response.model_dump()).encode())
+        client = MagicMock(spec=ServerClient)
+        client.post = AsyncMock(return_value=http_response)
+        server = AalcrResourcesServer(config=_config(V1_1_JUDGE_PROTOCOL), server_client=client)
+        result = await server.verify(request)
+        assert result.reward == result.reward_lt_80k == 1.0
+        assert result.invalid_model_response is False
+        assert result.invalid_judge_response is False
+        assert result.judge_response == judge_response
+        assert client.post.await_args.kwargs["json"]["input"] == fixture["judge_input"]
+        assert fixture["recorded_failure"] == "AA-LCR v1.1 judge response is not valid JSON"
 
     @pytest.mark.parametrize(
         ("judge_text", "expected_reward", "expected_invalid"),
