@@ -61,13 +61,7 @@ from nemo_gym.openai_utils import (
     _validate_atomic_token_metadata,
     training_variant_of,
 )
-
-
-def _message_content_to_text(content: Any) -> str:
-    """Plain text of a chat message content (a string, or a list of text parts)."""
-    if isinstance(content, str):
-        return content
-    return "".join(part.get("text", "") for part in content or [] if isinstance(part, dict))
+from nemo_gym.response_instructions import fold_instructions_into_messages
 
 
 def _optional_token_count(value: Any) -> Optional[int]:
@@ -248,14 +242,7 @@ class ResponsesConverter(BaseModel):
         # message: chat backends commonly admit only one system message, at position 0 (harnesses
         # like the Codex CLI send instructions plus a leading developer message).
         instructions = responses_create_params.pop("instructions", None)
-        if instructions:
-            leading_parts = [instructions]
-            while state.messages and state.messages[0]["role"] in ("system", "developer"):
-                leading_parts.append(_message_content_to_text(state.messages.pop(0)["content"]))
-            state.messages.insert(
-                0,
-                NeMoGymChatCompletionSystemMessageParam(content="\n\n".join(leading_parts), role="system"),
-            )
+        state.messages = fold_instructions_into_messages(instructions, state.messages)
 
         model = responses_create_params.pop("model", None)
         if model is not None:
