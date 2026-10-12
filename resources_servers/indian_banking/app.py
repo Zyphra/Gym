@@ -139,8 +139,7 @@ class IndianBankingResourcesServer(GymnasiumServer):
 
     async def reset(self, metadata: dict, session_id: Optional[str] = None) -> tuple[Optional[str], dict]:
         customer = metadata.get("customer")
-        world = engine.seed_world(customer)
-        world["fd_payout_consistency"] = self.config.fd_payout_consistency
+        world = engine.seed_world(customer, fd_payout_consistency=self.config.fd_payout_consistency)
 
         initial_state = metadata.get("initial_state") or {}
         init_errors = []
