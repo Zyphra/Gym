@@ -181,6 +181,9 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     propagate_context_overflow_errors: bool = False
 
     uses_reasoning_parser: bool
+    # Keep parsed backend reasoning fields on Chat Completions responses.
+    # Responses conversion continues to receive the historical think-tag content.
+    preserve_chat_completion_reasoning: bool = False
     uses_interleaved_reasoning: bool = True
     # Keep reconstructed assistant history byte-for-byte in ``content`` for
     # models whose validated direct-vLLM contract includes <think> tags.
@@ -249,6 +252,15 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     # ``data:audio/<fmt>;base64,...`` URI at request time — keeps the JSONL
     # small without depending on vLLM's ``--allowed-local-media-path``.
     audio_root: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_chat_reasoning_preservation(self) -> "VLLMModelConfig":
+        if self.preserve_chat_completion_reasoning:
+            if not self.uses_reasoning_parser:
+                raise ValueError("preserve_chat_completion_reasoning requires uses_reasoning_parser=true")
+            if self.use_completions_api:
+                raise ValueError("preserve_chat_completion_reasoning requires use_completions_api=false")
+        return self
 
     @model_validator(mode="after")
     def _validate_prefix_supply(self) -> "VLLMModelConfig":
@@ -867,6 +879,21 @@ class VLLMModel(SimpleResponsesAPIModel):
     async def chat_completions(
         self, request: Request, body: NeMoGymChatCompletionCreateParamsNonStreaming = Body()
     ) -> NeMoGymChatCompletion:
+        return await self._chat_completions(
+            request,
+            body,
+            preserve_reasoning=(
+                self.config.preserve_chat_completion_reasoning and request.url.path.endswith("/chat/completions")
+            ),
+        )
+
+    async def _chat_completions(
+        self,
+        request: Request,
+        body: NeMoGymChatCompletionCreateParamsNonStreaming,
+        *,
+        preserve_reasoning: bool,
+    ) -> NeMoGymChatCompletion:
         if self.config.use_completions_api:
             return await self._chat_completions_via_completions_api(request, body)
 
@@ -985,7 +1012,7 @@ class VLLMModel(SimpleResponsesAPIModel):
 
         choice_dict = chat_completion_dict["choices"][0]
         self._verify_generation_prefix(body_dict, chat_completion_dict)
-        if self.config.uses_reasoning_parser:
+        if self.config.uses_reasoning_parser and not preserve_reasoning:
             # See the TODO wrt reasoning_content above
             reasoning_content = choice_dict["message"].get("reasoning_content") or choice_dict["message"].get(
                 "reasoning"
@@ -1004,7 +1031,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                         [reasoning_content]
                     ) + (choice_dict["message"].get("content") or "")
 
-        else:
+        elif not self.config.uses_reasoning_parser:
             # See the TODO wrt reasoning_content above
             assert not (choice_dict["message"].get("reasoning_content") or choice_dict["message"].get("reasoning")), (
                 f"NeMo Gym server `{self.config.name}` config has explicitly been set to not use a reasoning parser i.e. `uses_reasoning_parser: false`. Please do not use a reasoning parser in your vLLM endpoint, or fix the `{self.config.name}` server config!"

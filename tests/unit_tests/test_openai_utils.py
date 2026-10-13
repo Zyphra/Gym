@@ -464,6 +464,74 @@ class TestDiscriminatedResponseItems:
 
 
 class TestNeMoGymChatCompletionSchemas:
+    def test_function_response_schema_round_trip(self) -> None:
+        payload = {
+            "messages": [{"role": "user", "content": "Inspect the file."}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "inspect",
+                        "parameters": {"type": "object", "properties": {}},
+                        "response": {
+                            "type": "object",
+                            "properties": {
+                                "contents": {"type": "string"},
+                                "size": {"type": "integer", "maximum": 2**80},
+                            },
+                        },
+                    },
+                }
+            ],
+        }
+        params = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(payload)
+        dumped = params.model_dump(exclude_unset=True)
+        round_tripped = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate_json(
+            params.model_dump_json(exclude_unset=True)
+        )
+        assert dumped == payload
+        assert round_tripped.model_dump(exclude_unset=True) == payload
+
+    def test_function_response_schema_absent_preserves_request(self) -> None:
+        payload = {
+            "messages": [{"role": "user", "content": "Inspect the file."}],
+            "tools": [{"type": "function", "function": {"name": "inspect"}}],
+        }
+        params = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(payload)
+        assert params.model_dump(exclude_unset=True) == payload
+        assert params.model_dump_json(exclude_unset=True) == (
+            '{"messages":[{"content":"Inspect the file.","role":"user"}],'
+            '"tools":[{"function":{"name":"inspect"},"type":"function"}]}'
+        )
+
+    @pytest.mark.parametrize("response", [None, [], "string", 1, True])
+    def test_function_response_schema_requires_object(self, response: object) -> None:
+        with pytest.raises(ValidationError):
+            NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(
+                {
+                    "messages": [],
+                    "tools": [{"type": "function", "function": {"name": "inspect", "response": response}}],
+                }
+            )
+
+    def test_function_response_schema_keeps_other_extras_forbidden(self) -> None:
+        with pytest.raises(ValidationError):
+            NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(
+                {
+                    "messages": [],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "inspect",
+                                "response": {},
+                                "unsupported_metadata": {},
+                            },
+                        }
+                    ],
+                }
+            )
+
     def test_user_audio_and_file_content_parts_round_trip(self) -> None:
         payload = {
             "messages": [
