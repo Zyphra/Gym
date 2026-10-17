@@ -272,6 +272,62 @@ class TestServerUtils:
         )
         assert "my mock response" == actual_response
 
+    async def test_bounded_read_timeout_fails_a_silent_call_but_not_an_episode_run(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """A peer that accepts a request and never answers fails the call, except /run."""
+        from aiohttp import ServerTimeoutError
+
+        answered = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def handle(reader, writer):
+            head = await reader.readuntil(b"\r\n\r\n")
+            if head.startswith(b"POST /run "):
+                # An episode outlives the read bound and still returns.
+                await asyncio.sleep(0.6)
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                await writer.drain()
+                answered.set()
+            else:
+                await finished.wait()
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        monkeypatch.setattr(nemo_gym.server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
+        nemo_gym.server_utils.set_global_aiohttp_client(
+            GlobalAIOHTTPAsyncClientConfig(global_aiohttp_sock_read_timeout_s=0.2)
+        )
+        server_client = ServerClient(
+            head_server_config=BaseServerConfig(host="127.0.0.1", port=1),
+            global_config_dict=DictConfig(
+                {"user_simulator": {"responses_api_models": {"m": {"host": "127.0.0.1", "port": port}}}}
+            ),
+        )
+        try:
+            started = asyncio.get_running_loop().time()
+            # One attempt on the shared client: the retry policy is not under test.
+            with raises(ServerTimeoutError):
+                await nemo_gym.server_utils.get_global_aiohttp_client().post(
+                    f"http://127.0.0.1:{port}/v1/responses", json={}
+                )
+            assert asyncio.get_running_loop().time() - started < 5
+            response = await server_client.post(server_name="user_simulator", url_path="/run", json={})
+            assert response.status == 200 and answered.is_set()
+        finally:
+            finished.set()
+            await nemo_gym.server_utils._GLOBAL_AIOHTTP_CLIENT.close()
+            monkeypatch.setattr(nemo_gym.server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
+            server.close()
+            await server.wait_closed()
+
+    def test_read_timeout_defaults_to_unbounded(self) -> None:
+        timeout = GlobalAIOHTTPAsyncClientConfig().client_timeout()
+        assert timeout.sock_read is None and timeout.total is None
+        with raises(ValueError):
+            GlobalAIOHTTPAsyncClientConfig(global_aiohttp_sock_read_timeout_s=0)
+
     async def test_ServerClient_preserves_external_capture_url(self, monkeypatch: MonkeyPatch) -> None:
         server_client = ServerClient(
             head_server_config=BaseServerConfig(host="head", port=12345),
