@@ -78,6 +78,7 @@ from nemo_gym.registry import (
     read_environment_details,
     resolve_catalog_entry,
 )
+from nemo_gym.runtime_workdir import component_launch_command
 from nemo_gym.server_status import StatusCommand
 from nemo_gym.server_utils import (
     HEAD_SERVER_KEY_NAME,
@@ -345,6 +346,8 @@ def _server_launch_command(
     global_config_dict: DictConfig,
     server_name: str,
     entrypoint_fpath: Path,
+    *,
+    runtime_workdir_root: Path | None = None,
 ) -> str:
     """Shell command that sets up a server's venv and starts its entrypoint with that venv's own interpreter.
 
@@ -353,8 +356,17 @@ def _server_launch_command(
     so activating it would silently run a different interpreter than `uv_venv_dir` selected.
     """
     venv_python_fpath = get_venv_path(dir_path, global_config_dict) / "bin" / "python"
-    return f"""{setup_env_command(dir_path, global_config_dict, server_name)} \\
+    if runtime_workdir_root is None:
+        return f"""{setup_env_command(dir_path, global_config_dict, server_name)} \\
     && {shlex.quote(str(venv_python_fpath))} {shlex.quote(str(entrypoint_fpath))}"""
+    return component_launch_command(
+        setup_env_command(dir_path, global_config_dict, server_name),
+        dir_path,
+        entrypoint_fpath,
+        runtime_root=runtime_workdir_root,
+        server_name=server_name,
+        python_executable=str(venv_python_fpath),
+    )
 
 
 class RunConfig(BaseNeMoGymCLIConfig):
@@ -414,6 +426,10 @@ class TestConfig(RunConfig):
 
 
 class RunHelper:  # pragma: no cover
+    def __init__(self, *, runtime_workdir_root: Path | None = None):
+        """Optionally launch component children in private process directories."""
+        self._runtime_workdir_root = runtime_workdir_root
+
     _head_server: uvicorn.Server
     _head_server_thread: Thread
     _head_server_instance: HeadServer
@@ -502,7 +518,13 @@ class RunHelper:  # pragma: no cover
 
             # Name the venv in the logs: the server runs that venv's interpreter (see _server_launch_command).
             print(f"Starting `{top_level_path}` from venv {get_venv_path(dir_path, global_config_dict)}")
-            command = _server_launch_command(dir_path, global_config_dict, top_level_path, entrypoint_fpath)
+            command = _server_launch_command(
+                dir_path,
+                global_config_dict,
+                top_level_path,
+                entrypoint_fpath,
+                runtime_workdir_root=self._runtime_workdir_root,
+            )
 
             extra_env = {
                 NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME: config_dict_yaml_str,
