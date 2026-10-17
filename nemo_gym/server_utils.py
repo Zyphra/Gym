@@ -22,6 +22,7 @@ import time
 from abc import abstractmethod
 from asyncio.exceptions import CancelledError
 from contextlib import asynccontextmanager
+from functools import partial
 from os import environ, getenv
 from pathlib import Path
 from threading import Thread
@@ -76,6 +77,12 @@ from nemo_gym.global_config import (
     get_first_server_config_dict,
     get_global_config_dict,
 )
+from nemo_gym.http_connection_diagnostics import (
+    ConnectionDiagnosticMixin,
+    client_trace_config,
+    diagnostic_protocol,
+    failure_context,
+)
 from nemo_gym.profiling import Profiler
 from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_from_run_body
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, safe_set_span_attributes
@@ -97,7 +104,18 @@ class _PickleSafeRequestInfo(NamedTuple):
     real_url: str
 
 
-class GlobalAIOHTTPAsyncClientConfig(BaseModel):
+class HTTPTransportDiagnosticsConfig(BaseModel):
+    global_http_transport_diagnostics: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Attach sanitized socket context to sampled request-failure logs and emit server connection-close events. "
+            "Does not enable request/response body debugging."
+        ),
+    )
+
+
+class GlobalAIOHTTPAsyncClientConfig(HTTPTransportDiagnosticsConfig):
     global_aiohttp_connector_limit: int = 100 * 1024
     global_aiohttp_connector_limit_per_host: int = 1024
 
@@ -157,14 +175,19 @@ def _make_keepalive_socket_factory(
     return factory
 
 
+class DiagnosticTCPConnector(ConnectionDiagnosticMixin, TCPConnector):
+    pass
+
+
 def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSession:  # pragma: no cover
     assert not is_global_aiohttp_client_setup(), (
         "There is already a global aiohttp client setup. Please refactor your code or call `global_aiohttp_client_exit` if you want to explicitly re-make the client!"
     )
 
     num_workers = get_nemo_gym_fastapi_num_workers()
+    connector_type = DiagnosticTCPConnector if cfg.global_http_transport_diagnostics else TCPConnector
     client_session = ClientSession(
-        connector=TCPConnector(
+        connector=connector_type(
             limit=cfg.global_aiohttp_connector_limit // num_workers,
             limit_per_host=cfg.global_aiohttp_connector_limit_per_host // num_workers,
             keepalive_timeout=15.0,
@@ -176,6 +199,7 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
         ),
         timeout=ClientTimeout(),
         cookie_jar=DummyCookieJar(),
+        trace_configs=[client_trace_config()] if cfg.global_http_transport_diagnostics else [],
     )
 
     global _GLOBAL_AIOHTTP_CLIENT
@@ -351,13 +375,20 @@ async def _request_with_retries(
     while True:
         try:
             return await client.request(method=method, url=url, **kwargs)
-        except ServerDisconnectedError:
+        except ServerDisconnectedError as error:
             global _NUM_SERVER_DISCONNECTED_ERROR
             _NUM_SERVER_DISCONNECTED_ERROR += 1
             retries += 1
             if _NUM_SERVER_DISCONNECTED_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+                context = failure_context(
+                    error,
+                    method,
+                    url,
+                    replay_allowed=True,
+                    final=_max_connection_retries is not None and retries >= _max_connection_retries,
+                )
                 print(
-                    f"[request_retry url={url} error=ServerDisconnectedError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f}] "
+                    f"[request_retry url={url} error=ServerDisconnectedError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f} context={context}] "
                     f"Hit {_NUM_SERVER_DISCONNECTED_ERROR} global `ServerDisconnectedError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
                     flush=True,
                 )
@@ -367,13 +398,20 @@ async def _request_with_retries(
                 raise
 
             await asyncio.sleep(0.5)
-        except ClientOSError:
+        except ClientOSError as error:
             global _NUM_CLIENT_OS_ERROR
             _NUM_CLIENT_OS_ERROR += 1
             retries += 1
             if _NUM_CLIENT_OS_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+                context = failure_context(
+                    error,
+                    method,
+                    url,
+                    replay_allowed=True,
+                    final=_max_connection_retries is not None and retries >= _max_connection_retries,
+                )
                 print(
-                    f"[request_retry url={url} error=ClientOSError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f}] "
+                    f"[request_retry url={url} error=ClientOSError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f} context={context}] "
                     f"Hit {_NUM_CLIENT_OS_ERROR} global `ClientOSError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
                     flush=True,
                 )
@@ -1075,6 +1113,12 @@ Full body: {json.dumps(exc.body, indent=4)}
             access_log=uvicorn_logging_cfg.uvicorn_logging_show_200_ok,
         )
 
+        transport_cfg = HTTPTransportDiagnosticsConfig.model_validate(global_config_dict)
+        if transport_cfg.global_http_transport_diagnostics:
+            from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+
+            uvicorn_kwargs["http"] = partial(diagnostic_protocol, base=HttpToolsProtocol)
+
         if server.config.num_workers and server.config.num_workers > 1:
             # TODO this is very dirty. We need a cleaner way to populate this information in the configs data structures.
             server_instance_config_dict = global_config_dict[server.config.name]
@@ -1160,6 +1204,11 @@ class HeadServer(BaseServer):
             host=server.config.host,
             port=server.config.port,
         )
+        transport_cfg = HTTPTransportDiagnosticsConfig.model_validate(get_global_config_dict())
+        if transport_cfg.global_http_transport_diagnostics:
+            from uvicorn.protocols.http.auto import AutoHTTPProtocol
+
+            config.http = partial(diagnostic_protocol, base=AutoHTTPProtocol)
         uvicorn_server = uvicorn.Server(config=config)
 
         thread = Thread(target=uvicorn_server.run, daemon=True)
