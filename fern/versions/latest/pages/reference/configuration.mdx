@@ -321,6 +321,17 @@ gym env start \
 
 ### HTTP Transport Diagnostics
 
+Caught server exceptions add one bounded `x-nemo-gym-failure-provenance` response
+header. Its versioned record contains a code-class label, an explicitly declared
+failure stage (otherwise `unknown`), and the existing safe operation/rollout
+identity when available. It contains no exception message, request/response body,
+query or arbitrary headers. This record is independent of socket diagnostics.
+`raise_for_status` attaches a valid record as
+`ClientResponseError.nemo_gym_failure_provenance`; it survives process pickling
+and HTTP relays retain the original record. Missing, malformed and oversized
+records remain unknown. The header does not change response bodies, statuses,
+retry policy or failure classification.
+
 Set the top-level strict boolean `global_http_transport_diagnostics: true` to attach
 sanitized connection context to existing sampled request-failure logs and emit
 `http_server_connection_close` events. It defaults to `false` and is independent
