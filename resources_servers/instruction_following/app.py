@@ -20,7 +20,7 @@ from typing import Any, Dict, List
 # which happens in CI where the server venv lives inside the repo root.
 import defusedxml.ElementTree  # noqa: F401
 import regex  # noqa: F401
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import model_validator
 from verifiable_instructions import instructions_registry
 
@@ -149,6 +149,17 @@ class InstructionFollowingResourcesServer(SimpleResourcesServer):
                 else:
                     is_following_list.append(False)
 
+            except (OSError, ImportError) as error:
+                # A missing checker dependency cannot grade the policy's answer.
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "stage": "verification",
+                        "cause": "instruction_checker_dependency_error",
+                        "exception_class": type(error).__name__,
+                        "instruction_id": instruction_id,
+                    },
+                ) from error
             except Exception as e:
                 # If there's an error processing the instruction, mark as failed
                 print(f"Error processing instruction {instruction_id}: {e}")
