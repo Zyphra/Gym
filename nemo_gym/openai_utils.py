@@ -1023,7 +1023,9 @@ class NeMoGymChatCompletion(ChatCompletion):
 
 
 class NeMoGymFunctionDefinition(FunctionDefinition):
-    pass
+    """A tool definition with optional response-schema metadata for compatible providers."""
+
+    response: NotRequired[Dict[str, Any]]
 
 
 class NeMoGymChatCompletionToolParam(ChatCompletionToolParam):
