@@ -83,6 +83,11 @@ from nemo_gym.http_connection_diagnostics import (
     diagnostic_protocol,
     failure_context,
 )
+from nemo_gym.http_failure_provenance import (
+    FAILURE_PROVENANCE_HEADER,
+    HTTPFailureProvenance,
+    failure_provenance_headers,
+)
 from nemo_gym.profiling import Profiler
 from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_from_run_body
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, safe_set_span_attributes
@@ -451,6 +456,9 @@ Response content: {content}""")
         except ClientResponseError as e:
             # Set the response content here so we have access to it down the line.
             e.response_content = content
+            origin = HTTPFailureProvenance.from_header(response.headers.get(FAILURE_PROVENANCE_HEADER))
+            if origin is not None:
+                e.nemo_gym_failure_provenance = origin
             # aiohttp stores unpicklable multidict proxies in this exception.
             # Preserve request details as pickle-safe values for cross-process propagation.
             request_info = e.request_info
@@ -938,7 +946,13 @@ class SimpleServer(BaseServer):
                 response_content = f"Hit an exception in {self.get_session_middleware_key()} calling an inner server: {e.response_content}"
                 print(_format_upstream_error_log(self.get_session_middleware_key(), e), flush=True)
 
-                return JSONResponse(content=response_content, status_code=500)
+                return JSONResponse(
+                    content=response_content,
+                    status_code=500,
+                    headers=failure_provenance_headers(
+                        e, method=request.method, path=request.scope["path"], relay=True
+                    ),
+                )
             except CancelledError:
                 return JSONResponse(content="Request was cancelled", status_code=500)
             except Exception as e:
@@ -947,7 +961,11 @@ class SimpleServer(BaseServer):
 Formatted exception: {format_exc()}
 repr(e): {repr(e)}"""
                 )
-                return JSONResponse(content=repr(e), status_code=500)
+                return JSONResponse(
+                    content=repr(e),
+                    status_code=500,
+                    headers=failure_provenance_headers(e, method=request.method, path=request.scope["path"]),
+                )
             except:
                 print_exc()
                 print(
