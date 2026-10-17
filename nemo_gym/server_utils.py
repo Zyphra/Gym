@@ -78,6 +78,7 @@ from nemo_gym.global_config import (
     get_first_server_config_dict,
     get_global_config_dict,
 )
+from nemo_gym.http_connection_diagnostics import client_trace_config, diagnostic_protocol, failure_context
 from nemo_gym.profiling import Profiler
 from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_from_run_body
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, safe_set_span_attributes
@@ -246,7 +247,18 @@ class _PickleSafeRequestInfo(NamedTuple):
     real_url: str
 
 
-class GlobalAIOHTTPAsyncClientConfig(BaseModel):
+class HTTPTransportDiagnosticsConfig(BaseModel):
+    global_http_transport_diagnostics: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Attach sanitized socket context to sampled request-failure logs and emit server connection-close events. "
+            "Does not enable request/response body debugging."
+        ),
+    )
+
+
+class GlobalAIOHTTPAsyncClientConfig(HTTPTransportDiagnosticsConfig):
     global_aiohttp_connector_limit: int = Field(
         default=100 * 1024,
         ge=0,
@@ -378,6 +390,7 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
     if not is_nemo_gym_fastapi_worker():
         report_connection_pool_capacity(cfg, capacity)
     connector = build_connection_pool_connector(
+        transport_debug=cfg.global_http_transport_diagnostics,
         limit=capacity.total,
         limit_per_host=capacity.per_host,
         keepalive_timeout=15.0,
@@ -391,6 +404,7 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
         connector=connector,
         timeout=ClientTimeout(),
         cookie_jar=DummyCookieJar(),
+        trace_configs=[client_trace_config()] if cfg.global_http_transport_diagnostics else [],
     )
 
     global _GLOBAL_AIOHTTP_CLIENT
@@ -596,13 +610,21 @@ async def _request_with_retries(
         while True:
             try:
                 return await client.request(method=method, url=url, **kwargs)
-            except ServerDisconnectedError:
+            except ServerDisconnectedError as error:
                 global _NUM_SERVER_DISCONNECTED_ERROR
                 _NUM_SERVER_DISCONNECTED_ERROR += 1
                 retries += 1
                 if _NUM_SERVER_DISCONNECTED_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+                    context = failure_context(
+                        error,
+                        method,
+                        url,
+                        replay_allowed=True,
+                        final=_max_connection_retries is not None and retries >= _max_connection_retries,
+                    )
                     print(
-                        f"[request_retry url={url} error=ServerDisconnectedError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f}] "
+                        f"[request_retry url={url} error=ServerDisconnectedError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f} "
+                        f"context={context}] "
                         f"Hit {_NUM_SERVER_DISCONNECTED_ERROR} global `ServerDisconnectedError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
                         flush=True,
                     )
@@ -612,13 +634,21 @@ async def _request_with_retries(
                     raise
 
                 await asyncio.sleep(0.5)
-            except ClientOSError:
+            except ClientOSError as error:
                 global _NUM_CLIENT_OS_ERROR
                 _NUM_CLIENT_OS_ERROR += 1
                 retries += 1
                 if _NUM_CLIENT_OS_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+                    context = failure_context(
+                        error,
+                        method,
+                        url,
+                        replay_allowed=True,
+                        final=_max_connection_retries is not None and retries >= _max_connection_retries,
+                    )
                     print(
-                        f"[request_retry url={url} error=ClientOSError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f}] "
+                        f"[request_retry url={url} error=ClientOSError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f} "
+                        f"context={context}] "
                         f"Hit {_NUM_CLIENT_OS_ERROR} global `ClientOSError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
                         flush=True,
                     )
@@ -1421,6 +1451,17 @@ repr(e): {repr(e)}"""
             forwarded_allow_ips=uvicorn_proxy_cfg.uvicorn_forwarded_allow_ips or [],
         )
 
+        if keepalive_cfg.global_http_transport_diagnostics:
+            uvicorn_kwargs["http"] = partial(
+                diagnostic_protocol,
+                base=KeepaliveHttpToolsProtocol,
+                keepalive=(
+                    keepalive_cfg.global_aiohttp_tcp_keepalive_idle_seconds,
+                    keepalive_cfg.global_aiohttp_tcp_keepalive_interval_seconds,
+                    keepalive_cfg.global_aiohttp_tcp_keepalive_probes,
+                ),
+            )
+
         if server.config.num_workers and server.config.num_workers > 1:
             # TODO this is very dirty. We need a cleaner way to populate this information in the configs data structures.
             server_instance_config_dict = global_config_dict[server.config.name]
@@ -1509,6 +1550,11 @@ class HeadServer(BaseServer):
             proxy_headers=uvicorn_proxy_cfg.uvicorn_proxy_headers,
             forwarded_allow_ips=uvicorn_proxy_cfg.uvicorn_forwarded_allow_ips or [],
         )
+        debug_cfg = HTTPTransportDiagnosticsConfig.model_validate(get_global_config_dict())
+        if debug_cfg.global_http_transport_diagnostics:
+            from uvicorn.protocols.http.auto import AutoHTTPProtocol
+
+            config.http = partial(diagnostic_protocol, base=AutoHTTPProtocol)
         uvicorn_server = uvicorn.Server(config=config)
 
         thread = Thread(target=uvicorn_server.run, daemon=True)

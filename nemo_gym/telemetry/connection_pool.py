@@ -260,7 +260,11 @@ class QueueTimedTCPConnector(TCPConnector):
                 logger.debug("Failed to record aiohttp connection-queue telemetry", exc_info=True)
 
 
-def build_connection_pool_connector(**kwargs: Any) -> TCPConnector:
+def build_connection_pool_connector(*, transport_debug: bool = False, **kwargs: Any) -> TCPConnector:
     """Build the timed connector only while this process exports metrics."""
     connector_cls = QueueTimedTCPConnector if is_metrics_exporter_active() else TCPConnector
+    if transport_debug:
+        from nemo_gym.http_connection_diagnostics import ConnectionDiagnosticMixin
+
+        connector_cls = type("Diagnostic" + connector_cls.__name__, (ConnectionDiagnosticMixin, connector_cls), {})
     return connector_cls(**kwargs)

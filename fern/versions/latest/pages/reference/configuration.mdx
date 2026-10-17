@@ -101,6 +101,36 @@ server_id:                    # Your unique name for this server
       # ... additional fields vary by server type
 ```
 
+### HTTP Transport Diagnostics
+
+Set the top-level strict boolean `global_http_transport_diagnostics: true` to attach
+sanitized connection context to existing sampled request-failure logs and emit
+`http_server_connection_close` events. It defaults to `false` and is independent
+of `global_aiohttp_client_request_debug`, which can print response contents.
+
+Failure context includes the method, a fixed operation label, an existing rollout
+or episode ID when available, retry permission and final-attempt status. With the
+flag enabled, it also includes the request's socket addresses, new/reused connection
+state, pool idle age when known, callback phase, timestamps and exception classes
+or numeric errno. Callback phases do not prove that the peer received bytes.
+`replay_allowed` reports the existing retry policy; it does not establish that an
+operation is safe to replay. Diagnostics do not change retries, deadlines, limits,
+responses or cancellation behavior.
+
+Server close events include socket addresses, PID, timestamps, the last parsed
+request's safe operation/ID and a local trigger when directly observed (idle
+expiry, parser rejection or idle shutdown). Other closes remain `unknown`.
+These events include normal idle closes and are not failure events. The last parsed
+request may be unrelated to a later failed request on a reused connection; match
+both socket tuples and times before attributing a close. A client EOF alone does
+not establish which process closed the connection.
+
+New diagnostic fields exclude credentials, query strings, arbitrary URL paths,
+headers, request/response contents and raw exception messages. Existing logging
+is unchanged. Leave legacy request debugging disabled when contents must not be
+logged. Both client and server need the transport flag enabled to collect evidence
+from both ends; no historical close evidence is reconstructed.
+
 ### HTTP Connection Pool
 
 Gym uses one shared aiohttp connection pool per process. Each top-level limit is a budget for
