@@ -29,7 +29,21 @@ from os import environ, getenv
 from pathlib import Path
 from threading import Thread
 from traceback import format_exc, print_exc
-from typing import Any, ClassVar, List, Literal, NamedTuple, Optional, TextIO, Tuple, Type, Union, Unpack
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    ClassVar,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    TextIO,
+    Tuple,
+    Type,
+    Union,
+    Unpack,
+)
 from uuid import uuid4
 
 import orjson
@@ -462,6 +476,8 @@ async def request(
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
     _server_name: Optional[str] = None,
+    *,
+    _before_attempt: Optional[Callable[[], Awaitable[None]]] = None,
     **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
     """Make an outbound HTTP call through Gym's shared aiohttp client.
@@ -490,6 +506,7 @@ async def request(
             _internal=_internal,
             _max_connection_retries=_max_connection_retries,
             _server_name=_server_name,
+            _before_attempt=_before_attempt,
             **kwargs,
         )
     return await _request_with_retries(
@@ -498,6 +515,7 @@ async def request(
         _internal=_internal,
         _max_connection_retries=_max_connection_retries,
         _server_name=_server_name,
+        _before_attempt=_before_attempt,
         **kwargs,
     )
 
@@ -508,6 +526,8 @@ async def _traced_request(
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
     _server_name: Optional[str] = None,
+    *,
+    _before_attempt: Optional[Callable[[], Awaitable[None]]] = None,
     **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
     """`_request_with_retries` wrapped in a CLIENT span, with `traceparent` injected.
@@ -548,6 +568,7 @@ async def _traced_request(
             _internal=_internal,
             _max_connection_retries=_max_connection_retries,
             _server_name=_server_name,
+            _before_attempt=_before_attempt,
             **kwargs,
         )
 
@@ -598,6 +619,8 @@ async def _request_with_retries(
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
     _server_name: Optional[str] = None,
+    *,
+    _before_attempt: Optional[Callable[[], Awaitable[None]]] = None,
     **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
     client = get_global_aiohttp_client()
@@ -608,6 +631,9 @@ async def _request_with_retries(
         retries = 0
         retry_start = time.monotonic()
         while True:
+            # Admission failures and cancellation stay outside the transport retry budget.
+            if _before_attempt is not None:
+                await _before_attempt()
             try:
                 return await client.request(method=method, url=url, **kwargs)
             except ServerDisconnectedError as error:
