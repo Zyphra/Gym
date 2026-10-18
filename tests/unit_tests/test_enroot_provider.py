@@ -806,15 +806,99 @@ async def test_close_missing_container_is_success(
     assert not staging.exists()
 
 
-async def test_close_real_failure_raises_but_cleans_up(
+@pytest.mark.parametrize("mode", [0o500, 0o000])
+async def test_close_read_only_staging_preserves_link_targets(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, no_killpg: list, mode: int
+) -> None:
+    staging = tmp_path / "staging"
+    nested = staging / "agent_deps_runtime" / "include" / "python3.13"
+    nested.mkdir(parents=True)
+    (nested / "header.h").write_text("header")
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o750)
+    sentinel = outside / "sentinel"
+    sentinel.write_text("keep")
+    (nested / "outside").symlink_to(outside, target_is_directory=True)
+    (nested / "dangling").symlink_to(tmp_path / "missing")
+    outside_mode = outside.stat().st_mode
+    order = []
+    for directory in [nested, nested.parent]:
+        directory.chmod(mode)
+
+    class DrainedProc(FakeProc):
+        async def wait(self) -> int:
+            assert no_killpg == [(12345, enroot_provider.signal.SIGTERM), (12345, enroot_provider.signal.SIGKILL)]
+            assert nested.parent.stat().st_mode & 0o777 == mode
+            order.append("wait")
+            return await super().wait()
+
+    def removed(argv: list[str]) -> tuple[int, str, str]:
+        assert "remove" in argv
+        assert order == ["wait"]
+        assert nested.parent.stat().st_mode & 0o777 == mode
+        order.append("remove")
+        return 0, "", ""
+
+    provider, _rec, _sr = _make_provider(monkeypatch, removed, tmp_path)
+    handle = _make_handle(staging, start_pgid=12345)
+    handle.raw.proc = DrainedProc()
+    await provider.close(handle)
+
+    assert order == ["wait", "remove"]
+    assert not staging.exists()
+    assert sentinel.read_text() == "keep"
+    assert outside.stat().st_mode == outside_mode
+
+
+@pytest.mark.parametrize("remove_fails", [False, True])
+async def test_close_refuses_staging_symlink_without_masking_remove_error(
+    fake_binary: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    remove_fails: bool,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o750)
+    sentinel = target / "sentinel"
+    sentinel.write_text("keep")
+    staging = tmp_path / "staging"
+    staging.symlink_to(target, target_is_directory=True)
+    before = target.stat().st_mode
+    result = (1, "", "permission denied") if remove_fails else (0, "", "")
+    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: result, tmp_path)
+
+    with caplog.at_level("WARNING"):
+        if remove_fails:
+            with pytest.raises(RuntimeError, match="enroot remove failed"):
+                await provider.close(_make_handle(staging))
+        else:
+            await provider.close(_make_handle(staging))
+
+    if remove_fails:
+        assert "failed to remove staging dir" not in caplog.text
+    else:
+        assert "failed to remove staging dir" in caplog.text
+        assert "expected a directory" in caplog.text
+    assert staging.is_symlink()
+    assert sentinel.read_text() == "keep"
+    assert target.stat().st_mode == before
+
+
+async def test_close_real_failure_raises_and_retains_staging(
     fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     staging = tmp_path / "staging"
     staging.mkdir()
     provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (1, "", "permission denied"), tmp_path)
+
+    def unexpected_cleanup(path: Path) -> None:
+        pytest.fail("unconfirmed removal must not change staging")
+
+    monkeypatch.setattr(enroot_provider, "remove_private_directory", unexpected_cleanup)
     with pytest.raises(RuntimeError, match="remove failed"):
         await provider.close(_make_handle(staging))
-    assert not staging.exists()
+    assert staging.is_dir()
 
 
 async def test_close_timeout_raises(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -825,9 +909,14 @@ async def test_close_timeout_raises(fake_binary: str, monkeypatch: pytest.Monkey
         raise TimeoutError("slow")
 
     provider, _rec, _sr = _make_provider(monkeypatch, responder, tmp_path)
+
+    def unexpected_cleanup(path: Path) -> None:
+        pytest.fail("unconfirmed removal must not change staging")
+
+    monkeypatch.setattr(enroot_provider, "remove_private_directory", unexpected_cleanup)
     with pytest.raises(TimeoutError):
         await provider.close(_make_handle(staging))
-    assert not staging.exists()
+    assert staging.is_dir()
 
 
 async def test_close_staging_removal_failure_is_logged(
