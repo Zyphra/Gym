@@ -875,22 +875,30 @@ async def test_close_refuses_staging_symlink_without_masking_remove_error(
         else:
             await provider.close(_make_handle(staging))
 
-    assert "failed to remove staging dir" in caplog.text
-    assert "expected a directory" in caplog.text
+    if remove_fails:
+        assert "failed to remove staging dir" not in caplog.text
+    else:
+        assert "failed to remove staging dir" in caplog.text
+        assert "expected a directory" in caplog.text
     assert staging.is_symlink()
     assert sentinel.read_text() == "keep"
     assert target.stat().st_mode == before
 
 
-async def test_close_real_failure_raises_but_cleans_up(
+async def test_close_real_failure_raises_and_retains_staging(
     fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     staging = tmp_path / "staging"
     staging.mkdir()
     provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (1, "", "permission denied"), tmp_path)
+
+    def unexpected_cleanup(path: Path) -> None:
+        pytest.fail("unconfirmed removal must not change staging")
+
+    monkeypatch.setattr(enroot_provider, "remove_private_directory", unexpected_cleanup)
     with pytest.raises(RuntimeError, match="remove failed"):
         await provider.close(_make_handle(staging))
-    assert not staging.exists()
+    assert staging.is_dir()
 
 
 async def test_close_timeout_raises(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -901,9 +909,14 @@ async def test_close_timeout_raises(fake_binary: str, monkeypatch: pytest.Monkey
         raise TimeoutError("slow")
 
     provider, _rec, _sr = _make_provider(monkeypatch, responder, tmp_path)
+
+    def unexpected_cleanup(path: Path) -> None:
+        pytest.fail("unconfirmed removal must not change staging")
+
+    monkeypatch.setattr(enroot_provider, "remove_private_directory", unexpected_cleanup)
     with pytest.raises(TimeoutError):
         await provider.close(_make_handle(staging))
-    assert not staging.exists()
+    assert staging.is_dir()
 
 
 async def test_close_staging_removal_failure_is_logged(

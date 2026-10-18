@@ -864,13 +864,13 @@ class EnrootProvider:
         except TimeoutError as e:
             remove_error = e
 
+        if remove_error is not None:
+            raise remove_error
+
         try:
             remove_private_directory(instance.staging_dir)
         except (OSError, ValueError) as e:
             LOGGER.warning("failed to remove staging dir %s: %s", instance.staging_dir, e)
-
-        if remove_error is not None:
-            raise remove_error
 
     async def aclose(self) -> None:
         """No provider-wide resources to close."""
