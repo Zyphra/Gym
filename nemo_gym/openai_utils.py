@@ -1303,34 +1303,64 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
         return await get_response_json(response)
 
     async def create_chat_completion(self, **kwargs):
-        request_kwargs = dict(
-            url=f"{self.base_url}/chat/completions",
-            json=kwargs,
+        from nemo_gym.model_call_metadata import (
+            measured_model_client,
+            record_request_metadata,
+            record_response_metadata,
         )
-        response = await self._request(method="POST", **request_kwargs)
 
-        await self._raise_for_status(response, request_kwargs)
-        return await get_response_json(response)
+        record_request_metadata(kwargs, resolved=True)
+        with measured_model_client():
+            request_kwargs = dict(
+                url=f"{self.base_url}/chat/completions",
+                json=kwargs,
+            )
+            response = await self._request(method="POST", **request_kwargs)
+
+            await self._raise_for_status(response, request_kwargs)
+            result = await get_response_json(response)
+            record_response_metadata(result, raw_client=True)
+            return result
 
     async def create_completion(self, **kwargs):
-        request_kwargs = dict(
-            url=f"{self.base_url}/completions",
-            json=kwargs,
+        from nemo_gym.model_call_metadata import (
+            measured_model_client,
+            record_request_metadata,
+            record_response_metadata,
         )
-        response = await self._request(method="POST", **request_kwargs)
 
-        await self._raise_for_status(response, request_kwargs)
-        return await get_response_json(response)
+        record_request_metadata(kwargs, resolved=True)
+        with measured_model_client():
+            request_kwargs = dict(
+                url=f"{self.base_url}/completions",
+                json=kwargs,
+            )
+            response = await self._request(method="POST", **request_kwargs)
+
+            await self._raise_for_status(response, request_kwargs)
+            result = await get_response_json(response)
+            record_response_metadata(result, raw_client=True)
+            return result
 
     async def create_response(self, **kwargs):
-        request_kwargs = dict(
-            url=f"{self.base_url}/responses",
-            json=kwargs,
+        from nemo_gym.model_call_metadata import (
+            measured_model_client,
+            record_request_metadata,
+            record_response_metadata,
         )
-        response = await self._request(method="POST", **request_kwargs)
 
-        await self._raise_for_status(response, request_kwargs)
-        return await get_response_json(response)
+        record_request_metadata(kwargs, resolved=True)
+        with measured_model_client():
+            request_kwargs = dict(
+                url=f"{self.base_url}/responses",
+                json=kwargs,
+            )
+            response = await self._request(method="POST", **request_kwargs)
+
+            await self._raise_for_status(response, request_kwargs)
+            result = await get_response_json(response)
+            record_response_metadata(result, raw_client=True)
+            return result
 
     async def create_tokenize(self, **kwargs):
         base_url = self.base_url.removesuffix("/v1")
