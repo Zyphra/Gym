@@ -156,46 +156,7 @@ class NemoGymLLM(BaseLLM):
         choices = response_dict.get("choices", [])
         choice = choices[0] if isinstance(choices, list) and choices else {}
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
-        content = message.get("content", "") if isinstance(message, dict) else ""
-        if content is None:
-            content = ""
-        reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
-
-        # Extract reasoning from the response content.  There are two cases:
-        #
-        # 1. Content has matched open+close tags (e.g. "<think>rc</think>text"):
-        #    vllm_model app.py wraps reasoning this way when uses_reasoning_parser is true.
-        #    We mirror vllm_model app.py's _parse_think_tags exactly: findall + sub to
-        #    strip all <think> blocks, but only keep the FIRST match as reasoning_content.
-        #    No .strip() — preserve whitespace so round-tripping is lossless.
-        #
-        # 2. Content has only a close tag (e.g. "rc</think>text"):
-        #    The open tag was in the generation prompt (e.g. nano-v3 appends
-        #    <think>\n to every prompt), so the model's output starts mid-think.
-        if reasoning_content is None and isinstance(content, str):
-            if _THINK_OPEN in content:
-                # Case 1: matched open+close tags.
-                matches = _THINK_PATTERN.findall(content)
-                remaining = _THINK_PATTERN.sub("", content)
-                if matches:
-                    if remaining:
-                        reasoning_content = matches[0]
-                        content = remaining
-                    else:
-                        # Entire output classified as reasoning — model didn't
-                        # generate the close tag.  Treat as content so the agent
-                        # can act on it; leave reasoning_content None so the
-                        # merge won't inject a close tag that was never generated
-                        # (which would break token contiguity).
-                        content = matches[0]
-                        reasoning_content = None
-            elif _THINK_CLOSE in content:
-                # Case 2: unmatched close tag — open tag was in the generation
-                # prompt (e.g. nanov3 appends <think>\n), so the model's output
-                # starts mid-think.  Split on the first close tag.
-                parts = content.split(_THINK_CLOSE, 1)
-                reasoning_content = parts[0]
-                content = parts[1] if len(parts) > 1 else ""
+        content, reasoning_content = self._parse_response_content(message)
 
         if isinstance(choice, dict) and choice.get("finish_reason") == "length":
             raise OutputLengthExceededError(
@@ -232,6 +193,32 @@ class NemoGymLLM(BaseLLM):
             completion_token_ids=completion_token_ids,
             logprobs=logprobs,
         )
+
+    def _parse_response_content(self, message: Any) -> tuple[Any, Any]:
+        content = message.get("content", "") if isinstance(message, dict) else ""
+        if content is None:
+            content = ""
+        reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
+
+        # Preserve Harbor's legacy reasoning split, including reasoning-only
+        # output and an opener supplied by the generation prompt.
+        if reasoning_content is None and isinstance(content, str):
+            if _THINK_OPEN in content:
+                matches = _THINK_PATTERN.findall(content)
+                remaining = _THINK_PATTERN.sub("", content)
+                if matches:
+                    if remaining:
+                        reasoning_content = matches[0]
+                        content = remaining
+                    else:
+                        content = matches[0]
+                        reasoning_content = None
+            elif _THINK_CLOSE in content:
+                parts = content.split(_THINK_CLOSE, 1)
+                reasoning_content = parts[0]
+                content = parts[1] if len(parts) > 1 else ""
+
+        return content, reasoning_content
 
     def get_model_context_limit(self) -> int:
         fallback_context_limit = 1000000

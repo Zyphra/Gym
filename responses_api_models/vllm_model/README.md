@@ -11,6 +11,12 @@ receives the upstream call:
 | `false` (default)             | `POST /v1/chat/completions`  | Instruct models. vLLM applies the chat template and runs reasoning- / tool-call parsers server-side. |
 | `true`                        | `POST /v1/completions`       | Base (non-instruct) models. Caller renders the full prompt upstream and forwards bytes verbatim. |
 
+Session cookies select an endpoint using the existing deterministic SHA256
+mapping across workers. Selection reads the current client list on each request,
+so a published endpoint change also moves existing sessions without retaining
+a per-session client map. Endpoint refresh, retry and stale-grace settings are
+unchanged.
+
 ## `use_completions_api: false` (default)
 
 Standard path. Configure with `configs/vllm_model.yaml` (rollouts) or
