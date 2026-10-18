@@ -79,7 +79,10 @@ async def call_judge(
         await raise_for_status(http_response)
         return response_model.model_validate(await get_response_json(http_response))
 
-    return await reraise_judge_errors(_call())
+    from nemo_gym.model_call_metadata import model_call_context
+
+    with model_call_context("judge", preserve_operation=True):
+        return await reraise_judge_errors(_call())
 
 
 def judge_failsafe(verify_fn: Callable) -> Callable:

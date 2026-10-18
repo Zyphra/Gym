@@ -570,6 +570,10 @@ class ServerClient(BaseModel):
         ):
             url_path = f"{rollout_path_prefix(rollout_id)}{url_path}"
 
+        from nemo_gym.model_call_metadata import metadata_headers
+
+        if headers := metadata_headers():
+            kwargs["headers"] = {**(kwargs.get("headers") or {}), **headers}
         return await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
 
     async def get(

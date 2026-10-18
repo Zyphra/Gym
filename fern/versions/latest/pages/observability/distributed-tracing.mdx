@@ -137,3 +137,33 @@ omits `job`, so each rollout becomes its own bounded root trace. See
 The `telemetry:` block reaches servers through environment variables exported before the
 servers start. If you set them after `gym env start` is already running, the servers never
 see them. Set them in the shell before you start the run.
+
+## Metadata-only model calls
+
+`model_call_capture_metadata_only: true` uses the existing rollout-keyed capture
+store and `ModelCallRecord` schema without buffering or writing request/response
+bodies, raw strings, tool outputs or token IDs. It requires observability and an
+absolute `model_call_capture_dir`; it is separate from content/token custody.
+The projection records native call/operation IDs, caller-declared role, requested
+and resolved sampling profiles, returned input/output/reasoning/cache usage and
+local monotonic elapsed durations. Missing usage or resolved profile stays null
+or absent. The resolved profile is observed at the native model HTTP client after adapter
+sampling changes, when that client is used; other adapters remain unknown.
+
+`model_call_context` labels an actual caller owner and optional dependency IDs.
+Unlabelled calls remain `unknown`; a model-server name is not a semantic role.
+Configured header propagation adds diagnostic identity and leaves request JSON,
+`X-Session-ID`, routing, retries and sampling intact. Native judge calls declare
+`judge`; task-owned user, lock, cache, semaphore, thread-start and policy-inbox
+boundaries may add their own measured spans. These are nested owner spans, not
+disjoint engine-time stages. A policy inbox wait includes external policy work;
+a thread-start delay is not a proven thread-limiter queue.
+
+`client_elapsed_ms` covers the native non-streaming model HTTP call through
+status/body decoding, including failures and cancellation. It does not identify
+backend physical retry attempts. `server_queue_ms` and `server_service_ms` remain
+null until native per-request queue/service boundaries exist. HTTP handler total,
+helper pool gauges and timestamps on different hosts cannot supply them. Unix
+bounds are correlation only; elapsed durations use a single monotonic clock.
+Metadata persistence failures leave unavailable evidence and never replay or
+replace the model result. Full capture remains a separate explicit selection.

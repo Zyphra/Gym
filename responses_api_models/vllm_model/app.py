@@ -453,6 +453,9 @@ class VLLMModel(SimpleResponsesAPIModel):
         """
         if self.config.sampling_overrides:
             body_dict.update(self.config.sampling_overrides)
+        from nemo_gym.model_call_metadata import record_request_metadata
+
+        record_request_metadata(body_dict, resolved=True)
         return body_dict
 
     async def _responses_native(
