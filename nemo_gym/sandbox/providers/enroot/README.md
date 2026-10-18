@@ -3,6 +3,13 @@
 A [NeMo Gym](../../../../README.md) sandbox provider backed by the local
 [enroot](https://github.com/NVIDIA/enroot) CLI.
 
+On close, the provider keeps its existing kill, wait, and rootfs-removal order
+before deleting that sandbox's private staging directory. Directory permissions
+created by sandbox workloads may be read-only; cleanup restores owner access
+inside the private tree without following symlinks or changing their targets.
+Staging cleanup failures, including a substituted root symlink, are logged
+without replacing an initiating Enroot removal error.
+
 ## Quick start
 
 **Step 1 — start the NeMo Gym container:**
