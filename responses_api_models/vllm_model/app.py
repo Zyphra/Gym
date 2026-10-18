@@ -353,7 +353,6 @@ class VLLMModel(SimpleResponsesAPIModel):
             for base_url in self.config.base_url
         ]
 
-        self._session_id_to_client: Dict[str, NeMoGymAsyncOpenAI] = dict()
         self._endpoint_file_mtime: Optional[float] = None
         self._endpoint_missing_since: Optional[float] = None
         self._endpoint_last_check_at: Optional[float] = None
@@ -1744,8 +1743,6 @@ class VLLMModel(SimpleResponsesAPIModel):
                 max_connection_retries=self.config.endpoint_connection_retries,
             )
         ]
-        # Every session re-resolves onto the new host.
-        self._session_id_to_client.clear()
 
     def _note_endpoint_unpublished(self) -> None:
         now = monotonic()
@@ -1762,16 +1759,11 @@ class VLLMModel(SimpleResponsesAPIModel):
     def _resolve_client(self, request: Request) -> NeMoGymAsyncOpenAI:
         self._maybe_rebind_endpoint()
         session_id = request.session[SESSION_ID_KEY]
-        if session_id not in self._session_id_to_client:
-            # Uvicorn workers do not share this cache. A stable assignment keeps
-            # every turn in a session on the same vLLM endpoint across workers.
-            digest = hashlib.sha256(session_id.encode("utf-8")).digest()
-            client_idx = int.from_bytes(digest[:8], byteorder="big") % len(self._clients)
-            client = self._clients[client_idx]
-            self._session_id_to_client[session_id] = client
-        client = self._session_id_to_client[session_id]
-
-        return client
+        # Every worker derives the same endpoint for a session; a refreshed
+        # client list takes effect immediately without retaining session state.
+        digest = hashlib.sha256(session_id.encode("utf-8")).digest()
+        client_idx = int.from_bytes(digest[:8], byteorder="big") % len(self._clients)
+        return self._clients[client_idx]
 
 
 if __name__ == "__main__":

@@ -3,6 +3,11 @@
 This agent integrates [Harbor](https://github.com/laude-institute/harbor) into NeMo Gym.
 It runs Harbor agents (e.g., `terminus-2`) in Harbor-managed environments and returns NeMo Gym-compatible outputs.
 
+The Harbor `NemoGymLLM` owns the client lifecycle, token metadata and call
+implementation also used by standalone Terminus. Harbor keeps its existing
+reasoning parser; the standalone subclass retains its stricter actionable-content
+and model-transport attribution behavior. Their import paths remain supported.
+
 ## Table of Contents
 
 - [Overview](#overview)

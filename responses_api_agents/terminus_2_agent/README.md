@@ -30,3 +30,9 @@ sets `workspace_root: "."` because each task already runs in an isolated contain
 
 The agent converts the Terminus-2 trajectory to Responses API messages and tool
 calls. Sampling parameters are forwarded to the configured model server.
+
+The standalone LLM shares Harbor's Gym client, token metadata, retry and close
+implementation. Its adapter keeps raw reasoning out of executable content,
+including unfinished `<think>` blocks, and records model transport failures
+separately from context or output limits. Both LLM import paths remain supported;
+timeouts and sampling are unchanged by this consolidation.

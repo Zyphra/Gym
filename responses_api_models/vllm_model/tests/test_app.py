@@ -15,6 +15,8 @@
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Union
 from unittest.mock import AsyncMock, MagicMock
 
@@ -809,26 +811,52 @@ class TestApp:
             assert response.status_code == 200
             assert '"finish_reason": "length"' in response.text
 
-    def test_session_client_routing_is_stable_across_workers(self, monkeypatch: MonkeyPatch) -> None:
+    @mark.parametrize("client_count", [1, 2, 4, 7])
+    @mark.parametrize(
+        ("session_id", "routing_value"),
+        [
+            ("", 16406829232824261652),
+            ("target-session", 4772610851126946157),
+            ("café-会話", 17676968387979039187),
+            ("session-" + "x" * 128, 10943644236445719018),
+        ],
+    )
+    def test_session_client_routing_is_stable_across_workers(
+        self, monkeypatch: MonkeyPatch, client_count: int, session_id: str, routing_value: int
+    ) -> None:
         workers = [self._setup_server(monkeypatch) for _ in range(2)]
+        for index, worker in enumerate(workers):
+            worker._clients = [MagicMock(spec=NeMoGymAsyncOpenAI) for _ in range(client_count)]
+            for prior in range(index + 1):
+                prior_request = MagicMock(session={SESSION_ID_KEY: f"prior-{index}-{prior}"})
+                worker._resolve_client(prior_request)
+
+        request = MagicMock(session={SESSION_ID_KEY: session_id})
+        # Fixed vectors from the original routing implementation also cover
+        # UTF-8, empty IDs, one endpoint and non-power-of-two replica counts.
         for worker in workers:
-            worker._clients = [MagicMock(spec=NeMoGymAsyncOpenAI) for _ in range(4)]
+            expected_client = worker._clients[routing_value % client_count]
+            assert worker._resolve_client(request) is expected_client
+            assert worker._resolve_client(request) is expected_client
 
-        workers[0]._session_id_to_client = {"prior-a": workers[0]._clients[0]}
-        workers[1]._session_id_to_client = {
-            "prior-b": workers[1]._clients[0],
-            "prior-c": workers[1]._clients[1],
-            "prior-d": workers[1]._clients[2],
-        }
-        request = MagicMock()
-        request.session = {SESSION_ID_KEY: "target-session"}
-
-        client_indices = []
-        for worker in workers:
-            selected_client = worker._resolve_client(request)
-            client_indices.append(next(i for i, client in enumerate(worker._clients) if client is selected_client))
-
-        assert client_indices[0] == client_indices[1]
+    def test_existing_session_follows_reinitialized_client_order_and_length(self, monkeypatch: MonkeyPatch) -> None:
+        server = self._setup_server(monkeypatch)
+        request = MagicMock(session={SESSION_ID_KEY: "target-session"})
+        previous_client = server._resolve_client(request)
+        # Local model/proxy setup uses _post_init after publishing its URL list.
+        # The original session map reset there; fixed routing must do the same.
+        for urls in [
+            ["http://a/v1", "http://b/v1", "http://c/v1", "http://d/v1"],
+            ["http://b/v1", "http://c/v1", "http://d/v1", "http://a/v1"],
+            ["http://a/v1", "http://d/v1"],
+            ["http://new/v1"],
+        ]:
+            server.config.base_url = urls
+            server._post_init()
+            selected_client = server._resolve_client(request)
+            assert selected_client is not previous_client
+            assert selected_client.base_url == urls[4772610851126946157 % len(urls)]
+            previous_client = selected_client
 
     def test_responses_multistep(self, monkeypatch: MonkeyPatch):
         server = self._setup_server(monkeypatch)
@@ -4179,8 +4207,6 @@ class TestCompletionsBackendEndToEnd:
             side_effect=AssertionError("create_chat_completion must not be called")
         )
         model._clients = [fake_client]
-        # Reset the per-session client routing so the new mock is picked up.
-        model._session_id_to_client = {}
         return fake_client, captured
 
     def test_chat_completions_call_routes_to_create_completion(self, monkeypatch: MonkeyPatch) -> None:
@@ -4625,7 +4651,6 @@ class TestCompletionsBackendChatTemplateRender:
         fake_client = MagicMock(spec=NeMoGymAsyncOpenAI)
         fake_client.create_completion = fake_create_completion
         model._clients = [fake_client]
-        model._session_id_to_client = {}
 
         # Patch _resolve_client to skip the session machinery.
         model._resolve_client = lambda r: fake_client  # type: ignore[assignment]
@@ -5186,6 +5211,14 @@ class TestSamplingOverrides:
 
 
 class TestEndpointFile:
+    @staticmethod
+    def _publish(endpoint_file: Path, content: str) -> None:
+        previous = endpoint_file.stat().st_mtime if endpoint_file.exists() else 0
+        endpoint_file.write_text(content)
+        # Filesystems may coarsen mtimes across immediate successive writes.
+        published = max(previous, endpoint_file.stat().st_mtime) + 1
+        os.utime(endpoint_file, (published, published))
+
     def _make_server(self, tmp_path, **overrides) -> VLLMModel:
         params = dict(
             host="0.0.0.0",
@@ -5202,12 +5235,24 @@ class TestEndpointFile:
         params.update(overrides)
         return VLLMModel(config=VLLMModelConfig(**params), server_client=MagicMock(spec=ServerClient))
 
-    def test_publish_rebinds_clients_and_clears_sessions(self, tmp_path) -> None:
-        (tmp_path / "endpoint.txt").write_text("http://new-host:8712/v1\n")
-        server = self._make_server(tmp_path, endpoint_check_interval_s=3600.0)
-        server._session_id_to_client["session-on-old-host"] = server._clients[0]
+    @mark.parametrize(
+        "initial_urls",
+        [
+            ["http://placeholder:8712/v1"],
+            ["http://first:8712/v1", "http://second:8712/v1", "http://third:8712/v1"],
+        ],
+    )
+    def test_publish_rebinds_existing_session_to_new_client(self, tmp_path, initial_urls) -> None:
+        server = self._make_server(tmp_path, base_url=initial_urls, endpoint_check_interval_s=3600.0)
+        request = MagicMock(session={SESSION_ID_KEY: "session-on-old-host"})
+        original_client = server._resolve_client(request)
+        assert original_client.base_url in initial_urls
+        self._publish(tmp_path / "endpoint.txt", "http://new-host:8712/v1\n")
+        server._endpoint_last_check_at = None
 
-        server._maybe_rebind_endpoint()
+        rebound_client = server._resolve_client(request)
+        assert rebound_client is not original_client
+        assert rebound_client.base_url == "http://new-host:8712/v1"
 
         assert server.config.base_url == ["http://new-host:8712/v1"]
         assert [client.base_url for client in server._clients] == ["http://new-host:8712/v1"]
@@ -5215,15 +5260,15 @@ class TestEndpointFile:
         # against a dead host fail fast and re-enter through the rebound
         # client; sessions re-resolve onto the new host.
         assert server._clients[0].max_connection_retries == 8
-        assert not server._session_id_to_client
         # Within endpoint_check_interval_s the filesystem is left alone, so a
         # fresh publish is only seen once the window is over.
-        (tmp_path / "endpoint.txt").write_text("http://newer-host:8712/v1\n")
+        self._publish(tmp_path / "endpoint.txt", "http://newer-host:8712/v1\n")
         server._maybe_rebind_endpoint()
         assert server.config.base_url == ["http://new-host:8712/v1"]
         server._endpoint_last_check_at = None  # window over: the next call re-checks
         server._maybe_rebind_endpoint()
         assert server.config.base_url == ["http://newer-host:8712/v1"]
+        assert server._resolve_client(request).base_url == "http://newer-host:8712/v1"
         # Static base_url clients keep today's retry-forever behavior.
         assert self._make_server(tmp_path, endpoint_file=None)._clients[0].max_connection_retries is None
 
@@ -5236,13 +5281,13 @@ class TestEndpointFile:
         server._maybe_rebind_endpoint()  # absent: the clock starts, last known-good client kept
         assert server.config.base_url == ["http://placeholder:8712/v1"]
         now = 1100.0
-        endpoint_file.write_text("")  # empty is as unpublished as missing: no clock reset
+        self._publish(endpoint_file, "")  # empty is as unpublished as missing: no clock reset
         server._maybe_rebind_endpoint()
         now = 1301.0  # past the grace COUNTED FROM 1000, proving the empty write reset nothing
         with raises(RuntimeError, match="no longer published"):
             server._maybe_rebind_endpoint()
 
-        endpoint_file.write_text("http://placeholder:8712/v1\n")  # republish on the SAME host
+        self._publish(endpoint_file, "http://placeholder:8712/v1\n")  # republish on the SAME host
         now = 1301.5  # within the check window: the publish is not seen yet, the raise stays loud
         with raises(RuntimeError, match="no longer published"):
             server._maybe_rebind_endpoint()

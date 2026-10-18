@@ -33,6 +33,11 @@ from responses_api_agents.harbor_agent.app import (
 from responses_api_agents.harbor_agent.utils import HarborAgentUtils
 
 
+@pytest.fixture(autouse=True)
+def private_results_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+
 # ---------------------------------------------------------------------------
 # Trajectory / step builders
 # ---------------------------------------------------------------------------
