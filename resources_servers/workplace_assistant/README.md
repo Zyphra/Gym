@@ -40,6 +40,12 @@ independent forwards, creations and plots in either order while rejecting wrong
 recipients, record IDs, fields, omitted writes and unintended changes. Final
 answers and evidence-read order remain outside the state grader.
 
+Sent email is graded as sent, not as the final mailbox shows it. Replay records
+every email each action creates (send, reply, forward), and the predicted and
+reference replays must send the same multiset of emails by content. Deleting a
+wrong email does not unsend it, so a wrong send followed by a delete and a
+correct resend fails even though the final mailbox matches.
+
 Calendar start times and durations compare their validated `Timestamp` and
 integer-minute values, so equivalent ISO timestamps and leading-zero durations
 are accepted. Naive and timezone-aware timestamps remain distinct; different
