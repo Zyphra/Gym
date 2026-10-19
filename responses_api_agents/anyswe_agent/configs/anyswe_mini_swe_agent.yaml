@@ -1,0 +1,32 @@
+anyswe_mini_swe_agent:
+  responses_api_agents:
+    anyswe_agent:
+      entrypoint: app.py
+      domain: coding
+      description: SWE-bench run by mini-swe-agent natively inside the task container.
+      value: Eval software engineering capabilities on SWE-bench with any Gym agent.
+
+      agent_server_module: responses_api_agents.mini_swe_agent_local.app
+      agent_server_class: MiniSweAgent
+      agent_config_class: MiniSweAgentConfig
+      agent_kwargs:
+        model: model
+        step_limit: 250
+        command_timeout: 180
+        temperature: 1.0
+
+      container_formatter: ${oc.env:ANYSWE_CONTAINER_FORMATTER}
+      sandbox_provider: sandbox
+      sandbox_model_base_url: ${oc.env:NEMO_GYM_SANDBOX_MODEL_BASE_URL,null}
+      swebench_agent_timeout: 2700
+      swebench_tests_timeout: 1800
+      concurrency: 4
+
+      model_server:
+        name: policy_model
+        type: responses_api_models
+
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: responses_api_agents/anyswe_agent/data/example.jsonl

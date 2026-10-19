@@ -44,7 +44,7 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import ModelServerRef
-from nemo_gym.judge import call_judge
+from nemo_gym.judge import JudgeError, call_judge
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponse,
@@ -131,6 +131,9 @@ Analyze carefully, then respond with exactly [[YES]] or [[NO]] on the last line.
     # Labels for verdict extraction
     yes_label: str = Field(default="[[YES]]", description="Label indicating YES verdict")
     no_label: str = Field(default="[[NO]]", description="Label indicating NO verdict")
+
+    strict_judge_response: bool = False
+    """Malformed or incomplete judge replies are failures, never inferred NO verdicts."""
 
 
 class MultiChallengeRunRequest(BaseRunRequest):
@@ -324,10 +327,27 @@ class MultiChallengeServer(SimpleResourcesServer):
             json=request_params,
             response_model=NeMoGymResponse,
         )
+        if self.config.strict_judge_response and (
+            judge_response.status != "completed"
+            or judge_response.error is not None
+            or judge_response.incomplete_details is not None
+            or any(
+                getattr(item, "status", None) != "completed"
+                for item in judge_response.output
+                if getattr(item, "type", None) == "message"
+            )
+        ):
+            raise JudgeError("MultiChallenge judge reply is incomplete or failed")
         judge_text = _extract_text_from_response(judge_response, exclude_thinking=True)
 
         # Extract verdict
-        verdict = _extract_verdict(judge_text, self.config.yes_label, self.config.no_label)
+        if self.config.strict_judge_response:
+            last_line = judge_text.strip().rsplit("\n", 1)[-1].strip()
+            if last_line not in (self.config.yes_label, self.config.no_label):
+                raise JudgeError("MultiChallenge judge reply has no terminal verdict marker")
+            verdict = "YES" if last_line == self.config.yes_label else "NO"
+        else:
+            verdict = _extract_verdict(judge_text, self.config.yes_label, self.config.no_label)
 
         # Score based on whether verdict matches expected criteria
         if pass_criteria.upper() == "YES":

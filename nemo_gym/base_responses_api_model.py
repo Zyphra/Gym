@@ -181,7 +181,7 @@ def _orjson_dispatch_response(content: Any) -> Any:
     if isinstance(content, Response):
         return content
     if isinstance(content, BaseModel):
-        content = content.model_dump(mode="json")
+        content = content.model_dump(mode="json", by_alias=True)
     return Response(content=orjson.dumps(content), media_type="application/json")
 
 
@@ -422,8 +422,16 @@ class ModelCallCaptureConfig(BaseModel):
     """Run-wide model-call capture settings from Gym's global config."""
 
     observability_enabled: bool = False
+    # Observability also drives rollout correlation (the ``/ng-rollout/<id>`` prefix and the
+    # session header derived from it). ``false`` keeps that correlation and writes no
+    # per-rollout capture files, so a run can correlate without a capture directory.
+    model_call_capture_enabled: bool = True
     model_call_capture_metadata_only: bool = False
     model_call_capture_dir: Optional[Path] = None
+
+    @property
+    def capture_store_enabled(self) -> bool:
+        return self.observability_enabled and self.model_call_capture_enabled
 
     @model_validator(mode="after")
     def validate_metadata_capture_dir(self):
@@ -434,7 +442,7 @@ class ModelCallCaptureConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_capture_dir(self) -> "ModelCallCaptureConfig":
-        if not self.observability_enabled:
+        if not self.capture_store_enabled:
             return self
         if self.model_call_capture_dir is None:
             raise ValueError("model_call_capture_dir is required when observability_enabled=true")
@@ -957,7 +965,7 @@ def make_capture_store(config: ModelCallCaptureConfig) -> Optional[CaptureStore]
             logger.warning("Could not initialize metadata-only model-call capture")
             return None
 
-    if not config.observability_enabled:
+    if not config.capture_store_enabled:
         return None
     root = config.model_call_capture_dir
     assert root is not None  # enforced by ModelCallCaptureConfig
@@ -1318,6 +1326,13 @@ class _CaptureMiddleware:
         self._token_capture_enabled = token_capture_enabled
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from nemo_gym.rollout_correlation import rollout_context
+
+        match = _ROLLOUT_PATH_RE.match(scope.get("path", "")) if scope.get("type") == "http" else None
+        with rollout_context(match.group("rollout_id") if match else None):
+            await self._call(scope, receive, send)
+
+    async def _call(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
             await self._app(scope, receive, send)
             return
@@ -1712,7 +1727,7 @@ def model_call_capture_dirs_from_config(global_config_dict: Any) -> list[Path]:
     config = ModelCallCaptureConfig.model_validate(global_config_dict)
     if config.observability_enabled and config.model_call_capture_metadata_only:
         return [config.model_call_capture_dir]
-    if not config.observability_enabled:
+    if not config.capture_store_enabled:
         return []
     assert config.model_call_capture_dir is not None  # enforced by ModelCallCaptureConfig
     return [config.model_call_capture_dir]

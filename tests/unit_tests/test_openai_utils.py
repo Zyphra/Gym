@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from copy import deepcopy
-from types import SimpleNamespace, UnionType
+from types import UnionType
 from typing import (
     Annotated,
     Any,
@@ -27,7 +27,6 @@ from typing import (
     get_origin,
     get_type_hints,
 )
-from unittest.mock import AsyncMock
 
 import openai
 import pytest
@@ -69,7 +68,6 @@ from openai.types.responses.response_output_item import (
 from pydantic import ValidationError
 
 from nemo_gym.openai_utils import (
-    MAX_NUM_TRIES,
     RESPONSES_TO_TRAIN,
     NeMoGymAsyncOpenAI,
     NeMoGymChatCompletion,
@@ -129,18 +127,33 @@ class TestOpenAIUtils:
     async def test_NeMoGymAsyncOpenAI(self) -> None:
         NeMoGymAsyncOpenAI(api_key="abc", base_url="https://api.openai.com/v1")
 
-    async def test_external_endpoint_retries_are_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        response = SimpleNamespace(status=504, content=SimpleNamespace(read=AsyncMock(return_value=b"")))
-        request = AsyncMock(side_effect=[response] * MAX_NUM_TRIES + [SimpleNamespace(status=200)])
-        monkeypatch.setattr("nemo_gym.openai_utils.request", request)
-        monkeypatch.setattr("nemo_gym.openai_utils.sleep", AsyncMock())
-        monkeypatch.setattr("nemo_gym.openai_utils.raise_for_status", AsyncMock(side_effect=RuntimeError))
+    async def test_failed_model_post_is_not_replayed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from aiohttp import ClientResponseError, ClientSession, web
+        from nemo_gym import server_utils
 
-        client = NeMoGymAsyncOpenAI(api_key="abc", base_url="https://example.com/v1")
-        with pytest.raises(RuntimeError):
-            await client._request_with_retry()
+        calls = []
 
-        assert request.await_count == MAX_NUM_TRIES
+        async def completed_but_failed(request):
+            calls.append(await request.json())
+            return web.Response(status=504, text="response outcome unknown")
+
+        app = web.Application()
+        app.router.add_post("/chat/completions", completed_but_failed)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        try:
+            async with ClientSession() as session:
+                monkeypatch.setattr(server_utils, "get_global_aiohttp_client", lambda: session)
+                client = NeMoGymAsyncOpenAI(api_key="test", base_url=f"http://127.0.0.1:{port}", internal=True)
+                with pytest.raises(ClientResponseError) as caught:
+                    await client.create_chat_completion(model="test", messages=[])
+                assert caught.value.status == 504
+                assert len(calls) == 1
+        finally:
+            await runner.cleanup()
 
 
 class TestNeMoGymResponseCreateParamsNonStreaming:

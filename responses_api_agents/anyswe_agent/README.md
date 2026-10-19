@@ -47,7 +47,15 @@ task image through its `image` field or `container_formatter`.
 ## Agents
 
 The included configurations run Hermes Agent, Claude Code, Cline, Pi, OpenClaw, or OpenCode
-with the same sandbox and grading path. Configure another Gym agent with:
+with the same sandbox and grading path.
+
+Agents whose configuration declares `working_directory` receive the sandbox's
+task working directory unless `agent_kwargs` explicitly supplies one. Pi uses
+this directory for its CLI tools while keeping its temporary HOME separate;
+standalone Pi retains its temporary-workspace default. The submitted patch still
+comes from the task repository through the normal AnySWE extraction path.
+
+Configure another Gym agent with:
 
 ```yaml
 agent_server_module: responses_api_agents.hermes_agent.app
@@ -68,6 +76,20 @@ agent into each task image. `agent_runtime_source` controls other delivery modes
 - An HTTP(S) URL downloads a prebuilt runtime inside the sandbox.
 
 Each archive must contain the runtime's `bin/python` at its root.
+
+A directory `agent_runtime_source` (an unpacked runtime on a filesystem every
+node mounts) is bind-mounted read-only at `/agent_deps_mount` instead of being
+copied; it needs the Apptainer provider. Archives and URLs remain the path for
+providers without bind mounts.
+
+`agent_runtime_overlay` maps package paths to directories or selected `.py` paths
+to Python files. Modules take precedence on `PYTHONPATH`; shared Gym modules fall
+back to the pinned archive. Use it
+for first-party agent packages so editing them does not repack the archive;
+third-party dependencies stay in the pinned runtime.
+
+Package directories also ship `.ts` source files for agent extensions. Other
+assets remain excluded from the overlay.
 
 Private task images can pass registry credentials through
 `sandbox_spec.provider_options.image_auth`.

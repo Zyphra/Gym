@@ -1,0 +1,125 @@
+[
+  {
+    "harness": "pi",
+    "source_sha256": "aebfd849136d2bc2c005cdfb2d04b5b7a9919fb4e7a88fa99b2de5d771dfe78e",
+    "response": {
+      "id": "resp_bf79443778b84afd95ff5039e098a16f",
+      "created_at": 1791691819.0,
+      "model": "model",
+      "object": "response",
+      "output": [
+        {
+          "id": "msg_78cafc7b2ef14a9b8acf3250861610f0",
+          "content": [
+            {
+              "annotations": [],
+              "text": "",
+              "type": "output_text",
+              "logprobs": null
+            }
+          ],
+          "role": "assistant",
+          "status": "completed",
+          "type": "message",
+          "phase": null
+        }
+      ],
+      "parallel_tool_calls": true,
+      "tools": [],
+      "tool_choice": "auto",
+      "status": null,
+      "error": null,
+      "usage": {
+        "input_tokens": 0,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens": 0,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 0
+      },
+      "_ng_agent_observations": {
+        "source": "pi",
+        "records": [
+          {
+            "kind": "agent_invocation",
+            "invocation_id": "5227c7ce10f645898e2f2d89316e640b",
+            "parent_invocation_id": null,
+            "status": "failed",
+            "model_calls": []
+          }
+        ]
+      }
+    }
+  },
+  {
+    "harness": "hermes",
+    "source_sha256": "0cd5593f1464dbb233f1af07974709b0c591ffc7fb52afab0a2765839bf9f244",
+    "response": {
+      "id": "resp_e2c878e9be894c57a26a56d1313bfd79",
+      "created_at": 1791691907.0,
+      "model": "model",
+      "object": "response",
+      "output": [
+        {
+          "prompt_token_ids": [
+            0
+          ],
+          "generation_token_ids": [
+            0
+          ],
+          "generation_log_probs": [
+            0.0
+          ],
+          "routed_experts": null,
+          "id": "msg_9b045e753acf4fd3afdf5c36934a95a9",
+          "content": [
+            {
+              "annotations": [],
+              "text": "Error code: 403 - {'error': 'model route is not permitted'}",
+              "type": "output_text",
+              "logprobs": null
+            }
+          ],
+          "role": "assistant",
+          "status": "completed",
+          "type": "message",
+          "phase": null
+        }
+      ],
+      "parallel_tool_calls": true,
+      "tools": [],
+      "tool_choice": "auto",
+      "status": "failed",
+      "error": {
+        "code": "server_error",
+        "message": "Error code: 403 - {'error': 'model route is not permitted'}"
+      },
+      "usage": {
+        "input_tokens": 0,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens": 0,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 0
+      },
+      "_ng_agent_observations": {
+        "source": "hermes",
+        "records": [
+          {
+            "kind": "agent_invocation",
+            "invocation_id": "root",
+            "parent_invocation_id": null,
+            "status": "failed",
+            "model_calls": []
+          }
+        ]
+      }
+    }
+  }
+]

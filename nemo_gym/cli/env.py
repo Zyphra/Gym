@@ -17,11 +17,12 @@ import asyncio
 import json
 import os
 import shlex
+import socket
 import sys
 from glob import glob
 from pathlib import Path
 from shutil import rmtree
-from signal import SIGINT
+from signal import SIGINT, SIGKILL
 from subprocess import Popen, TimeoutExpired
 from tempfile import TemporaryDirectory
 from threading import Thread
@@ -39,6 +40,7 @@ from tqdm.auto import tqdm
 
 from nemo_gym import PARENT_DIR, _resolve_under_cwd_or_install, component_search_roots
 from nemo_gym.cli.setup_command import get_venv_path, run_command, setup_env_command
+from nemo_gym.runtime_workdir import component_launch_command
 from nemo_gym.cli.utils import (
     exit_cleanly_on_config_error,
     exit_unknown_component,
@@ -62,7 +64,6 @@ from nemo_gym.global_config import (
     DRY_RUN_KEY_NAME,
     JSON_OUTPUT_KEY_NAME,
     MODEL_ENDPOINT_READINESS_TIMEOUT_KEY_NAME,
-    NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
     NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME,
     NEMO_GYM_RESERVED_TOP_LEVEL_KEYS,
     QUERY_KEY_NAME,
@@ -86,6 +87,7 @@ from nemo_gym.server_utils import (
     ServerStatus,
     initialize_ray,
 )
+from nemo_gym.setup_timeout import setup_timeout_seconds
 from nemo_gym.telemetry.metrics import record_active_servers
 from nemo_gym.telemetry.setup import (
     configure_telemetry_env,
@@ -284,10 +286,10 @@ def _model_endpoint_timeout_seconds(global_config_dict: DictConfig) -> float:
     """
     value = global_config_dict.get(MODEL_ENDPOINT_READINESS_TIMEOUT_KEY_NAME)
     if value is None:
-        return _DEFAULT_MODEL_ENDPOINT_READINESS_TIMEOUT_SEC
+        return setup_timeout_seconds(_DEFAULT_MODEL_ENDPOINT_READINESS_TIMEOUT_SEC, config=global_config_dict)
 
     try:
-        return float(value)
+        return setup_timeout_seconds(float(value), config=global_config_dict)
     except (TypeError, ValueError):
         raise ConfigError(
             f"`{MODEL_ENDPOINT_READINESS_TIMEOUT_KEY_NAME}` must be a number of seconds, got {value!r}. "
@@ -365,6 +367,9 @@ class TestConfig(RunConfig):
 
 
 class RunHelper:  # pragma: no cover
+    def __init__(self, *, runtime_workdir_root: Path | None = None):
+        self._runtime_workdir_root = runtime_workdir_root
+
     _head_server: uvicorn.Server
     _head_server_thread: Thread
     _head_server_instance: HeadServer
@@ -373,7 +378,11 @@ class RunHelper:  # pragma: no cover
     _server_instance_display_configs: List[ServerInstanceDisplayConfig]
     _server_client: ServerClient
 
-    def start(self, global_config_dict_parser_config: GlobalConfigDictParserConfig) -> None:
+    def start(
+        self,
+        global_config_dict_parser_config: GlobalConfigDictParserConfig,
+        head_listener: Optional[socket.socket] = None,
+    ) -> None:
         global_config_dict = get_global_config_dict(global_config_dict_parser_config=global_config_dict_parser_config)
 
         # Fail fast before starting Ray if nothing is configured to run (covers env run and the
@@ -391,15 +400,22 @@ class RunHelper:  # pragma: no cover
         # Note: This function will modify the global config dict - update `ray_head_node_address`
         initialize_ray()
 
-        # Assume Nemo Gym Run is for a single agent.
-        escaped_config_dict_yaml_str = shlex.quote(OmegaConf.to_yaml(global_config_dict))
+        # Share the exact parent-composed YAML by path, not one exec argument or
+        # environment entry. Keep it alive until every owned child has stopped.
+        self._global_config_directory = TemporaryDirectory(prefix="nemo-gym-config-")
+        global_config_file = Path(self._global_config_directory.name) / "global.yaml"
+        global_config_file.touch(mode=0o600)
+        global_config_file.write_text(OmegaConf.to_yaml(global_config_dict), encoding="utf-8")
 
         # We always run the head server in this `run` command.
-        self._head_server, self._head_server_thread, self._head_server_instance = HeadServer.run_webserver()
+        self._head_server, self._head_server_thread, self._head_server_instance = HeadServer.run_webserver(
+            head_listener
+        )
 
         top_level_paths = [k for k in global_config_dict.keys() if k not in NEMO_GYM_RESERVED_TOP_LEVEL_KEYS]
 
         self._processes: Dict[str, Popen] = dict()
+        self._owned_server_groups: set[Popen] = set()
         self._server_instance_display_configs: List[ServerInstanceDisplayConfig] = []
 
         start_time = time()
@@ -429,13 +445,20 @@ class RunHelper:  # pragma: no cover
             # Resolve cwd-first (a local server), else the install location for built-ins.
             dir_path = _resolve_server_dir(Path(first_key, second_key))
 
-            command = f"""{setup_env_command(dir_path, global_config_dict, top_level_path)} \\
-    && {NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME}={escaped_config_dict_yaml_str} \\
-    {NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME}={shlex.quote(top_level_path)} \\
-    python {str(entrypoint_fpath)}"""
+            command = component_launch_command(
+                setup_env_command(dir_path, global_config_dict, top_level_path),
+                dir_path, entrypoint_fpath,
+                runtime_root=self._runtime_workdir_root,
+                server_name=top_level_path,
+                environment={NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME: top_level_path},
+            )
 
-            process = run_command(command, dir_path, server_name=top_level_path)
+            process = run_command(
+                command, dir_path, server_name=top_level_path, start_new_session=True,
+                global_config_file=global_config_file,
+            )
             self._processes[top_level_path] = process
+            self._owned_server_groups.add(process)
             # In dry run mode, wait for each setup command to finish before starting the next.
             # This installs uv virtual environments serially, which significantly reduces uv
             # cache size. For Nemotron's set of environments, parallel installation can produce
@@ -443,6 +466,7 @@ class RunHelper:  # pragma: no cover
             if global_config_dict[DRY_RUN_KEY_NAME]:
                 print("DRY_RUN enabled: setup commands are run serially")
                 process.communicate()
+                self._owned_server_groups.discard(process)
 
             host = server_config_dict.get("host")
             port = server_config_dict.get("port")
@@ -480,6 +504,7 @@ class RunHelper:  # pragma: no cover
         print("Waiting for head server to spin up")
         poll_count = 0
         while True:
+            self.poll()
             status = self._server_client.poll_for_status(HEAD_SERVER_KEY_NAME)
             if status == "success":
                 break
@@ -615,27 +640,59 @@ Process `{process_name}` stderr:
         shutdown_telemetry()
 
         print("Sending interrupt signals to servers...")
+        owned_groups = getattr(self, "_owned_server_groups", set())
         for process in self._processes.values():
-            process.send_signal(SIGINT)
+            if process in owned_groups:
+                # A completed dry run (or an already exited server shell) must not
+                # signal a process group whose numeric ID may now belong to others.
+                if process.poll() is not None:
+                    continue
+                try:
+                    os.killpg(process.pid, SIGINT)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.send_signal(SIGINT)
 
         print("Waiting for processes to finish...")
+        # The Wrapper service sets this from its already typed stop timeout;
+        # direct Gym callers retain the one-second interactive default. One
+        # deadline covers every child instead of charging the grace per child.
+        graceful_timeout = getattr(self, "_graceful_shutdown_timeout_s", _GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
+        deadline = monotonic() + graceful_timeout
         killed_process_names: List[str] = []
         unreaped_process_names: List[str] = []
         for process_name, process in self._processes.items():
             try:
-                process.wait(timeout=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
+                process.wait(timeout=max(0.0, deadline - monotonic()))
             except TimeoutExpired:
-                process.kill()
+                if process in owned_groups:
+                    try:
+                        os.killpg(process.pid, SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
                 killed_process_names.append(process_name)
                 # Reap the child after SIGKILL to avoid leaving a <defunct> entry.
                 try:
                     process.wait(timeout=_FORCE_KILL_REAP_TIMEOUT_SEC)
                 except TimeoutExpired:
                     unreaped_process_names.append(process_name)
+            # Popen retains the unmodified wait result (negative for signals).
+            # Log every owned child before discarding the process table; an
+            # unreaped child remains explicitly unknown, never a clean exit.
+            print(
+                f"[gym-child-exit] name={json.dumps(process_name)} pid={process.pid} "
+                f"returncode={process.returncode} "
+                f"forced_kill={str(process_name in killed_process_names).lower()} "
+                f"reaped={str(process_name not in unreaped_process_names).lower()}",
+                flush=True,
+            )
 
         if killed_process_names:
             print(
-                f"""Some processes ({", ".join(killed_process_names)}) didn't shutdown within the {_GRACEFUL_SHUTDOWN_TIMEOUT_SEC}s timeout, killing instead. You may see messages like:
+                f"""Some processes ({", ".join(killed_process_names)}) didn't shutdown within the {graceful_timeout}s timeout, killing instead. You may see messages like:
 ```bash
 rpc_client.h:203: Failed to connect to GCS within 60 seconds. GCS may have been killed. It's either GCS is terminated by `ray stop` or is killed unexpectedly. If it is killed unexpectedly, see the log file gcs_server.out. https://docs.ray.io/en/master/ray-observability/user-guides/configure-logging.html#logging-directory-structure. The program will terminate.
 ```
@@ -648,12 +705,19 @@ rpc_client.h:203: Failed to connect to GCS within 60 seconds. GCS may have been 
                 "they may remain as zombies until this process exits."
             )
         self._processes = dict()
+        if hasattr(self, "_owned_server_groups"):
+            self._owned_server_groups.clear()
 
         self._head_server.should_exit = True
         self._head_server_thread.join()
 
         self._head_server = None
         self._head_server_thread = None
+
+        config_directory = getattr(self, "_global_config_directory", None)
+        if config_directory is not None:
+            config_directory.cleanup()
+            self._global_config_directory = None
 
         print("NeMo Gym finished!")
 

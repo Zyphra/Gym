@@ -17,6 +17,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Optional
+from urllib.parse import quote
 
 from pydantic import BaseModel
 
@@ -116,3 +117,12 @@ class RolloutContextMiddleware:
         scope = {**scope, "path": path, "raw_path": path.encode()}
         with rollout_context(match.group("rollout_id")):
             await self._app(scope, receive, send)
+
+
+FAILURE_ROLLOUT_HEADER = "x-nemo-gym-rollout-id"
+FAILURE_TOOL_CALL_HEADER = "x-nemo-gym-tool-call-id"
+
+
+def failure_log_metadata(value: Optional[str]) -> str:
+    """Bound and encode diagnostic identity without changing the request body."""
+    return quote((value or "")[:256], safe="", errors="replace")

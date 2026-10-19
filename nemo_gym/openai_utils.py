@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
-from asyncio import sleep
 from typing import (
     Annotated,
     Any,
@@ -27,6 +26,7 @@ from typing import (
     Union,
     get_args,
 )
+from urllib.parse import urlsplit
 
 from openai.types.chat import (
     ChatCompletion,
@@ -144,7 +144,8 @@ from typing_extensions import TypedDict
 
 from nemo_gym.server_utils import (
     _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG,
-    MAX_NUM_TRIES,
+    RATE_LIMIT_ERROR_CODES as RATE_LIMIT_ERROR_CODES,
+    RETRY_ERROR_CODES as RETRY_ERROR_CODES,
     ClientResponse,
     get_response_json,
     raise_for_status,
@@ -291,6 +292,8 @@ class NeMoGymEasyInputMessage(BaseModel):
     content: Union[str, NeMoGymResponseInputContentList]
     role: Literal["user", "assistant", "system", "developer"]
     type: Literal["message"] = "message"
+    # Complete assistant turns retain their validated inline function calls.
+    tool_calls: Optional[List[ChatCompletionMessageToolCallParam]] = None
     # Preserve the response phase when replaying the item.
     phase: Optional[Literal["commentary", "final_answer"]] = None
 
@@ -1138,6 +1141,9 @@ class NeMoGymChatCompletionAssistantMessageParam(ChatCompletionAssistantMessageP
     # Override the iterable which is annoying to work with.
     content: Union[str, List[ContentArrayOfContentPart], None]
     tool_calls: Optional[NeMoGymChatCompletionMessageToolCallsParam] = None
+    # vLLM has used both names for parsed reasoning in assistant history.
+    reasoning_content: Optional[str]
+    reasoning: Optional[str]
 
 
 class NeMoGymChatCompletionAssistantMessageForTrainingParam(
@@ -1174,6 +1180,7 @@ NeMoGymChatCompletionMessageParam: TypeAlias = Annotated[
 class NeMoGymChatCompletionCreateParamsNonStreaming(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
     messages: List[NeMoGymChatCompletionMessageParam]
     model: Optional[Union[str, ChatModel]] = None
     audio: Optional[ChatCompletionAudioParam] = None
@@ -1218,14 +1225,6 @@ class NeMoGymChatCompletionCreateParamsNonStreaming(BaseModel):
 # Clients
 ########################################
 
-# See https://platform.openai.com/docs/guides/error-codes/api-errors
-# 500 is internal server error, which may sporadically occur
-# 502 is Bad gateway (when the endpoint is overloaded)
-# 504 is Gateway timeout (when the endpoint config has too low of a gateway timeout setting for the model to finish generating)
-RATE_LIMIT_ERROR_CODES = [429, 502, 503, 504, 520]
-RETRY_ERROR_CODES = RATE_LIMIT_ERROR_CODES + [500]
-
-
 class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
     """This is just a stub class that wraps around aiohttp"""
 
@@ -1234,13 +1233,13 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
 
     internal: bool = Field(
         default=False,
-        description="Set this to true for internal NeMo Gym servers, which may retry indefinitely.",
+        description="Set this to true for internal NeMo Gym server diagnostics; retry limits remain bounded.",
     )
 
     max_connection_retries: Optional[int] = Field(
         default=None,
         description=(
-            "How many connection-error retries per request; None retries forever. "
+            "Maximum attempts for repeat-safe requests; None uses the shared default. "
             "Allows callers that can resolve a moved endpoint to avoid stalling forever."
         ),
     )
@@ -1251,7 +1250,16 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
     )
 
     async def _request(self, **request_kwargs: Dict) -> ClientResponse:
+        from nemo_gym.rollout_correlation import current_rollout_id
+
+        if request_kwargs.get("method", "").upper() == "POST" and urlsplit(
+            request_kwargs["url"]
+        ).path.rstrip("/").endswith(("/responses", "/chat/completions", "/completions", "/messages")):
+            request_kwargs["_model_request"] = True
+
         request_headers = request_kwargs.pop("headers", {})
+        if rollout_id := current_rollout_id():
+            request_headers = {"X-Session-ID": rollout_id} | request_headers
         request_kwargs = request_kwargs | {
             "headers": self.default_headers
             | request_headers
@@ -1261,33 +1269,7 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
             "_internal": self.internal,
             "_max_connection_retries": self.max_connection_retries,
         }
-        return await self._request_with_retry(**request_kwargs)
-
-    async def _request_with_retry(self, **request_kwargs: Dict) -> ClientResponse:
-        max_num_tries = MAX_NUM_TRIES
-        tries = 0
-        while tries < max_num_tries:
-            tries += 1
-            response = await request(**request_kwargs)
-
-            if response.status in RETRY_ERROR_CODES:
-                # Internal NeMo Gym servers extend max tries for retryable errors.
-                if response.status in RATE_LIMIT_ERROR_CODES and self.internal:
-                    max_num_tries += 1
-
-                content = (await response.content.read()).decode()
-                kind = "rate_limit" if response.status in RATE_LIMIT_ERROR_CODES else "server_error"
-                print(
-                    f"[model_retry url={request_kwargs.get('url')} status={response.status} kind={kind} try={tries} max_tries={max_num_tries} error_msg={content[:200]}]",
-                    flush=True,
-                )
-                await sleep(0.5)
-                continue
-            else:
-                return response
-
-        # We've exited the loop
-        await raise_for_status(response)
+        return await request(**request_kwargs)
 
     async def _raise_for_status(self, response: ClientResponse, request_kwargs: Dict[str, Any]) -> None:
         if not response.ok and _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG:

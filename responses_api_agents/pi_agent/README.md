@@ -57,6 +57,10 @@ configuration is unchanged.
 - `max_output_tokens`: output limit for a generated model entry
 - `env`: extra env vars for the subprocess (e.g. provider API keys)
 - `workspace_root`: where per-request HOMEs are created and deleted
+- `working_directory`: optional CLI working directory. When absent, the CLI uses
+  its temporary per-request workspace. An explicitly supplied directory is never
+  removed; only the temporary HOME workspace is removed after the invocation. AnySWE
+  supplies its task working directory unless explicitly configured otherwise.
 - `thinking`: passed to `--thinking` (off, minimal, low, medium, high, xhigh)
 - `system_prompt`: appended via `--append-system-prompt`
 - `timeout`: seconds for the `pi` run

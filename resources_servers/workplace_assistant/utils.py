@@ -137,7 +137,11 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
         # identity. Track this per replay so delete/create order can also vary.
         for name, (frame, id_column) in _state_tables(tool_env).items():
             if id_column is not None and action.get("name", "").startswith(name + "_"):
-                tool_env["stable_ids"][name].intersection_update(frame[id_column])
+                # Canonicalization rejects non-scalar IDs. Keep them out of
+                # hash-based identity tracking so they reach that validation.
+                tool_env["stable_ids"][name].intersection_update(
+                    value for value in frame[id_column] if pd.api.types.is_scalar(value)
+                )
     return tool_env
 
 
@@ -160,12 +164,19 @@ def _canonical_rows(frame, id_column, stable_ids, table_name=None):
     Keep row multiplicity, every other field, and the original case rules.
     """
     columns = tuple(sorted(frame.columns))
-    if id_column is not None and frame[id_column].duplicated().any():
-        return None
+    if id_column is not None:
+        if not all(pd.api.types.is_scalar(value) for value in frame[id_column]):
+            return None
+        if frame[id_column].duplicated().any():
+            return None
     rows = []
     for values in frame.loc[:, columns].itertuples(index=False, name=None):
         row = []
         for column, value in zip(columns, values):
+            # Tool schemas declare scalar table cells. Malformed persisted tool
+            # arguments are incorrect actions, not verifier infrastructure errors.
+            if not pd.api.types.is_scalar(value):
+                return None
             if pd.isna(value):
                 value = None
             elif table_name == "calendar" and column in {"event_start", "duration"}:
@@ -185,7 +196,13 @@ def _canonical_rows(frame, id_column, stable_ids, table_name=None):
     return columns, Counter(rows)
 
 
-def is_correct(predicted_actions: Dict[str, str], ground_truth_actions: Dict[str, str], error: str) -> bool:
+def is_correct(
+    predicted_actions: Dict[str, str],
+    ground_truth_actions: Dict[str, str],
+    error: str,
+    *,
+    reject_noop_reference: bool = False,
+) -> bool:
     """
     Checks if the prediction is correct by comparing the state change after executing the actions.
 
@@ -210,6 +227,18 @@ def is_correct(predicted_actions: Dict[str, str], ground_truth_actions: Dict[str
     reference_env = execute_actions_and_reset_state(ground_truth_actions)
     predicted = _state_tables(predicted_env)
     reference = _state_tables(reference_env)
+    if reject_noop_reference:
+        seed_env = execute_actions_and_reset_state([])
+        seed = _state_tables(seed_env)
+        unchanged = True
+        for name, (reference_frame, id_column) in reference.items():
+            expected = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
+            initial = _canonical_rows(seed[name][0], id_column, seed_env["stable_ids"][name], name)
+            if expected is None or initial is None:
+                return False
+            unchanged = unchanged and expected == initial
+        if unchanged:
+            return False
     for name, (reference_frame, id_column) in reference.items():
         predicted_rows = _canonical_rows(predicted[name][0], id_column, predicted_env["stable_ids"][name], name)
         reference_rows = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)

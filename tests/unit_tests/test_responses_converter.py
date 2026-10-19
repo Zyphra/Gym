@@ -82,6 +82,37 @@ def test_backwards_compatible_aliases():
     assert VLLMConverterResponsesToChatCompletionsState is ResponsesConverterState
 
 
+def test_explicit_assistant_boundaries_are_opt_in():
+    params = NeMoGymResponseCreateParamsNonStreaming(
+        input=[
+            {"role": "user", "content": "Find a film"},
+            {"role": "assistant", "content": ""},
+            {"type": "function_call", "call_id": "call_1", "name": "get_films", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "Found one"},
+            {"role": "assistant", "content": "First answer"},
+            {"role": "assistant", "content": "Final answer"},
+        ]
+    )
+    default = ResponsesConverter(return_token_id_information=False)
+    preserved = ResponsesConverter(return_token_id_information=False, preserve_explicit_assistant_boundaries=True)
+    default_messages = default.responses_to_chat_completion_create_params(params).model_dump(exclude_unset=True)[
+        "messages"
+    ]
+    messages = preserved.responses_to_chat_completion_create_params(params).model_dump(exclude_unset=True)["messages"]
+    assert [message["role"] for message in default_messages] == ["user", "assistant", "tool", "assistant"]
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "assistant",
+        "tool",
+        "assistant",
+        "assistant",
+    ]
+    assert messages[1]["content"] in (None, "")
+    assert messages[2]["tool_calls"][0]["function"] == {"name": "get_films", "arguments": "{}"}
+    assert [messages[-2]["content"], messages[-1]["content"]] == ["First answer", "Final answer"]
+
+
 def test_usage_detail_ignores_ambiguous_top_level_names():
     usage = {"cached_tokens": 99, "cached_input_tokens": 7, "reasoning_tokens": 88, "reasoning_output_tokens": 3}
     assert _usage_detail(usage, "prompt_tokens_details", "cached_tokens", "cached_input_tokens") == 7

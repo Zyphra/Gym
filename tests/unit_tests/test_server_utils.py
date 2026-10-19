@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 from aiohttp import ClientOSError, ClientResponseError, RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
 from omegaconf import OmegaConf
+import pytest
 from pytest import CaptureFixture, MonkeyPatch, raises
 from yarl import URL
 
@@ -827,6 +828,36 @@ class TestServerUtils:
         captured = capsys.readouterr().out
         assert "[upstream_request_failed]" in captured
         assert "ValueError: actionable inner failure" in captured
+
+    @pytest.mark.parametrize(("inner", "outer"), [(400, 400), (413, 413), (429, 429), (500, 500), (501, 500), (502, 502), (503, 503), (504, 504)])
+    async def test_exception_middleware_keeps_inner_client_error_status(
+        self, monkeypatch: MonkeyPatch, inner: int, outer: int
+    ) -> None:
+        callbacks = []
+        app = MagicMock()
+        app.middleware.side_effect = lambda _kind: (lambda callback: callbacks.append(callback) or callback)
+        server = MagicMock()
+        server.get_session_middleware_key.return_value = "TestSimpleServer___my_server"
+        SimpleServer.setup_exception_middleware(server, app)
+        request_info = RequestInfo(
+            url=URL("http://simulator.test/v1/responses"),
+            method="POST",
+            headers=CIMultiDictProxy(CIMultiDict()),
+            real_url=URL("http://simulator.test/v1/responses"),
+        )
+        error = ClientResponseError(request_info=request_info, history=(), status=inner, message="inner")
+        error.response_content = b"This model's maximum context length is 131072 tokens."
+
+        async def fail(_request):
+            raise error
+
+        monkeypatch.setattr(nemo_gym.server_utils, "_GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG", False)
+        response = await callbacks[0](MagicMock(), fail)
+
+        assert response.status_code == outer
+        assert b"maximum context length" in response.body
+        # Gateway status preservation keeps the same retry-eligible failures.
+        assert (outer in nemo_gym.server_utils.RETRY_ERROR_CODES) == (inner in (429, 500, 501, 502, 503, 504))
 
     def _mock_global_client(self, monkeypatch: MonkeyPatch, connection_errors: int) -> MagicMock:
         """Global-client stand-in whose request() raises ClientOSError `connection_errors` times, then succeeds."""

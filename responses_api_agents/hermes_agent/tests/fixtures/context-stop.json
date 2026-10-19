@@ -1,0 +1,26 @@
+{
+  "source_sha256": "3af6350fd78bb99a83b2673dafc6401b1a3d6dcc3b61ca2f26aea299158fd5a0",
+  "error": {
+    "code": "server_error",
+    "message": "Context length exceeded (129,724 tokens). Cannot compress further."
+  },
+  "metadata": {
+    "interrupted": "false",
+    "failed": "false",
+    "partial": "true",
+    "turns": "109",
+    "hermes_error": "Context length exceeded (129,724 tokens). Cannot compress further."
+  },
+  "usage": {
+    "input_tokens": 0,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 0,
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "total_tokens": 0
+  },
+  "status": "failed"
+}

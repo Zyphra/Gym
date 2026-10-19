@@ -33,6 +33,7 @@ This environment:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from enum import Enum
@@ -49,7 +50,7 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import ModelServerRef
-from nemo_gym.judge import call_judge
+from nemo_gym.judge import JudgeError, call_judge, reraise_judge_errors
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponse,
@@ -122,6 +123,18 @@ class InverseIFConfig(BaseResourcesServerConfig):
         default=True,
         description="Whether to evaluate rubric criteria in parallel",
     )
+
+    strict_judge_response: bool = False
+    """Require completed, valid structured replies; malformed verdicts raise JudgeError."""
+
+    judge_timeout_seconds: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    """Optional bound on each judge call; timeout retains native JudgeError handling."""
+
+    use_default_judge_prompts: bool = False
+    """Judge every criterion with the configured default prompts, ignoring task-level ones.
+
+    Some sources ship a task system prompt that lists the whole rubric and asks for one overall
+    score, while this server sends one criterion per call; those verdicts mix criteria."""
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +214,7 @@ def _extract_text_from_response(response: NeMoGymResponse, exclude_thinking: boo
     return ""
 
 
-def _extract_verdict(judge_text: str) -> tuple[str, str]:
+def _extract_verdict(judge_text: str, *, allow_keyword_fallback: bool = True) -> tuple[str, str]:
     """
     Extract PASS/FAIL verdict and explanation from judge response.
 
@@ -215,6 +228,9 @@ def _extract_verdict(judge_text: str) -> tuple[str, str]:
 
     Returns:
         (verdict, explanation) where verdict is "PASS" or "FAIL".
+
+    Without keyword fallback, malformed verdicts or explanation types raise
+    JudgeError rather than fabricating a semantic FAIL.
     """
     # Strategy 1: Extract from fenced code block
     json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", judge_text, re.DOTALL)
@@ -224,6 +240,8 @@ def _extract_verdict(judge_text: str) -> tuple[str, str]:
             result = parsed.get("result", "").upper().strip()
             explanation = parsed.get("explanation", "")
             if result in ("PASS", "FAIL"):
+                if not allow_keyword_fallback and not isinstance(explanation, str):
+                    raise JudgeError("Structured judge verdict explanation must be a string")
                 return result, explanation
         except (json.JSONDecodeError, AttributeError):
             pass
@@ -236,9 +254,14 @@ def _extract_verdict(judge_text: str) -> tuple[str, str]:
             result = parsed.get("result", "").upper().strip()
             explanation = parsed.get("explanation", "")
             if result in ("PASS", "FAIL"):
+                if not allow_keyword_fallback and not isinstance(explanation, str):
+                    raise JudgeError("Structured judge verdict explanation must be a string")
                 return result, explanation
         except (json.JSONDecodeError, AttributeError):
             pass
+
+    if not allow_keyword_fallback:
+        raise JudgeError("Judge response has no valid structured PASS/FAIL verdict")
 
     # Strategy 3: Keyword fallback — scan last few lines
     lines = judge_text.strip().split("\n")
@@ -273,6 +296,8 @@ class InverseIFServer(SimpleResourcesServer):
         A failed judge call (auth, rate limit, timeout, endpoint error) is a distinct
         outcome, not a wrong answer: it raises JudgeError, so the row carries the
         model's output to the failures sidecar and stays out of the denominator.
+        Strict response mode also treats malformed/unclear judge verdicts as
+        JudgeError; only an explicit semantic FAIL is a scored task zero.
         """
 
         # Extract the generated response (excluding thinking blocks)
@@ -284,6 +309,9 @@ class InverseIFServer(SimpleResourcesServer):
         rubric = body.rubric or []
         judge_prompt_template = body.judge_prompt_template or self.config.default_judge_prompt_template
         judge_system_prompt = body.judge_system_prompt or self.config.default_judge_system_prompt
+        if self.config.use_default_judge_prompts:
+            judge_prompt_template = self.config.default_judge_prompt_template
+            judge_system_prompt = self.config.default_judge_system_prompt
 
         # Fallback: pull from metadata if top-level fields are empty
         if body.metadata:
@@ -296,8 +324,6 @@ class InverseIFServer(SimpleResourcesServer):
 
         # Evaluate each criterion
         if self.config.parallel_evaluation and len(rubric) > 1:
-            import asyncio
-
             evaluations = await asyncio.gather(
                 *[
                     self._evaluate_criterion(
@@ -380,17 +406,36 @@ class InverseIFServer(SimpleResourcesServer):
         request_params.input = msgs
 
         # Call the judge model
-        judge_response = await call_judge(
+        judge_call = call_judge(
             self.server_client,
             server_name=self.config.judge_model_server.name,
             url_path="/v1/responses",
             json=request_params,
             response_model=NeMoGymResponse,
         )
+        if self.config.judge_timeout_seconds is None:
+            judge_response = await judge_call
+        else:
+            judge_response = await reraise_judge_errors(
+                asyncio.wait_for(judge_call, timeout=self.config.judge_timeout_seconds)
+            )
+        if self.config.strict_judge_response and (
+            judge_response.status != "completed"
+            or judge_response.error is not None
+            or judge_response.incomplete_details is not None
+            or any(
+                getattr(item, "status", None) != "completed"
+                for item in judge_response.output
+                if getattr(item, "type", None) == "message"
+            )
+        ):
+            raise JudgeError("Judge response is not completed or reports an error/incomplete details")
         judge_text = _extract_text_from_response(judge_response, exclude_thinking=True)
 
         # Extract verdict
-        verdict, explanation = _extract_verdict(judge_text)
+        verdict, explanation = _extract_verdict(
+            judge_text, allow_keyword_fallback=not self.config.strict_judge_response
+        )
         score = 1.0 if verdict == "PASS" else 0.0
 
         return RubricEvaluation(

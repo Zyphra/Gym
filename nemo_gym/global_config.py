@@ -24,7 +24,7 @@ from importlib import import_module
 from os import environ, getenv
 from pathlib import Path
 from platform import python_version
-from random import randint
+from random import SystemRandom
 from socket import gethostbyname, gethostname, socket
 from typing import ClassVar, Dict, List, Optional, Set, Tuple, Type
 
@@ -38,6 +38,12 @@ from ray import __version__ as ray_version
 
 from nemo_gym import CACHE_DIR, RESULTS_DIR, WORKING_DIR, _resolve_under_cwd_or_install, component_search_roots
 from nemo_gym._config_aliases import LEGACY_AGENT_ALIASES, legacy_config_path_alias
+from nemo_gym.config_directives import (
+    COPY_KEY_NAME,
+    DELETE_KEY_KEY_NAME,
+    INHERIT_FROM_KEY_NAME,
+    resolve_config_directives,
+)
 from nemo_gym.config_types import (
     AgentCompositionError,
     AlmostServerError,
@@ -71,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 _GLOBAL_CONFIG_DICT = None
 NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME = "NEMO_GYM_CONFIG_DICT"
+NEMO_GYM_CONFIG_FILE_ENV_VAR_NAME = "NEMO_GYM_CONFIG_FILE"
 NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME = "NEMO_GYM_CONFIG_PATH"
 CONFIG_PATHS_KEY_NAME = "config_paths"
 ENTRYPOINT_KEY_NAME = "entrypoint"
@@ -85,6 +92,7 @@ UV_PIP_SET_PYTHON_KEY_NAME = "uv_pip_set_python"
 SKIP_VENV_IF_PRESENT_KEY_NAME = "skip_venv_if_present"
 HF_TOKEN_KEY_NAME = "hf_token"
 RAY_HEAD_NODE_ADDRESS_KEY_NAME = "ray_head_node_address"
+RAY_INIT_KWARGS_KEY_NAME = "ray_init_kwargs"
 PORT_RANGE_LOW_KEY_NAME = "port_range_low"
 PORT_RANGE_HIGH_KEY_NAME = "port_range_high"
 DRY_RUN_KEY_NAME = "dry_run"
@@ -95,20 +103,13 @@ UV_CACHE_DIR_KEY_NAME = "uv_cache_dir"
 UV_VENV_DIR_KEY_NAME = "uv_venv_dir"
 RESULTS_DIR_KEY_NAME = "results_dir"
 CACHE_DIR_KEY_NAME = "cache_dir"
-INHERIT_FROM_KEY_NAME = "_inherit_from"
-COPY_KEY_NAME = "_copy"
-DELETE_KEY_KEY_NAME = "_delete_key"
-
-# Sentinel returned by _recursive_index_dict_using_path when a referenced swap/copy/inherit path is
-# unset (a '???' leaf or ancestor). Distinct object so callers can branch on it without mistaking a
-# real config value (e.g. a literal "???" or a DictConfig) for "missing".
-_MISSING_REF = object()
 NEMO_GYM_LOG_DIR_KEY_NAME = "nemo_gym_log_dir"
 VERBOSE_KEY_NAME = "verbose"
 JSON_OUTPUT_KEY_NAME = "json"
 QUERY_KEY_NAME = "query"
 OBSERVABILITY_ENABLED_KEY_NAME = "observability_enabled"
 MODEL_CALL_CAPTURE_DIR_KEY_NAME = "model_call_capture_dir"
+MODEL_CALL_CAPTURE_ENABLED_KEY_NAME = "model_call_capture_enabled"
 MODEL_CALL_CAPTURE_METADATA_ONLY_KEY_NAME = "model_call_capture_metadata_only"
 # Run-wide training-token capture settings.
 # See ``nemo_gym/token_id_capture/config.py``.
@@ -132,6 +133,7 @@ NEMO_GYM_RESERVED_TOP_LEVEL_KEYS = [
     SKIP_VENV_IF_PRESENT_KEY_NAME,
     HF_TOKEN_KEY_NAME,
     RAY_HEAD_NODE_ADDRESS_KEY_NAME,
+    RAY_INIT_KWARGS_KEY_NAME,
     PORT_RANGE_LOW_KEY_NAME,
     PORT_RANGE_HIGH_KEY_NAME,
     DRY_RUN_KEY_NAME,
@@ -149,6 +151,7 @@ NEMO_GYM_RESERVED_TOP_LEVEL_KEYS = [
     QUERY_KEY_NAME,
     OBSERVABILITY_ENABLED_KEY_NAME,
     MODEL_CALL_CAPTURE_DIR_KEY_NAME,
+    MODEL_CALL_CAPTURE_ENABLED_KEY_NAME,
     MODEL_CALL_CAPTURE_METADATA_ONLY_KEY_NAME,
     TOKEN_ID_CAPTURE_BLOCK,
     COMPONENT_NAME_KEY_NAME,
@@ -1038,115 +1041,7 @@ For example, on the command line:
         )
 
     def _recursively_swap_keys(self, dict_config: DictConfig) -> None:
-        frozen_dict_config = deepcopy(dict_config)
-        with open_dict(dict_config):
-            self._recursively_swap_keys_helper(dict_config, dict_config, frozen_dict_config)
-
-    def _recursively_swap_keys_helper(
-        self, dict_config: DictConfig, original_dict_config: DictConfig, frozen_dict_config: DictConfig
-    ) -> None:
-        # items_ex(resolve=False) yields raw values: directive strings like "${inherit_from:...}"
-        # come back unresolved (so the swap detection below still matches), and a missing ('???')
-        # leaf is returned as-is instead of raising MissingMandatoryValue mid-swap. Any genuinely
-        # unset values are reported together by raise_on_missing_values, which runs after this pass.
-        for k, v in list(dict_config.items_ex(resolve=False)):
-            is_delete_property = isinstance(v, DictConfig) and DELETE_KEY_KEY_NAME in v
-
-            if is_delete_property:
-                keys_to_delete = v.pop(DELETE_KEY_KEY_NAME).split(",")
-                keys_to_delete = set(map(str.strip, keys_to_delete))
-
-                # Delete first so we don't resolve the deleted keys
-                # but only delete keys that are present in case the key-to-delete comes from a downstream inherit or swap
-                existing_keys = set(k for k in keys_to_delete if k in v)
-                for key in existing_keys:
-                    v.pop(key)
-                keys_to_delete -= existing_keys
-
-            if isinstance(v, (DictConfig, dict)):
-                self._recursively_swap_keys_helper(v, original_dict_config, frozen_dict_config)
-            elif isinstance(v, (ListConfig, list)):
-                # Iterate without resolving so a missing ('???') element doesn't raise mid-swap (it's
-                # a scalar, so it's skipped here and reported later by raise_on_missing_values).
-                for i in range(len(v)):
-                    if isinstance(v, ListConfig) and OmegaConf.is_missing(v, i):
-                        continue
-                    inner_v = v[i]
-                    if isinstance(inner_v, (DictConfig, dict)):
-                        self._recursively_swap_keys_helper(inner_v, original_dict_config, frozen_dict_config)
-
-            # e.g. ${inherit_from:grpo.num_prompts_per_step}
-            is_swap_str = isinstance(v, str) and v.startswith("${inherit_from:")
-            is_swap_property = isinstance(v, DictConfig) and INHERIT_FROM_KEY_NAME in v
-            is_swap = is_swap_str or is_swap_property
-
-            is_copy_str = isinstance(v, str) and v.startswith("${copy:")
-            is_copy_property = isinstance(v, DictConfig) and COPY_KEY_NAME in v
-            is_copy = is_copy_str or is_copy_property
-            if not (is_swap or is_copy):
-                continue
-
-            if is_swap_str:
-                path_to_swap = v.removeprefix("${inherit_from:").removesuffix("}")
-            elif is_swap_property:
-                path_to_swap = v.pop(INHERIT_FROM_KEY_NAME)
-
-            if is_copy_str:
-                path_to_swap = v.removeprefix("${copy:").removesuffix("}")
-            elif is_copy_property:
-                path_to_swap = v.pop(COPY_KEY_NAME)
-
-            path_to_swap = path_to_swap.split(".")
-
-            # Pop the swapped value. A '???' leaf or ancestor on the source path comes back as the
-            # _MISSING_REF sentinel (not a dict/str), so guard the .pop()/.merge() that would crash on it.
-            dict_containing_key_to_swap = self._recursive_index_dict_using_path(
-                original_dict_config, path_to_swap[:-1]
-            )
-            if is_swap and dict_containing_key_to_swap is not _MISSING_REF:
-                # Pop with a default since multiple configs may refer to the same path
-                # We don't want to pop if it's just a copy
-                dict_containing_key_to_swap.pop(path_to_swap[-1], None)
-
-            swapped_value = self._recursive_index_dict_using_path(frozen_dict_config, path_to_swap)
-
-            # If the source (leaf or an ancestor) is unset, the target inherits MISSING; skip the
-            # property-merge and _delete_key handling and let raise_on_missing_values report it.
-            if dict_containing_key_to_swap is _MISSING_REF or swapped_value is _MISSING_REF:
-                dict_config[k] = "???"
-                continue
-
-            if is_swap_property or is_copy_property:
-                swapped_value = OmegaConf.merge(swapped_value, v)
-
-            dict_config[k] = swapped_value
-
-            # TODO We may want to recurse again after swap since we are not guaranteed to traverse the swapped-from value before hitting this swap.
-
-            if is_delete_property:
-                # Enforce that every key-to-delete exists
-                for key in keys_to_delete:
-                    dict_config[k].pop(key)
-
-    def _recursive_index_dict_using_path(self, dict_config: DictConfig, path: List[str]) -> "DictConfig | object":
-        for k in path:
-            # Use _get_node so a referenced value that is unset ('???') can be detected without
-            # resolving it (indexing a MISSING leaf would raise an opaque error). A genuinely
-            # absent key still errors clearly.
-            node = dict_config._get_node(k) if isinstance(dict_config, DictConfig) else None
-            if node is None:
-                raise InheritPathNotFoundError(f"Path specified does not exist in config: {path}")
-
-            # The referenced value (or an ancestor of it) is unset. Return the _MISSING_REF sentinel
-            # so the caller makes the swap/copy/inherit target '???' too (instead of calling .pop()/
-            # OmegaConf.merge() on a bare string and crashing); raise_on_missing_values then reports
-            # it with an actionable message instead of an opaque interpolation error.
-            if OmegaConf.is_missing(dict_config, k):
-                return _MISSING_REF
-
-            dict_config = dict_config[k]
-
-        return dict_config
+        resolve_config_directives(dict_config, missing_path_error=InheritPathNotFoundError)
 
     def parse(self, parse_config: Optional[GlobalConfigDictParserConfig] = None) -> DictConfig:
         if parse_config is None:
@@ -1447,7 +1342,7 @@ def maybe_get_global_config_dict() -> Optional[DictConfig]:
     """The global config dict when this process already has one; never triggers a CLI parse.
 
     Returns the cached dict, or the one the parent injected via
-    NEMO_GYM_CONFIG_DICT (caching it), or None in a bare process. Library code
+    NEMO_GYM_CONFIG_FILE (caching it), or None in a bare process. Library code
     that only wants to *consult* the config should use this instead of
     `get_global_config_dict`, which falls through to a full CLI/hydra parse.
     """
@@ -1455,15 +1350,19 @@ def maybe_get_global_config_dict() -> Optional[DictConfig]:
     if _GLOBAL_CONFIG_DICT is not None:
         return _GLOBAL_CONFIG_DICT
 
-    nemo_gym_config_dict_str_from_env = getenv(NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME)
-    if nemo_gym_config_dict_str_from_env:
-        global_config_dict = OmegaConf.create(nemo_gym_config_dict_str_from_env)
+    config_file = getenv(NEMO_GYM_CONFIG_FILE_ENV_VAR_NAME)
+    if config_file is not None:
+        # Reuse the parent's composed YAML without parsing CLI/includes/dotenv
+        # or resolving interpolations a second time.
+        global_config_dict = OmegaConf.create(Path(config_file).read_text(encoding="utf-8"))
 
         _GLOBAL_CONFIG_DICT = global_config_dict
 
         _apply_verbosity(global_config_dict)
         return global_config_dict
 
+    if getenv(NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME) is not None:
+        raise ValueError("Inline NEMO_GYM_CONFIG_DICT is unsupported; use NEMO_GYM_CONFIG_FILE")
     return None
 
 
@@ -1486,7 +1385,8 @@ def get_global_config_dict(
 
     Then, the global config dict will be cached and reused.
 
-    If this function is run by a child server of the main proc, that child will have been spun up with an environment variable with key NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME. The config dict will be read directly off this variable, cached, and returned with no additional validation.
+    Child servers reuse the parent-composed YAML through NEMO_GYM_CONFIG_FILE,
+    caching it without additional validation.
     """
     existing_global_config_dict = maybe_get_global_config_dict()
     if existing_global_config_dict is not None:
@@ -1731,7 +1631,8 @@ def _find_open_port_using_range(
             # Pick a random port in our range that is not disallowed
             port = None
             while port is None or port in disallowed_ports:
-                port = randint(port_range_low, port_range_high)
+                # OS entropy: co-located jobs that share a seeded global RNG must not pick the same port.
+                port = SystemRandom().randint(port_range_low, port_range_high)
 
             try:
                 s.bind(("", port))

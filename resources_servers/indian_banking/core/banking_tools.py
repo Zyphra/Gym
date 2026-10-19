@@ -59,6 +59,29 @@ _BOUND_DB: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVa
 _BOUND_CUSTOMER: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "indian_banking_bound_customer", default=None
 )
+_BOUND_LOCAL_TIME: contextvars.ContextVar[datetime | None] = contextvars.ContextVar(
+    "indian_banking_bound_local_time", default=None
+)
+
+
+@contextmanager
+def bank_local_clock(service_time: str, timezone: str):
+    """Naive bank-local calendar time in explicitly declared IST or UTC.
+
+    Date-only business state uses this declared timezone; no conversion occurs.
+    Mixed/unknown suffixes and numeric offsets are rejected.
+    """
+    local, suffix = service_time.rsplit(" ", 1)
+    if timezone not in {"IST", "UTC"} or suffix != timezone:
+        raise ValueError("indian_business_clock_timezone_mismatch")
+    value = datetime.strptime(local, "%Y-%m-%d %H:%M:%S")
+    if value.strftime("%Y-%m-%d %H:%M:%S") != local:
+        raise ValueError("indian_business_clock_invalid_format")
+    token = _BOUND_LOCAL_TIME.set(value)
+    try:
+        yield
+    finally:
+        _BOUND_LOCAL_TIME.reset(token)
 
 
 def bind_db(raw_db: dict[str, Any], active_customer: Optional[str]) -> tuple[Any, Any]:
@@ -632,6 +655,9 @@ def _now() -> datetime:
     """Wall clock, or a frozen clock when ``SIM_CLOCK`` is set (ISO datetime).
     Needed so the gold-action replay used by the DB check produces the same
     timestamps as the agent's rollout instead of failing DB equality."""
+    bound = _BOUND_LOCAL_TIME.get()
+    if bound is not None:
+        return bound
     sim = SIM_CLOCK
     if sim:
         return datetime.fromisoformat(sim)  # let a malformed value raise, not silently fall back

@@ -90,6 +90,12 @@ class BaseRunRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     responses_create_params: NeMoGymResponseCreateParamsNonStreaming
+    episode_control: Optional[str] = Field(
+        default=None, alias="_ng_episode_control", exclude=True,
+    )
+    episode_excluded_node_ids: tuple[str, ...] = Field(
+        default=(), alias="_ng_episode_excluded_node_ids", exclude=True,
+    )
     capture_rollout_id: Optional[str] = Field(
         default=None,
         alias="_ng_rollout_id",

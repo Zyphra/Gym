@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
 import shlex
+import signal
 import sys
 import tomllib
 from importlib import import_module
 from pathlib import Path
-from subprocess import TimeoutExpired
+from subprocess import PIPE, Popen, TimeoutExpired
+from time import monotonic, sleep
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -53,6 +56,7 @@ from nemo_gym.cli.env import (
 from nemo_gym.cli.env import (
     test_environment_manifest as run_manifest_test,
 )
+from nemo_gym.cli.setup_command import run_command
 from nemo_gym.cli.utils import exit_cleanly_on_config_error
 from nemo_gym.config_types import ConfigError, NoServerInstancesError, ResourcesServerInstanceConfig
 from nemo_gym.environment.scaffold import ScaffoldError
@@ -357,6 +361,204 @@ class TestRunHelperShutdownReap:
         runner._head_server = MagicMock()
         runner._head_server_thread = MagicMock()
         return runner
+
+    @staticmethod
+    def _interrupt_ignoring_child() -> Popen:
+        process = Popen(
+            [sys.executable, "-u", "-c",
+             "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+             "print('ready', flush=True); time.sleep(30)"],
+            stdout=PIPE, stderr=PIPE,
+        )
+        try:
+            assert process.stdout is not None and process.stdout.readline() == b"ready\n"
+        except BaseException:
+            process.kill()
+            process.wait(timeout=2)
+            raise
+        return process
+
+    @staticmethod
+    def _reap_children(*processes: Popen) -> None:
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+    @pytest.mark.parametrize("ignores_interrupt", [False, True])
+    def test_owned_shell_pipeline_interrupts_server_and_spares_sibling(
+        self, tmp_path: Path, capsys, ignores_interrupt: bool
+    ) -> None:
+        """Shutdown targets the owned server group, including its Python child."""
+        app = tmp_path / "app.py"
+        app.write_text(
+            """
+import os
+from pathlib import Path
+import signal
+import sys
+
+ready, stopped, ignores = sys.argv[1:]
+if ignores == "1":
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+else:
+    def stop(_signum, _frame):
+        Path(stopped).write_text("interrupted")
+        raise SystemExit(0)
+    signal.signal(signal.SIGINT, stop)
+Path(ready).write_text(str(os.getpid()))
+signal.pause()
+""",
+            encoding="utf-8",
+        )
+        ready = tmp_path / "ready"
+        stopped = tmp_path / "stopped"
+        config = OmegaConf.create({
+            "uv_cache_dir": str(tmp_path / "cache"),
+            "nemo_gym_log_dir": str(tmp_path / "logs"),
+        })
+        command = " ".join(shlex.quote(part) for part in (
+            sys.executable, "-u", str(app), str(ready), str(stopped),
+            "1" if ignores_interrupt else "0",
+        ))
+        sibling = Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        process = run_command(
+            command, tmp_path, server_name="owned_server",
+            global_config_dict=config, start_new_session=True,
+        )
+        try:
+            deadline = monotonic() + 5
+            while not ready.exists() and monotonic() < deadline:
+                assert process.poll() is None
+                sleep(0.01)
+            assert ready.exists()
+            assert os.getpgid(process.pid) == process.pid
+            assert os.getpgid(sibling.pid) != process.pid
+            runner = self._make_runner_with_processes({"owned_server": process})
+            runner._owned_server_groups = {process}
+            runner._graceful_shutdown_timeout_s = 0.3
+            runner.shutdown()
+            assert process.poll() is not None
+            assert sibling.poll() is None
+            output = capsys.readouterr().out
+            if ignores_interrupt:
+                assert "didn't shutdown within the 0.3s timeout, killing instead" in output
+                assert not stopped.exists()
+                child_pid = int(ready.read_text())
+                child_stat = Path(f"/proc/{child_pid}/stat")
+
+                def child_stopped() -> bool:
+                    try:
+                        return child_stat.read_text().split()[2] == "Z"
+                    except FileNotFoundError:
+                        return True
+
+                deadline = monotonic() + 2
+                while not child_stopped() and monotonic() < deadline:
+                    sleep(0.01)
+                assert child_stopped()
+            else:
+                deadline = monotonic() + 2
+                while not stopped.exists() and monotonic() < deadline:
+                    sleep(0.01)
+                assert stopped.read_text() == "interrupted"
+                assert "didn't shutdown" not in output
+        finally:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=3)
+            sibling.kill()
+            sibling.wait(timeout=3)
+
+    def test_grace_is_one_aggregate_deadline_for_real_children(self) -> None:
+        first = self._interrupt_ignoring_child()
+        second = self._interrupt_ignoring_child()
+        try:
+            waits: dict[str, list[float]] = {"first": [], "second": []}
+            for name, process in (("first", first), ("second", second)):
+                wait = process.wait
+
+                def observed_wait(*, timeout, _name=name, _wait=wait):
+                    waits[_name].append(timeout)
+                    return _wait(timeout=timeout)
+
+                process.wait = observed_wait
+            runner = self._make_runner_with_processes({"first": first, "second": second})
+            runner._graceful_shutdown_timeout_s = 0.3
+            runner.shutdown()
+
+            assert 0.0 < waits["first"][0] <= 0.3
+            assert waits["second"][0] < waits["first"][0] / 2
+            assert first.poll() is not None and second.poll() is not None
+            assert runner._processes == {}
+        finally:
+            self._reap_children(first, second)
+
+    def test_unconfigured_real_child_keeps_one_second_grace(self) -> None:
+        process = self._interrupt_ignoring_child()
+        try:
+            initial_waits: list[float] = []
+            wait = process.wait
+
+            def observed_wait(*, timeout):
+                initial_waits.append(timeout)
+                return wait(timeout=timeout)
+
+            process.wait = observed_wait
+            runner = self._make_runner_with_processes({"server": process})
+            started = monotonic()
+            runner.shutdown()
+            elapsed = monotonic() - started
+
+            assert 0.95 <= initial_waits[0] <= 1.0
+            assert elapsed >= 0.9
+            assert process.poll() is not None
+        finally:
+            self._reap_children(process)
+
+    @pytest.mark.parametrize("child_status", [0, 47, None])
+    def test_real_child_wait_status_is_logged_before_process_table_is_cleared(
+        self, capsys, child_status: int | None
+    ) -> None:
+        child = """
+import signal
+import sys
+import time
+status = sys.argv[1]
+def close(*_):
+    time.sleep(0.02)
+    raise SystemExit(int(status))
+signal.signal(signal.SIGINT, signal.SIG_IGN if status == "ignore" else close)
+print("ready", flush=True)
+signal.pause()
+"""
+        process = Popen(
+            [sys.executable, "-u", "-c", child,
+             "ignore" if child_status is None else str(child_status)],
+            stdout=PIPE, stderr=PIPE,
+        )
+        try:
+            assert process.stdout is not None and process.stdout.readline() == b"ready\n"
+            runner = self._make_runner_with_processes({"server": process})
+            runner._graceful_shutdown_timeout_s = 0.1 if child_status is None else 3.0
+            runner.shutdown()
+            raw = -9 if child_status is None else child_status
+            assert process.returncode == raw
+            output = capsys.readouterr().out
+            assert (
+                f'[gym-child-exit] name="server" pid={process.pid} returncode={raw} '
+                f'forced_kill={str(child_status is None).lower()} reaped=true'
+            ) in output
+            assert runner._processes == {}
+            assert not Path(f"/proc/{process.pid}").exists()
+        finally:
+            self._reap_children(process)
 
     def test_kill_is_followed_by_reap_wait(self) -> None:
         good = MagicMock()

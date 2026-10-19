@@ -12,12 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
 import sys
 from os import environ
 from pathlib import Path
+from pkgutil import extend_path
 from typing import Callable, List, Optional, Union
+
+
+__path__ = extend_path(__path__, __name__)
 
 
 # /path/to/dir/Gym (PARENT_DIR)
@@ -62,12 +67,20 @@ def component_search_roots(*, sys_path: List[Path] | None = None) -> List[Path]:
     roots but before cwd/built-ins. Any entry that is itself cwd or the install root is dropped so those two
     always stay last — matching the file-lookup order even in a wheel install, where the install root is
     already on ``sys.path`` as ``site-packages``.
+
+    A woven entry holding another Gym install (a sandbox runtime's bundled copy beside the mounted checkout)
+    never shadows the running Gym's built-ins: the install root moves ahead of the first such entry, and cwd
+    alone stays last.
     """
     # cwd and the built-ins are always searched last; drop them from the woven sys.path entries so they
     # can't get pinned mid-path (e.g. site-packages == PARENT_DIR in a wheel install).
     trailing = [Path.cwd(), PARENT_DIR]
     trailing_resolved = {root.resolve() for root in trailing}
     middle = [entry for entry in (sys_path or []) if entry.resolve() not in trailing_resolved]
+    other_install = next((i for i, entry in enumerate(middle) if (entry / "nemo_gym" / "__init__.py").is_file()), None)
+    if other_install is not None:
+        middle.insert(other_install, PARENT_DIR)
+        trailing = [Path.cwd()]
     candidates = [*_extra_roots(), *middle, *trailing]
     roots: List[Path] = []
     seen: set[Path] = set()
@@ -79,13 +92,41 @@ def component_search_roots(*, sys_path: List[Path] | None = None) -> List[Path]:
     return roots
 
 
+def _project_absolute_read_path(path: Path) -> Path:
+    """Optional source-read contract; independent of include identity and write paths."""
+    encoded = os.environ.get("NEMO_GYM_READ_PATH_PROJECTION")
+    if not encoded:
+        return path
+    try:
+        value = json.loads(encoded)
+        if not isinstance(value, dict) or set(value) != {"destination", "sources"}:
+            raise ValueError("expected destination and sources")
+        destination, sources = value["destination"], value["sources"]
+        if not isinstance(sources, list) or not sources:
+            raise ValueError("sources must be a nonempty list")
+        for root in (destination, *sources):
+            if not isinstance(root, str) or not Path(root).is_absolute() or ".." in Path(root).parts or "\x00" in root:
+                raise ValueError("roots must be absolute without traversal or NUL")
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid NEMO_GYM_READ_PATH_PROJECTION: {error}") from error
+    # Do not resolve retired origins or consult their files for fallback.
+    value = Path(os.path.normpath(path))
+    destination = Path(destination)
+    if value.is_relative_to(destination):
+        return value
+    for source in sorted(set(sources), key=lambda root: (-len(Path(root).parts), root)):
+        if value.is_relative_to(source):
+            return destination / value.relative_to(source)
+    return path
+
+
 def _resolve_under_cwd_or_install(
     rel_path: Union[str, Path], *, validator: Optional[Callable[[Path], bool]] = None
 ) -> Path:
     """Resolve a possibly-relative path for *reading* a built-in or user-supplied file against the ordered
     :func:`component_search_roots`.
 
-    Absolute paths are returned unchanged. A relative path is returned rooted at the first root where it
+    Absolute reads use NEMO_GYM_READ_PATH_PROJECTION when supplied. A relative path uses the first root where it
     exists (earliest-wins: extra roots > cwd > install root), so a repo-relative path like
     ``benchmarks/<name>/config.yaml`` or ``resources_servers/<env>/data/example.jsonl`` resolves by name
     from any cwd or plugin root. ``validator`` overrides the default ``Path.exists`` check — pass it when a
@@ -98,7 +139,7 @@ def _resolve_under_cwd_or_install(
     """
     p = Path(rel_path)
     if p.is_absolute():
-        return p
+        return _project_absolute_read_path(p)
     is_valid = validator if validator is not None else Path.exists
     roots = component_search_roots()
     for root in roots:

@@ -15,7 +15,9 @@
 import asyncio
 import atexit
 import json
+import logging
 import resource
+import select
 import socket
 import sys
 import time
@@ -23,7 +25,7 @@ from abc import abstractmethod
 from asyncio.exceptions import CancelledError
 from contextlib import asynccontextmanager
 from functools import partial
-from os import environ, getenv
+from os import environ, getenv, getpid, getppid, strerror
 from pathlib import Path
 from threading import Thread
 from traceback import format_exc, print_exc
@@ -35,6 +37,8 @@ import ray
 import requests
 import uvicorn
 from aiohttp import (
+    ClientConnectionError,
+    ClientConnectorError,
     ClientOSError,
     ClientResponse,
     ClientResponseError,
@@ -56,6 +60,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 from requests.exceptions import ConnectionError
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from uvicorn.protocols.http.auto import AutoHTTPProtocol
 
 from nemo_gym import WORKING_DIR
 from nemo_gym.config_types import (
@@ -67,10 +72,11 @@ from nemo_gym.config_types import (
 from nemo_gym.global_config import (
     DRY_RUN_KEY_NAME,
     HEAD_SERVER_KEY_NAME,
-    NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
+    NEMO_GYM_CONFIG_FILE_ENV_VAR_NAME,
     NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME,
     OBSERVABILITY_ENABLED_KEY_NAME,
     RAY_HEAD_NODE_ADDRESS_KEY_NAME,
+    RAY_INIT_KWARGS_KEY_NAME,
     UVICORN_TIMEOUT_WORKER_HEALTHCHECK,
     GlobalConfigDictParser,
     GlobalConfigDictParserConfig,
@@ -89,17 +95,54 @@ from nemo_gym.http_failure_provenance import (
     failure_provenance_headers,
 )
 from nemo_gym.profiling import Profiler
-from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_from_run_body
+from nemo_gym.rollout_correlation import (
+    FAILURE_ROLLOUT_HEADER,
+    FAILURE_TOOL_CALL_HEADER,
+    current_rollout_id,
+    maybe_rollout_id_from_run_body,
+)
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, safe_set_span_attributes
 from nemo_gym.telemetry.span_groups import GymSpanGroup
 
 
 _GLOBAL_AIOHTTP_CLIENT: Union[None, ClientSession] = None
 _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG: bool = False
+_GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S: float | None = None
 _UPSTREAM_ERROR_LOG_BODY_CHARS = 2000
 
 NEMO_GYM_MODEL_SERVER_NAME_ENV_VAR_NAME = "NEMO_GYM_MODEL_SERVER_NAME"
 NEMO_GYM_MODEL_SERVER_BASE_URL_ENV_VAR_NAME = "NEMO_GYM_MODEL_SERVER_BASE_URL"
+
+
+if AutoHTTPProtocol.__module__ == "uvicorn.protocols.http.httptools_impl":
+
+    class PollSafeHttpToolsProtocol(AutoHTTPProtocol):
+        """Give kernel-ready input one poll opportunity before idle close."""
+
+        def timeout_keep_alive_handler(self) -> None:
+            if not self.transport.is_closing():
+                self.timeout_keep_alive_task = self.loop.call_soon(self._defer_keep_alive_close)
+
+        def _defer_keep_alive_close(self) -> None:
+            if not self.transport.is_closing():
+                self.timeout_keep_alive_task = self.loop.call_soon(self._close_keep_alive_transport)
+
+        def _close_keep_alive_transport(self) -> None:
+            self.timeout_keep_alive_task = None
+            if not self.transport.is_closing():
+                super().timeout_keep_alive_handler()
+
+else:  # Preserve HeadServer's existing Uvicorn "auto" h11 fallback.
+    PollSafeHttpToolsProtocol = None  # type: ignore[assignment,misc]
+
+
+HEAD_SERVER_HTTP_PROTOCOL = PollSafeHttpToolsProtocol or AutoHTTPProtocol
+
+
+def _required_poll_safe_httptools_protocol():
+    if PollSafeHttpToolsProtocol is None:
+        raise RuntimeError("Component servers require Uvicorn's httptools protocol")
+    return PollSafeHttpToolsProtocol
 
 
 class _PickleSafeRequestInfo(NamedTuple):
@@ -121,6 +164,7 @@ class HTTPTransportDiagnosticsConfig(BaseModel):
 
 
 class GlobalAIOHTTPAsyncClientConfig(HTTPTransportDiagnosticsConfig):
+    model_request_timeout_s: float | None = Field(default=None, gt=0, allow_inf_nan=False, strict=True)
     global_aiohttp_connector_limit: int = 100 * 1024
     global_aiohttp_connector_limit_per_host: int = 1024
 
@@ -180,17 +224,52 @@ def _make_keepalive_socket_factory(
     return factory
 
 
-class DiagnosticTCPConnector(ConnectionDiagnosticMixin, TCPConnector):
+class PollSafeTCPConnector(TCPConnector):
+    """Reject pooled sockets whose kernel state makes reuse unsafe."""
+
+    async def _get(self, key, traces):
+        connection = await super()._get(key, traces)
+        if connection is None:
+            return None
+        try:
+            if self.closed:
+                raise ClientConnectionError("Connector is closed.")
+            transport = connection.transport
+            sock = transport.get_extra_info("socket") if transport else None
+            if sock is None or sock.fileno() < 0:
+                connection.close()
+                return None
+            # Linux TCP FIN is observable before the event loop handles EOF.
+            # This does not consume input, TLS records, or SO_ERROR.
+            terminal = select.POLLRDHUP | select.POLLHUP | select.POLLERR | select.POLLNVAL
+            # Unprocessed TLS close_notify need not have a TCP FIN. Pending
+            # encrypted input makes idle reuse uncertain; do not consume it.
+            # A healthy post-handshake record can cause a conservative reconnect.
+            if transport.get_extra_info("ssl_object") is not None:
+                terminal |= select.POLLIN
+            poller = select.poll()
+            poller.register(sock, terminal)
+            if any(flags & terminal for _, flags in poller.poll(0)):
+                connection.close()
+                return None
+            return connection
+        except BaseException:
+            connection.close()
+            raise
+
+
+class DiagnosticPollSafeTCPConnector(ConnectionDiagnosticMixin, PollSafeTCPConnector):
     pass
 
 
 def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSession:  # pragma: no cover
     assert not is_global_aiohttp_client_setup(), (
-        "There is already a global aiohttp client setup. Please refactor your code or call `global_aiohttp_client_exit` if you want to explicitly re-make the client!"
+        "There is already a global aiohttp client setup. Please refactor your code or await "
+        "`close_global_aiohttp_client` if you want to explicitly re-make the client!"
     )
 
     num_workers = get_nemo_gym_fastapi_num_workers()
-    connector_type = DiagnosticTCPConnector if cfg.global_http_transport_diagnostics else TCPConnector
+    connector_type = DiagnosticPollSafeTCPConnector if cfg.global_http_transport_diagnostics else PollSafeTCPConnector
     client_session = ClientSession(
         connector=connector_type(
             limit=cfg.global_aiohttp_connector_limit // num_workers,
@@ -213,6 +292,9 @@ def set_global_aiohttp_client(cfg: GlobalAIOHTTPAsyncClientConfig) -> ClientSess
     global _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG
     _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG = cfg.global_aiohttp_client_request_debug
 
+    global _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S
+    _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S = cfg.model_request_timeout_s
+
     return _GLOBAL_AIOHTTP_CLIENT
 
 
@@ -224,14 +306,69 @@ def is_global_aiohttp_client_request_debug_enabled() -> bool:
     return _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG
 
 
-def global_aiohttp_client_exit():  # pragma: no cover
-    if not is_global_aiohttp_client_setup():
+async def close_global_aiohttp_client() -> None:
+    """Idempotently close the global session on its owning event loop."""
+    global _GLOBAL_AIOHTTP_CLIENT, _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S
+    client = _GLOBAL_AIOHTTP_CLIENT
+    if client is None:
+        _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S = None
+        return
+    if client.closed:
+        _GLOBAL_AIOHTTP_CLIENT = None
+        _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S = None
+        return
+    if asyncio.get_running_loop() is not client._loop:
+        raise RuntimeError("the global aiohttp client must be closed on its owning event loop")
+    try:
+        await client.close()
+    finally:
+        if _GLOBAL_AIOHTTP_CLIENT is client and client.closed:
+            _GLOBAL_AIOHTTP_CLIENT = None
+            _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S = None
+
+
+def global_aiohttp_client_exit(timeout_s: float = 5.0) -> None:  # pragma: no cover
+    global _GLOBAL_AIOHTTP_CLIENT
+    client = _GLOBAL_AIOHTTP_CLIENT
+    if client is None:
         return
 
-    global _GLOBAL_AIOHTTP_CLIENT
-    asyncio.run(_GLOBAL_AIOHTTP_CLIENT.close())
+    owner_loop = client._loop
+    if client.closed:
+        _GLOBAL_AIOHTTP_CLIENT = None
+        return
+    if owner_loop.is_closed():
+        raise RuntimeError("global aiohttp client cleanup incomplete: owning event loop is already closed")
 
-    _GLOBAL_AIOHTTP_CLIENT = None
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is owner_loop:
+        return
+    if timeout_s <= 0:
+        raise ValueError("aiohttp exit timeout must be positive")
+    if owner_loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(close_global_aiohttp_client(), owner_loop)
+        try:
+            future.result(timeout=timeout_s)
+        except TimeoutError as error:
+            future.cancel()
+            raise RuntimeError(
+                "global aiohttp client cleanup incomplete: owning loop close deadline exceeded"
+            ) from error
+    else:
+        if running_loop is not None:
+            raise RuntimeError(
+                "global aiohttp client cleanup incomplete: another event loop is running in this thread"
+            )
+        try:
+            owner_loop.run_until_complete(asyncio.wait_for(close_global_aiohttp_client(), timeout=timeout_s))
+        except TimeoutError as error:
+            raise RuntimeError(
+                "global aiohttp client cleanup incomplete: owning loop close deadline exceeded"
+            ) from error
 
 
 atexit.register(global_aiohttp_client_exit)
@@ -239,10 +376,13 @@ atexit.register(global_aiohttp_client_exit)
 
 # This is not intended to be changed. If you want to increase this, we should probably figure out how to improve server-side robustness.
 MAX_NUM_TRIES = 3
+RATE_LIMIT_ERROR_CODES = [429, 502, 503, 504, 520]
+RETRY_ERROR_CODES = RATE_LIMIT_ERROR_CODES + [500]
 
 _NUM_SERVER_DISCONNECTED_ERROR: int = 0
 _NUM_CLIENT_OS_ERROR: int = 0
 DISCONNECTED_CLIENT_OS_PRINT_INTERVAL: int = 100
+_RETRY_ERROR_MESSAGE_CHARS = 160
 DISCONNECTED_CLIENT_OS_HELP_TEXT = """We've run into this issue in two different scenarios previously:
 1. Too many open connections and not enough sockets due to the file descriptor limit being hit.
     - Increase ulimit.
@@ -252,11 +392,57 @@ DISCONNECTED_CLIENT_OS_HELP_TEXT = """We've run into this issue in two different
     - Increase adapter server replicas."""
 
 
+def _format_retry_error(error: ClientOSError | ServerDisconnectedError) -> str:
+    """Return useful socket diagnostics without serializing request data."""
+    cause = error.__cause__ or error.__context__
+    diagnostic = cause if isinstance(cause, OSError) else error
+    error_number = getattr(diagnostic, "errno", None)
+    if isinstance(error_number, int):
+        message = strerror(error_number)
+    elif isinstance(getattr(error, "message", None), str):
+        message = error.message
+    else:
+        message = type(error).__name__
+    message = " ".join(message.split())
+    if "?" in message:
+        message = f"{message.split('?', 1)[0]}?[REDACTED]"
+    if len(message) > _RETRY_ERROR_MESSAGE_CHARS:
+        message = f"{message[:_RETRY_ERROR_MESSAGE_CHARS]}…"
+    return f"errno={error_number if isinstance(error_number, int) else 'none'} cause={type(cause or error).__name__} message={message}"
+
+
+def _json_integer_fragments(value: Any) -> Any:
+    if isinstance(value, int):
+        integer = int.__int__(value)
+        if not -(1 << 63) <= integer <= (1 << 64) - 1:
+            return orjson.Fragment(str(integer).encode("ascii"))
+    if isinstance(value, dict):
+        return {key: _json_integer_fragments(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_integer_fragments(item) for item in value]
+    return value
+
+
+def _encode_json_body(value: Any) -> bytes:
+    try:
+        return orjson.dumps(value)
+    except TypeError as error:
+        if str(error) != "Integer exceeds 64-bit range":
+            raise
+        try:
+            fragments = _json_integer_fragments(value)
+        except RecursionError as recursion_error:
+            raise TypeError("Recursion limit reached") from recursion_error
+        return orjson.dumps(fragments)
+
+
 async def request(
     method: str,
     url: str,
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
+    _replay_safe: Optional[bool] = None,
+    _model_request: bool = False,
     **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
     """Make an outbound HTTP call through Gym's shared aiohttp client.
@@ -267,7 +453,7 @@ async def request(
     """
     # Faster JSON dumps than the default aiohttp json
     if kwargs.get("json"):
-        kwargs["data"] = orjson.dumps(kwargs.pop("json"))
+        kwargs["data"] = _encode_json_body(kwargs.pop("json"))
         kwargs.setdefault("headers", dict())
         kwargs["headers"]["Content-Type"] = "application/json"
 
@@ -275,10 +461,22 @@ async def request(
     # 16k+ concurrency, so this is a hot path (kb/knowledge/conventions/hot-path-overhead.md).
     if is_span_group_enabled(GymSpanGroup.HTTP_CLIENT):
         return await _traced_request(
-            method, url, _internal=_internal, _max_connection_retries=_max_connection_retries, **kwargs
+            method,
+            url,
+            _internal=_internal,
+            _max_connection_retries=_max_connection_retries,
+            _replay_safe=_replay_safe,
+            _model_request=_model_request,
+            **kwargs,
         )
     return await _request_with_retries(
-        method, url, _internal=_internal, _max_connection_retries=_max_connection_retries, **kwargs
+        method,
+        url,
+        _internal=_internal,
+        _max_connection_retries=_max_connection_retries,
+        _replay_safe=_replay_safe,
+        _model_request=_model_request,
+        **kwargs,
     )
 
 
@@ -287,6 +485,8 @@ async def _traced_request(
     url: str,
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
+    _replay_safe: Optional[bool] = None,
+    _model_request: bool = False,
     **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
     """`_request_with_retries` wrapped in a CLIENT span, with `traceparent` injected.
@@ -322,7 +522,13 @@ async def _traced_request(
             safe_set_span_attributes(span, attributes)
 
         response = await _request_with_retries(
-            method, url, _internal=_internal, _max_connection_retries=_max_connection_retries, **kwargs
+            method,
+            url,
+            _internal=_internal,
+            _max_connection_retries=_max_connection_retries,
+            _replay_safe=_replay_safe,
+            _model_request=_model_request,
+            **kwargs,
         )
 
         if span is not None:
@@ -366,40 +572,95 @@ def _format_upstream_error_log(server_name: str, error: ClientResponseError) -> 
     )
 
 
+class _NonReplayableRequestError(Exception):
+    """Carry the transport cause past aiohttp's automatic idempotent retry."""
+
+    def __init__(self, original):
+        self.original = original
+
+
+async def _single_attempt_middleware(request, handler):
+    try:
+        return await handler(request)
+    except (ServerDisconnectedError, ClientOSError) as error:
+        raise _NonReplayableRequestError(error) from error
+
+
 async def _request_with_retries(
     method: str,
     url: str,
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
+    _replay_safe: Optional[bool] = None,
+    _model_request: bool = False,
     **kwargs: Unpack[_RequestOptions],
 ) -> ClientResponse:  # pragma: no cover
     client = get_global_aiohttp_client()
-    num_tries = 1
+    if _model_request and _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S is not None:
+        existing = kwargs.get("timeout") or client.timeout
+        if not isinstance(existing, ClientTimeout):
+            existing = ClientTimeout(total=existing)
+        deadline = _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S
+        total = min(existing.total, deadline) if existing.total and existing.total > 0 else deadline
+        kwargs["timeout"] = ClientTimeout(
+            total=total, connect=existing.connect, sock_read=existing.sock_read,
+            sock_connect=existing.sock_connect, ceil_threshold=existing.ceil_threshold,
+        )
+    # A transport failure cannot tell us whether a stateful operation committed.
+    # Only reads or operations explicitly declared repeat-safe may be replayed;
+    # a connector error proves the request was never sent, so any method retries it.
+    if _replay_safe is not None and type(_replay_safe) is not bool:
+        raise ValueError("_replay_safe must be a boolean")
+    replay_safe = method.upper() in {"GET", "HEAD", "OPTIONS"} if _replay_safe is None else _replay_safe
+    max_attempts = MAX_NUM_TRIES if _max_connection_retries is None else _max_connection_retries
+    if type(max_attempts) is not int or max_attempts < 1:
+        raise ValueError("_max_connection_retries must be positive")
+    # Gym owns the one retry budget. Its shared session has no session middleware;
+    # preserve request middleware while preventing aiohttp from replaying below us.
+    kwargs["middlewares"] = (*(kwargs.get("middlewares") or ()), _single_attempt_middleware)
     retries = 0
     retry_start = time.monotonic()
     while True:
         try:
-            return await client.request(method=method, url=url, **kwargs)
+            try:
+                response = await client.request(method=method, url=url, **kwargs)
+                if replay_safe and response.status in RETRY_ERROR_CODES:
+                    retries += 1
+                    if retries < max_attempts:
+                        response.release()
+                        await asyncio.sleep(0.5)
+                        continue
+                return response
+            except _NonReplayableRequestError as error:
+                context = getattr(error, "_gym_transport_context", None)
+                if context is not None:
+                    error.original._gym_transport_context = context
+                raise error.original
         except ServerDisconnectedError as error:
             global _NUM_SERVER_DISCONNECTED_ERROR
             _NUM_SERVER_DISCONNECTED_ERROR += 1
             retries += 1
-            if _NUM_SERVER_DISCONNECTED_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+            if _NUM_SERVER_DISCONNECTED_ERROR == 1 or (
+                _NUM_SERVER_DISCONNECTED_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0
+            ):
+                redacted_url = _redacted_url(url)
                 context = failure_context(
                     error,
                     method,
                     url,
-                    replay_allowed=True,
-                    final=_max_connection_retries is not None and retries >= _max_connection_retries,
+                    replay_allowed=replay_safe,
+                    final=not replay_safe or retries >= max_attempts,
                 )
                 print(
-                    f"[request_retry url={url} error=ServerDisconnectedError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f} context={context}] "
-                    f"Hit {_NUM_SERVER_DISCONNECTED_ERROR} global `ServerDisconnectedError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
+                    f"[request_retry url={redacted_url} error=ServerDisconnectedError retry={retries} "
+                    f"elapsed_s={time.monotonic() - retry_start:.1f} {_format_retry_error(error)} context={context}] "
+                    f"Hit {_NUM_SERVER_DISCONNECTED_ERROR} global `ServerDisconnectedError` while querying "
+                    f"{redacted_url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
                     flush=True,
                 )
 
             # Retrying forever is wrong if the endpoint is expected to sometimes die and move.
-            if _max_connection_retries is not None and retries >= _max_connection_retries:
+            if not replay_safe or retries >= max_attempts:
                 raise
 
             await asyncio.sleep(0.5)
@@ -407,21 +668,24 @@ async def _request_with_retries(
             global _NUM_CLIENT_OS_ERROR
             _NUM_CLIENT_OS_ERROR += 1
             retries += 1
-            if _NUM_CLIENT_OS_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+            if _NUM_CLIENT_OS_ERROR == 1 or _NUM_CLIENT_OS_ERROR % DISCONNECTED_CLIENT_OS_PRINT_INTERVAL == 0:
+                redacted_url = _redacted_url(url)
                 context = failure_context(
                     error,
                     method,
                     url,
-                    replay_allowed=True,
-                    final=_max_connection_retries is not None and retries >= _max_connection_retries,
+                    replay_allowed=replay_safe or isinstance(error, ClientConnectorError),
+                    final=not (replay_safe or isinstance(error, ClientConnectorError)) or retries >= max_attempts,
                 )
                 print(
-                    f"[request_retry url={url} error=ClientOSError retry={retries} elapsed_s={time.monotonic() - retry_start:.1f} context={context}] "
-                    f"Hit {_NUM_CLIENT_OS_ERROR} global `ClientOSError` while querying {url}.\n{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
+                    f"[request_retry url={redacted_url} error=ClientOSError retry={retries} "
+                    f"elapsed_s={time.monotonic() - retry_start:.1f} {_format_retry_error(error)} context={context}] "
+                    f"Hit {_NUM_CLIENT_OS_ERROR} global `ClientOSError` while querying {redacted_url}.\n"
+                    f"{DISCONNECTED_CLIENT_OS_HELP_TEXT}",
                     flush=True,
                 )
 
-            if _max_connection_retries is not None and retries >= _max_connection_retries:
+            if not (replay_safe or isinstance(error, ClientConnectorError)) or retries >= max_attempts:
                 raise
 
             await asyncio.sleep(0.5)
@@ -429,17 +693,14 @@ async def _request_with_retries(
             if _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG:
                 print_exc()
 
-            # Don't increment internal since we know we are ok. If we are not, the head server will shut everything down anyways.
+            retries += 1
             if not _internal:
                 print(
-                    f"""Hit an exception while making a request (try {num_tries}): {type(e)}: {e}
-Sleeping 0.5s and retrying...
+                    f"""Request failed (attempt {retries}, replay_safe={replay_safe}): {type(e)}: {e}
 """
                 )
-                if num_tries >= MAX_NUM_TRIES:
-                    raise e
-
-                num_tries += 1
+            if not replay_safe or retries >= max_attempts:
+                raise
 
             await asyncio.sleep(0.5)
 
@@ -553,6 +814,11 @@ class ServerClient(BaseModel):
 
         observability_enabled = self.global_config_dict.get(OBSERVABILITY_ENABLED_KEY_NAME, False)
         server_entry = self.global_config_dict.get(server_name)
+        model_path = url_path.partition("?")[0].rstrip("/")
+        if server_entry is not None and "responses_api_models" in server_entry and model_path.endswith(
+            ("/responses", "/chat/completions", "/completions", "/messages")
+        ):
+            kwargs["_model_request"] = True
         rollout_id = current_rollout_id()
         if observability_enabled and server_entry is not None and "resources_servers" in server_entry:
             if url_path == "/verify":
@@ -649,7 +915,7 @@ class ServerClient(BaseModel):
 
 
 def _has_injected_global_config_env() -> bool:
-    return getenv(NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME) is not None
+    return getenv(NEMO_GYM_CONFIG_FILE_ENV_VAR_NAME) is not None
 
 
 SESSION_ID_KEY = "session_id"
@@ -723,6 +989,7 @@ def initialize_ray() -> None:
         ray_init_kwargs["address"] = ray_head_node_address
     else:
         print("NeMo Gym is starting a new Ray cluster...")
+        ray_init_kwargs.update(global_config_dict.get(RAY_INIT_KWARGS_KEY_NAME, {}))
         global _NEMO_GYM_STARTED_RAY_CLUSTER
         _NEMO_GYM_STARTED_RAY_CLUSTER = True
 
@@ -938,11 +1205,23 @@ class SimpleServer(BaseServer):
         app.add_middleware(SessionMiddleware, secret_key=session_middleware_key, session_cookie=session_middleware_key)
 
     def setup_exception_middleware(self, app: FastAPI) -> None:  # pragma: no cover
+        def log_exception(request: Request) -> None:
+            logging.getLogger(__name__).error(
+                "gym_request_failed server=%r worker_pid=%s parent_pid=%s rollout_id=%r tool_call_id=%r",
+                self.config.name,
+                getpid(),
+                getppid(),
+                current_rollout_id() or request.headers.get(FAILURE_ROLLOUT_HEADER) or "unknown",
+                request.headers.get(FAILURE_TOOL_CALL_HEADER) or "unknown",
+                exc_info=True,
+            )
+
         @app.middleware("http")
         async def exception_handling_middleware(request: Request, call_next):
             try:
                 return await call_next(request)
             except ClientResponseError as e:
+                log_exception(request)
                 assert hasattr(e, "response_content"), (
                     "Please use `nemo_gym.server_utils.raise_for_status` for HTTP exceptions!"
                 )
@@ -950,9 +1229,12 @@ class SimpleServer(BaseServer):
                 response_content = f"Hit an exception in {self.get_session_middleware_key()} calling an inner server: {e.response_content}"
                 print(_format_upstream_error_log(self.get_session_middleware_key(), e), flush=True)
 
+                # Keep deterministic client failures and gateway availability/deadline
+                # errors intact; the existing retry policy owns any safe replay.
+                status_code = e.status if 400 <= e.status < 500 or e.status in (502, 503, 504) else 500
                 return JSONResponse(
                     content=response_content,
-                    status_code=500,
+                    status_code=status_code,
                     headers=failure_provenance_headers(
                         e, method=request.method, path=request.scope["path"], relay=True
                     ),
@@ -960,6 +1242,7 @@ class SimpleServer(BaseServer):
             except CancelledError:
                 return JSONResponse(content="Request was cancelled", status_code=500)
             except Exception as e:
+                log_exception(request)
                 print(
                     f"""🚨 Caught an exception printed above in {self.config.name} ({self.__class__.__name__}). If you expect this to be fed back into this model, the exception repr i.e. `repr(e)` is returned to the model. However, please make sure this exception is caught in your server and returned to the model as appropriate. See https://fastapi.tiangolo.com/tutorial/handling-errors/#use-httpexception
 Formatted exception: {format_exc()}
@@ -1089,6 +1372,11 @@ repr(e): {repr(e)}"""
 
             maybe_auto_expose(server, app)
         server.setup_liveness(app)
+
+        @app.on_event("shutdown")
+        async def close_http_client() -> None:
+            await close_global_aiohttp_client()
+
         server.set_ulimit()
         server.prefix_server_logs()
         server.setup_exception_middleware(app)
@@ -1131,15 +1419,16 @@ Full body: {json.dumps(exc.body, indent=4)}
             # Parse HTTP with httptools instead of pure-Python h11.
             # Explicit selection prevents Uvicorn from silently falling back to h11.
             # A missing or incompatible httptools wheel now fails during startup.
-            http="httptools",
+            http=_required_poll_safe_httptools_protocol(),
             access_log=uvicorn_logging_cfg.uvicorn_logging_show_200_ok,
         )
 
         transport_cfg = HTTPTransportDiagnosticsConfig.model_validate(global_config_dict)
         if transport_cfg.global_http_transport_diagnostics:
-            from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
-
-            uvicorn_kwargs["http"] = partial(diagnostic_protocol, base=HttpToolsProtocol)
+            uvicorn_kwargs["http"] = partial(
+                diagnostic_protocol,
+                base=_required_poll_safe_httptools_protocol(),
+            )
 
         if server.config.num_workers and server.config.num_workers > 1:
             # TODO this is very dirty. We need a cleaner way to populate this information in the configs data structures.
@@ -1215,7 +1504,9 @@ class HeadServer(BaseServer):
         self._cached_yaml = None
 
     @classmethod
-    def run_webserver(cls) -> Tuple[uvicorn.Server, Thread, "HeadServer"]:  # pragma: no cover
+    def run_webserver(
+        cls, listener: Optional[socket.socket] = None
+    ) -> Tuple[uvicorn.Server, Thread, "HeadServer"]:  # pragma: no cover
         config = ServerClient.load_head_server_config()
         server = cls(config=config)
 
@@ -1225,15 +1516,17 @@ class HeadServer(BaseServer):
             app,
             host=server.config.host,
             port=server.config.port,
+            # Match component servers: exceed the Gym client's 15-second pool lifetime.
+            timeout_keep_alive=30,
+            http=HEAD_SERVER_HTTP_PROTOCOL,
         )
         transport_cfg = HTTPTransportDiagnosticsConfig.model_validate(get_global_config_dict())
         if transport_cfg.global_http_transport_diagnostics:
-            from uvicorn.protocols.http.auto import AutoHTTPProtocol
-
-            config.http = partial(diagnostic_protocol, base=AutoHTTPProtocol)
+            config.http = partial(diagnostic_protocol, base=HEAD_SERVER_HTTP_PROTOCOL)
         uvicorn_server = uvicorn.Server(config=config)
 
-        thread = Thread(target=uvicorn_server.run, daemon=True)
+        kwargs = {"sockets": [listener]} if listener is not None else {}
+        thread = Thread(target=uvicorn_server.run, kwargs=kwargs, daemon=True)
         thread.start()
 
         return uvicorn_server, thread, server
