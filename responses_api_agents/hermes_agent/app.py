@@ -14,6 +14,7 @@
 # limitations under the License.
 import asyncio
 import atexit
+import json
 import logging
 import os
 import shutil
@@ -183,6 +184,73 @@ def _keep_tool_calls(tool_calls: list) -> list:
     return tool_calls
 
 
+# OpenHands' built-in `finish` schema (openhands/sdk/tool/builtins/finish.py), so a
+# harness mix offers one completion contract.
+FINISH_TOOL_SCHEMA = {
+    "name": "finish",
+    "description": (
+        "Signals the completion of the current task or conversation.\n\n"
+        "Use this tool when:\n"
+        "- You have successfully completed the user's requested task\n"
+        "- You cannot proceed further due to technical limitations or missing information\n\n"
+        "The message should include:\n"
+        "- A clear summary of actions taken and their results\n"
+        "- Any next steps for the user\n"
+        "- Explanation if you're unable to complete the task\n"
+        "- Any follow-up questions if more information is needed\n"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"message": {"type": "string", "description": "Final message to send to the user."}},
+        "required": ["message"],
+    },
+}
+
+
+def _finish_result(args: dict, **_: Any) -> str:
+    return str(args.get("message", ""))
+
+
+def _offer_finish_tool(agent: Any) -> Callable[[], bool]:
+    """Offer `finish` and end the run after the turn that calls it.
+
+    Hermes ends a run on a turn without tool calls. `finish` is the explicit
+    form of that stop: Hermes runs it through its registry like any tool, every
+    call in the turn still executes, and the loop then stops at its own
+    between-turn interrupt check, before another model request. A finish on the
+    last allowed turn skips Hermes' extra iteration-limit summary request.
+    Returns whether the run was finished this way.
+    """
+    from tools.registry import registry  # pyright: ignore[reportMissingImports]
+
+    registry.register(name="finish", toolset="finish", schema=FINISH_TOOL_SCHEMA, handler=_finish_result)
+    agent.tools = [*(agent.tools or []), {"type": "function", "function": FINISH_TOOL_SCHEMA}]
+    agent.valid_tool_names = {*(agent.valid_tool_names or ()), "finish"}
+    execute_tool_calls = agent._execute_tool_calls
+    handle_max_iterations = agent._handle_max_iterations
+    message: Optional[str] = None
+
+    def execute_then_finish(assistant_message, *args, **kwargs):
+        nonlocal message
+        result = execute_tool_calls(assistant_message, *args, **kwargs)
+        for call in assistant_message.tool_calls or []:
+            if call.function.name == "finish":
+                try:
+                    arguments = json.loads(call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                message = _finish_result(arguments if isinstance(arguments, dict) else {})
+                agent._interrupt_requested = True
+        return result
+
+    def summary_unless_finished(*args, **kwargs):
+        return message if message is not None else handle_max_iterations(*args, **kwargs)
+
+    agent._execute_tool_calls = execute_then_finish
+    agent._handle_max_iterations = summary_unless_finished
+    return lambda: message is not None
+
+
 class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
@@ -203,6 +271,8 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
     checkpoints_enabled: bool = False
+    # Offer OpenHands' `finish(message)` tool; the turn that calls it ends the run as completed.
+    finish_tool: bool = False
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -350,6 +420,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
 
         agent._build_api_kwargs = _patched_build_api_kwargs
         _execute_every_tool_call(agent)
+        finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         observer = None
         if observation_collector is not None:
             try:
@@ -374,6 +445,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 system_message,
                 history,
             )
+            if finished_by_tool is not None and finished_by_tool() and agent_id not in self.interrupted_agents:
+                # The policy ended the run itself; the loop's interrupt check was only the stop point.
+                result = {**result, "completed": True, "interrupted": False}
         except BaseException as exc:
             agent_error = exc
             raise
