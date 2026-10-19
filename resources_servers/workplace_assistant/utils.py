@@ -127,12 +127,19 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
         for name, (frame, id_column) in _state_tables(tool_env).items()
     }
 
+    # Every email an action sends, as sent. A later delete removes the row from
+    # the mailbox, but the recipient already has the message, so grading keeps it.
+    tool_env["sent_emails"] = []
+
     # Execute the actions
     for action in actions:
+        emails_before = set(tool_env["containers"]["email"]._emails["email_id"])
         try:
             tool_env["functions"][action["name"]](**json.loads(action["arguments"]))
         except Exception as e:
             print("Error executing tool: ", e)
+        emails = tool_env["containers"]["email"]._emails
+        tool_env["sent_emails"].extend(emails[~emails["email_id"].isin(emails_before)].to_dict(orient="records"))
         # Once a seeded record is removed, reusing its ID does not restore its
         # identity. Track this per replay so delete/create order can also vary.
         for name, (frame, id_column) in _state_tables(tool_env).items():
@@ -154,6 +161,17 @@ def _state_tables(tool_env):
         "project_management": (containers["project_management"]._project_tasks, "task_id"),
         "customer_relationship_manager": (containers["customer_relationship_manager"]._crm_data, "customer_id"),
     }
+
+
+def _sent_email_rows(tool_env):
+    """Canonical multiset of every email sent during a replay, deleted or not.
+
+    Generated email IDs are positional (max + 1), so a deleted send and its
+    replacement can share one; identity is the sent content.
+    """
+    columns = tool_env["containers"]["email"]._emails.columns
+    frame = pd.DataFrame(tool_env["sent_emails"], columns=columns).drop(columns=["email_id"])
+    return _canonical_rows(frame, None, set(), "email")
 
 
 def _canonical_rows(frame, id_column, stable_ids, table_name=None):
@@ -218,7 +236,8 @@ def is_correct(
     Returns
     -------
     bool
-        True if the predicted actions result in the same state change as the ground truth actions.
+        True if the predicted actions result in the same state change as the ground truth actions
+        and send the same emails, counting sent emails that were later deleted.
 
     """
     if error:
@@ -244,4 +263,7 @@ def is_correct(
         reference_rows = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
         if predicted_rows is None or reference_rows is None or predicted_rows != reference_rows:
             return False
-    return True
+    # The final mailbox hides a wrong email that was sent and then deleted.
+    predicted_sent = _sent_email_rows(predicted_env)
+    reference_sent = _sent_email_rows(reference_env)
+    return predicted_sent is not None and reference_sent is not None and predicted_sent == reference_sent
