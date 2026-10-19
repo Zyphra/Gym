@@ -30,11 +30,25 @@ def model_call_context(role, *, operation_id=None, depends_on=None, measured_spa
         "role": role if role in _ROLES else "unknown",
         "operation_id": _id(operation_id) or (previous.get("operation_id") if reuse else None) or uuid4().hex,
         "parent_operation_id": previous.get("parent_operation_id") if reuse else previous.get("operation_id"),
-        "depends_on_operation_ids": [value for value in (previous.get("depends_on_operation_ids", []) if depends_on is None else depends_on) if _id(value)],
+        "depends_on_operation_ids": [
+            value
+            for value in (previous.get("depends_on_operation_ids", []) if depends_on is None else depends_on)
+            if _id(value)
+        ],
         "measured_spans_ms": {
-            name: float(value) for name, value in spans.items()
-            if name in {"session_lock_wait_ms", "decision_cache_wait_ms", "judge_semaphore_wait_ms", "owned_thread_start_delay_ms", "policy_inbox_wait_ms"}
-            and type(value) in (int, float) and math.isfinite(value) and value >= 0
+            name: float(value)
+            for name, value in spans.items()
+            if name
+            in {
+                "session_lock_wait_ms",
+                "decision_cache_wait_ms",
+                "judge_semaphore_wait_ms",
+                "owned_thread_start_delay_ms",
+                "policy_inbox_wait_ms",
+            }
+            and type(value) in (int, float)
+            and math.isfinite(value)
+            and value >= 0
         },
     }
     token = _OWNER.set(owner)
@@ -62,7 +76,13 @@ def metadata_headers():
 def metadata_exchange(headers):
     role = headers.get("x-nemo-gym-call-role")
     spans = {}
-    for name in ("session_lock_wait_ms", "decision_cache_wait_ms", "judge_semaphore_wait_ms", "owned_thread_start_delay_ms", "policy_inbox_wait_ms"):
+    for name in (
+        "session_lock_wait_ms",
+        "decision_cache_wait_ms",
+        "judge_semaphore_wait_ms",
+        "owned_thread_start_delay_ms",
+        "policy_inbox_wait_ms",
+    ):
         try:
             value = float(headers.get("x-nemo-gym-span-" + name, "nan"))
             if math.isfinite(value) and value >= 0:
@@ -70,12 +90,16 @@ def metadata_exchange(headers):
         except ValueError:
             pass
     exchange = {
-        "metadata_only": True, "role": role if role in _ROLES else "unknown",
+        "metadata_only": True,
+        "role": role if role in _ROLES else "unknown",
         "operation_id": _id(headers.get("x-nemo-gym-operation-id")),
         "parent_operation_id": _id(headers.get("x-nemo-gym-parent-operation-id")),
-        "depends_on_operation_ids": [value for value in headers.get("x-nemo-gym-depends-on", "").split(",") if _id(value)],
+        "depends_on_operation_ids": [
+            value for value in headers.get("x-nemo-gym-depends-on", "").split(",") if _id(value)
+        ],
         "measured_spans_ms": spans,
-        "server_queue_ms": None, "server_service_ms": None,
+        "server_queue_ms": None,
+        "server_service_ms": None,
     }
     token = _CALL.set(exchange)
     try:
@@ -114,6 +138,7 @@ def record_response_metadata(response, *, raw_client=False):
     if exchange is None:
         return
     from nemo_gym.base_responses_api_model import _cache_signal, extract_token_stats
+
     usage = _get(response, "usage")
     if hasattr(usage, "model_dump"):
         usage = usage.model_dump(exclude_unset=True)
@@ -147,14 +172,16 @@ def measured_model_client():
 def model_call_role(role):
     """Mark the actual role owner without changing its signature or arguments."""
     from functools import wraps
+
     def decorate(function):
         @wraps(function)
         async def invoke(*args, **kwargs):
             with model_call_context(role):
                 return await function(*args, **kwargs)
-        return invoke
-    return decorate
 
+        return invoke
+
+    return decorate
 
 
 @asynccontextmanager
@@ -164,9 +191,12 @@ async def observed_lock(lock):
     await lock.acquire()
     try:
         owner = _OWNER.get() or {}
-        with model_call_context(owner.get("role", "unknown"), measured_spans_ms={
-            "session_lock_wait_ms": 1000 * (perf_counter() - started),
-        }):
+        with model_call_context(
+            owner.get("role", "unknown"),
+            measured_spans_ms={
+                "session_lock_wait_ms": 1000 * (perf_counter() - started),
+            },
+        ):
             yield
     finally:
         lock.release()

@@ -153,9 +153,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         while True:
             step += 1
             new_body = body.model_copy(update={"input": body.input + new_outputs})
-            final_answer_turn = bool(
-                self.config.final_answer_after_max_steps and step > self.config.max_steps
-            )
+            final_answer_turn = bool(self.config.final_answer_after_max_steps and step > self.config.max_steps)
             if final_answer_turn:
                 new_body.tools = []
                 new_body.tool_choice = "none"
@@ -250,7 +248,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 except (_UnpresentedToolError, _FinalAnswerToolError) as e:
                     tool_output = json.dumps({"error": str(e)})
                     if collect_trajectory:
-                        error_type = "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
+                        error_type = (
+                            "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
+                        )
                         tool_status = "failed"
                 except (json.JSONDecodeError, TypeError) as e:
                     tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})

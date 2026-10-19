@@ -80,6 +80,7 @@ async def call_judge(
         return response_model.model_validate(await get_response_json(http_response))
 
     from nemo_gym.model_call_metadata import model_call_context
+
     with model_call_context("judge", preserve_operation=True):
         return await reraise_judge_errors(_call())
 
