@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
+import inspect
 import json
 from contextlib import asynccontextmanager
 
@@ -75,7 +77,12 @@ async def episode(monkeypatch, outputs, **kwargs):
                 "summary": [{"type": "summary_text", "text": "deterministic calculation"}],
             }
         ]
-        output.extend(outputs(body, len(requests)))
+        produced = outputs(body, len(requests))
+        if inspect.isawaitable(produced):
+            produced = await produced
+        if isinstance(produced, web.StreamResponse):
+            return produced
+        output.extend(produced)
         return web.json_response(
             {
                 "id": f"response-{len(requests)}",
@@ -147,29 +154,27 @@ async def run(agent, body):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("answer", [r"\boxed{42}", "No answer.", r"\boxed{41}"])
-async def test_tenth_tool_result_is_followed_by_a_real_answer_request(monkeypatch, answer):
+async def test_exhausted_interactive_budget_gets_exactly_one_answer_request(monkeypatch, answer):
     async with episode(
         monkeypatch,
-        lambda body, n: [_call(n)] if n <= 10 else [_answer(answer)],
-        max_tool_calls=10,
+        lambda body, n: [_call(n)] if n <= 24 else [_answer(answer)],
+        final_answer_after_max_steps=True,
         presented_tools_only=True,
     ) as (agent, body, requests, executed):
         response, trajectory, _, _ = await run(agent, body)
-        assert len(executed) == 10 and len(requests) == 11
-        assert all(request["tools"] == body.model_dump()["tools"] for request in requests[:10])
-        assert requests[10]["tools"] == [] and requests[10]["tool_choice"] == "none"
-        assert len([item for item in requests[10]["input"] if item.get("type") == "function_call_output"]) == 10
+        assert len(executed) == 24 and len(requests) == 25
+        assert all(request["tools"] == body.model_dump()["tools"] for request in requests[:24])
+        assert requests[-1]["tools"] == [] and requests[-1]["tool_choice"] == "none"
+        assert len([item for item in requests[-1]["input"] if item.get("type") == "function_call_output"]) == 24
         assert response.output[-1].content[0].text == answer
         assert trajectory.invocations[0].status == "completed"
-        assert len(trajectory.tool_calls) == 10 and all(t.status == "completed" for t in trajectory.tool_calls)
+        assert len(trajectory.tool_calls) == 24 and len(trajectory.turns) == 25
         assert len(body.input) == 1 and body.tools and body.tool_choice != "none"
-        assert all(request.get("max_tool_calls") is None for request in requests)
-        await run(agent, body)  # New episode has its own counter, never shared state.
-        assert requests[11]["tools"] == body.model_dump()["tools"]
+        assert agent.config.max_steps == 24
 
 
 @pytest.mark.asyncio
-async def test_disabled_option_preserves_the_24th_call_and_turn_cap(monkeypatch):
+async def test_default_preserves_the_24th_call_and_original_incomplete_ending(monkeypatch):
     async with episode(monkeypatch, lambda body, n: [_call(n)]) as (agent, body, requests, executed):
         response, trajectory, _, _ = await run(agent, body)
         assert len(requests) == len(executed) == 24
@@ -179,70 +184,147 @@ async def test_disabled_option_preserves_the_24th_call_and_turn_cap(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_parallel_calls_cannot_overrun_the_budget(monkeypatch):
-    async with episode(
-        monkeypatch, lambda body, n: [_call(i) for i in range(4)] if n == 1 else [_answer("done")], max_tool_calls=3
-    ) as (agent, body, requests, executed):
-        _, trajectory, _, _ = await run(agent, body)
-        assert len(executed) == 3
-        assert requests[1]["tools"] == [] and requests[1]["tool_choice"] == "none"
-        assert trajectory.tool_calls[-1].error_type == "tool_budget_exhausted"
-        assert "budget exhausted" in json.loads(trajectory.tool_calls[-1].output)["error"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["malformed", "unpresented"])
-async def test_rejected_calls_consume_budget_without_resource_dispatch(monkeypatch, kind):
-    call = _call(
-        1, arguments="{" if kind == "malformed" else "{}", name="hidden" if kind == "unpresented" else "execute_python"
-    )
+@pytest.mark.parametrize("calls", [0, 14])
+async def test_existing_early_answer_and_more_than_ten_calls_are_unchanged(monkeypatch, calls):
     async with episode(
         monkeypatch,
-        lambda body, n: [call] if n == 1 else [_answer("done")],
-        max_tool_calls=1,
-        presented_tools_only=True,
+        lambda body, n: [_call(n)] if n <= calls else [_answer(r"\boxed{42}")],
+        final_answer_after_max_steps=True,
     ) as (agent, body, requests, executed):
-        _, trajectory, _, _ = await run(agent, body)
-        assert not executed and requests[1]["tools"] == []
-        assert trajectory.tool_calls[0].status == "failed"
-
-
-@pytest.mark.asyncio
-async def test_last_model_turn_is_reserved_even_before_call_budget(monkeypatch):
-    async with episode(
-        monkeypatch, lambda body, n: [_call(n)] if n < 3 else [_answer("done")], max_tool_calls=10, max_steps=3
-    ) as (agent, body, requests, executed):
-        _, trajectory, _, _ = await run(agent, body)
-        assert len(requests) == 3 and len(executed) == 2
-        assert requests[2]["tools"] == [] and requests[2]["tool_choice"] == "none"
+        response, trajectory, _, _ = await run(agent, body)
+        assert len(requests) == calls + 1 and len(executed) == calls
+        assert all(request["tools"] == body.model_dump()["tools"] for request in requests)
+        assert response.output[-1].content[0].text == r"\boxed{42}"
         assert trajectory.invocations[0].status == "completed"
 
 
 @pytest.mark.asyncio
-async def test_calls_despite_disabled_tools_do_not_execute_or_fabricate_an_answer(monkeypatch):
-    async with episode(monkeypatch, lambda body, n: [_call(n)], max_tool_calls=1, max_steps=3) as (
+@pytest.mark.parametrize("extra_calls", [1, 2])
+async def test_final_request_calls_never_dispatch_or_invent_an_answer(monkeypatch, extra_calls):
+    async with episode(
+        monkeypatch,
+        lambda body, n: [_call(n)] if n <= 3 else [_call(n + i) for i in range(extra_calls)],
+        max_steps=3,
+        final_answer_after_max_steps=True,
+    ) as (agent, body, requests, executed):
+        response, trajectory, _, _ = await run(agent, body)
+        assert len(requests) == 4 and len(executed) == 3
+        assert requests[-1]["tools"] == [] and requests[-1]["tool_choice"] == "none"
+        assert all(t.error_type == "final_answer_tool_call" for t in trajectory.tool_calls[-extra_calls:])
+        assert response.output[-1].type == "function_call_output"
+        assert trajectory.invocations[0].status == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_context_exhaustion_keeps_the_native_incomplete_result(monkeypatch):
+    from aiohttp import web
+
+    error = {
+        "error": {
+            "type": "invalid_request_error",
+            "message": "maximum context length is 131072 tokens; you requested 131073 tokens",
+        }
+    }
+    async with episode(
+        monkeypatch,
+        lambda body, n: [_call(n)] if n <= 3 else web.json_response(error, status=400),
+        max_steps=3,
+        final_answer_after_max_steps=True,
+    ) as (agent, body, requests, executed):
+        response, trajectory, _, _ = await run(agent, body)
+        assert len(requests) == 4 and len(executed) == 3
+        assert response.status == "incomplete" and response.incomplete_details.reason == "max_output_tokens"
+        assert trajectory.invocations[0].status == "incomplete"
+        assert response.output[-1].type == "function_call_output"
+
+
+@pytest.mark.asyncio
+async def test_unrelated_model_error_is_not_converted_or_retried_away(monkeypatch):
+    from aiohttp import ClientResponseError, web
+
+    error = {"error": {"type": "original-invalid-control", "message": "original initiating error"}}
+    async with episode(
+        monkeypatch,
+        lambda body, n: [_call(n)] if n <= 3 else web.json_response(error, status=422),
+        max_steps=3,
+        final_answer_after_max_steps=True,
+    ) as (agent, body, requests, executed):
+        with pytest.raises(ClientResponseError) as raised:
+            await run(agent, body)
+        assert raised.value.status == 422
+        assert json.loads(raised.value.response_content) == error
+        assert len(requests) == 4 and len(executed) == 3
+
+
+@pytest.mark.asyncio
+async def test_cancellation_on_final_request_propagates_and_releases(monkeypatch):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def policy(body, n):
+        if n <= 3:
+            return [_call(n)]
+        entered.set()
+        await release.wait()
+        return [_answer("not delivered after cancellation")]
+
+    async with episode(monkeypatch, policy, max_steps=3, final_answer_after_max_steps=True) as (
+        agent,
+        body,
+        requests,
+        executed,
+    ):
+        task = asyncio.create_task(run(agent, body))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert task.cancelled() and len(requests) == 4 and len(executed) == 3
+        finally:
+            release.set()
+
+
+@pytest.mark.asyncio
+async def test_native_output_length_ending_does_not_admit_an_extra_request(monkeypatch):
+    from aiohttp import web
+
+    def policy(body, n):
+        if n == 1:
+            return [_call(n)]
+        return web.json_response(
+            {
+                "id": "cut",
+                "created_at": 0.0,
+                "model": "fixture",
+                "object": "response",
+                "parallel_tool_calls": False,
+                "tool_choice": "auto",
+                "tools": [],
+                "output": [],
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+            }
+        )
+
+    async with episode(monkeypatch, policy, max_steps=2, final_answer_after_max_steps=True) as (
         agent,
         body,
         requests,
         executed,
     ):
         response, trajectory, _, _ = await run(agent, body)
-        assert len(requests) == 3 and len(executed) == 1
-        assert [t.error_type for t in trajectory.tool_calls] == [
-            None,
-            "tool_budget_exhausted",
-            "tool_budget_exhausted",
-        ]
-        assert response.output[-1].type == "function_call_output"
+        assert len(requests) == 2 and len(executed) == 1
+        assert response.incomplete_details.reason == "max_output_tokens"
         assert trajectory.invocations[0].status == "incomplete"
 
 
-@pytest.mark.parametrize("invalid", [-1, True, "10", 1.5])
-def test_tool_budget_is_a_strict_nonnegative_integer(invalid):
+@pytest.mark.parametrize("limit", [None, 0, -1])
+def test_finalization_requires_a_finite_positive_interactive_limit(limit):
     with pytest.raises(ValidationError):
-        _config(max_tool_calls=invalid)
+        _config(max_steps=limit, final_answer_after_max_steps=True)
 
 
-def test_zero_budget_is_supported_and_default_is_disabled():
-    assert _config(max_tool_calls=0).max_tool_calls == 0
-    assert _config().max_tool_calls is None
+@pytest.mark.parametrize("flag", ["true", 1, None])
+def test_finalization_opt_in_is_strict(flag):
+    with pytest.raises(ValidationError):
+        _config(final_answer_after_max_steps=flag)

@@ -1,18 +1,24 @@
 # Description
 
-`max_steps` bounds model turns. Optional `max_tool_calls` bounds attempted
-function calls per episode (including malformed or unpresented calls); its
-default `null` preserves existing behavior. Once the budget is spent, subsequent
-model requests use `tools: []` and `tool_choice: none`. With this option enabled,
-the final allowed model turn also disables tools so it can contain an answer.
-Calls emitted despite that restriction receive ordinary error feedback and are
-never dispatched. Parallel calls cannot exceed the budget. No answer or reward
-is fabricated; a model that still supplies no answer remains subject to the
-resource verifier and the existing turn cap.
+`max_steps` bounds interactive model turns. Optional
+`final_answer_after_max_steps` defaults to `false`, preserving existing callers.
+When enabled with a positive `max_steps`, exhaustion allows exactly one extra
+model request with `tools: []` and `tool_choice: none`. For example, 24
+interactive turns still permit all 24 tool turns, followed by at most one
+25th answer request. An earlier answer ends normally. This does not enforce a
+smaller tool-call allowance from prompt prose.
 
-Deterministic loopback controls exercise actual agent dispatch, cookies,
-trajectories and last-call-to-answer requests with no model or judge service.
-They do not establish model compliance or a reward-rate improvement.
+Calls emitted on the extra answer request receive ordinary error feedback and
+are never dispatched. No answer or reward is fabricated. A missing final answer
+remains incomplete; existing native context/output endings, unrelated HTTP
+errors and cancellation retain their original handling.
+
+Twenty-two changed deterministic CPU controls cover real loopback dispatch,
+default behavior, exhausted and early answers, unexpected final calls, context
+exhaustion, initiating HTTP errors, cancellation and caller-to-native scalar
+verification (gold/no-op/wrong = 1/0/0). No model, judge or Python sandbox is
+substituted for an outcome claim: the tool route is a deterministic fixture,
+and model compliance and sandbox qualification remain separate.
 
 # Licensing information
 Code: Apache 2.0
