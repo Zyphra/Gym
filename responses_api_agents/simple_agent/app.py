@@ -18,7 +18,7 @@ from time import perf_counter, time
 from typing import Any, List
 
 from fastapi import Request, Response
-from pydantic import ConfigDict, ValidationError
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
@@ -61,6 +61,13 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
     max_steps: int = None
     presented_tools_only: bool = False
+    final_answer_after_max_steps: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def _check_finalization_limit(self):
+        if self.final_answer_after_max_steps and (self.max_steps is None or self.max_steps < 1):
+            raise ValueError("final_answer_after_max_steps requires a positive max_steps")
+        return self
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -77,6 +84,10 @@ class SimpleAgentVerifyResponse(BaseVerifyResponse):
 
 class _UnpresentedToolError(ValueError):
     """A model requested a function outside the episode tool schemas."""
+
+
+class _FinalAnswerToolError(ValueError):
+    """The optional final answer request cannot dispatch more tools."""
 
 
 class SimpleAgent(SimpleResponsesAPIAgent):
@@ -112,6 +123,10 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         while True:
             step += 1
             new_body = body.model_copy(update={"input": body.input + new_outputs})
+            final_answer_turn = bool(self.config.final_answer_after_max_steps and step > self.config.max_steps)
+            if final_answer_turn:
+                new_body.tools = []
+                new_body.tool_choice = "none"
             if collect_trajectory:
                 turn_timestamp = time()
 
@@ -182,15 +197,19 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     started_at = time()
                     started_monotonic = perf_counter()
                 try:
+                    if final_answer_turn:
+                        raise _FinalAnswerToolError("Final answer required; no more tools may be called.")
                     if self.config.presented_tools_only and output_function_call.name not in presented_tools:
                         raise _UnpresentedToolError(
                             f"Tool {output_function_call.name!r} was not presented in this request."
                         )
                     parsed_arguments = json.loads(output_function_call.arguments)
-                except _UnpresentedToolError as e:
+                except (_UnpresentedToolError, _FinalAnswerToolError) as e:
                     tool_output = json.dumps({"error": str(e)})
                     if collect_trajectory:
-                        error_type = "unpresented_tool"
+                        error_type = (
+                            "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
+                        )
                         tool_status = "failed"
                 except (json.JSONDecodeError, TypeError) as e:
                     tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})
@@ -241,6 +260,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
             # Check if max steps is not None and if we have exhausted it.
             if self.config.max_steps and step >= self.config.max_steps:
+                if self.config.final_answer_after_max_steps and step == self.config.max_steps:
+                    continue
                 invocation_status = "incomplete"
                 break
 
