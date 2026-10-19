@@ -1290,6 +1290,7 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
             record_request_metadata,
             record_response_metadata,
         )
+
         record_request_metadata(kwargs, resolved=True)
         with measured_model_client():
             request_kwargs = dict(
@@ -1309,6 +1310,7 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
             record_request_metadata,
             record_response_metadata,
         )
+
         record_request_metadata(kwargs, resolved=True)
         with measured_model_client():
             request_kwargs = dict(
@@ -1328,6 +1330,7 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
             record_request_metadata,
             record_response_metadata,
         )
+
         record_request_metadata(kwargs, resolved=True)
         with measured_model_client():
             request_kwargs = dict(

@@ -315,6 +315,7 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         self, request: Request, params: NeMoGymChatCompletionCreateParamsNonStreaming
     ) -> NeMoGymChatCompletion:
         from nemo_gym.model_call_metadata import record_request_metadata, record_response_metadata
+
         record_request_metadata(params)
         # chat_completions() signatures vary across servers: some take a leading `request`, some
         # only `body`. Dispatch on whichever this server declares so the shared dispatch works for
@@ -363,6 +364,7 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         self, request: Request, params: NeMoGymResponseCreateParamsNonStreaming
     ) -> NeMoGymResponse:
         from nemo_gym.model_call_metadata import record_request_metadata, record_response_metadata
+
         record_request_metadata(params)
         # responses() signatures vary across servers: some take a leading `request`, some only
         # `body`. Dispatch on whichever this server declares so the default messages() works for
@@ -808,8 +810,10 @@ def build_model_call_record(exchange: dict[str, Any], *, call_index: int) -> Mod
     model = response.get("model") or request.get("model")
     if exchange.get("metadata_only") is True:
         fields = ModelCallRecord.model_fields
-        return ModelCallRecord(**{key: value for key, value in exchange.items() if key in fields and key != "call_index"},
-                               call_index=call_index)
+        return ModelCallRecord(
+            **{key: value for key, value in exchange.items() if key in fields and key != "call_index"},
+            call_index=call_index,
+        )
     return ModelCallRecord(
         model_call_id=exchange.get("model_call_id"),
         response_id=response.get("id") if isinstance(response.get("id"), str) else None,
@@ -1347,19 +1351,39 @@ class _CaptureMiddleware:
 
         if self._metadata_only and self._store is not None and rollout_from_path is not None and dialect is not None:
             from nemo_gym.model_call_metadata import metadata_exchange
-            headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope.get("headers", [])}
+
+            headers = {
+                key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope.get("headers", [])
+            }
             with metadata_exchange(headers) as exchange:
-                exchange.update(model_call_id=uuid4().hex, dialect=dialect,
-                                client_session_id=_unique_request_header(scope.get("headers") or [], _CLIENT_SESSION_HEADER),
-                                model_ref={"type": "responses_api_models", "name": self._model_server_name} if self._model_server_name else None,
-                                started_at=time.time(), status_code=None)
+                exchange.update(
+                    model_call_id=uuid4().hex,
+                    dialect=dialect,
+                    client_session_id=_unique_request_header(scope.get("headers") or [], _CLIENT_SESSION_HEADER),
+                    model_ref={"type": "responses_api_models", "name": self._model_server_name}
+                    if self._model_server_name
+                    else None,
+                    started_at=time.time(),
+                    status_code=None,
+                )
                 started = time.perf_counter()
+
                 async def metadata_send(message):
                     if message["type"] == "http.response.start":
                         exchange["status_code"] = message["status"]
                     await send(message)
+
                 try:
-                    await self._capture_correlated(scope, receive, metadata_send, path, rollout_from_path, token_capture_requested, dialect, exchange["model_call_id"])
+                    await self._capture_correlated(
+                        scope,
+                        receive,
+                        metadata_send,
+                        path,
+                        rollout_from_path,
+                        token_capture_requested,
+                        dialect,
+                        exchange["model_call_id"],
+                    )
                 except BaseException as error:
                     exchange["error_category"] = type(error).__name__
                     raise
@@ -1373,7 +1397,9 @@ class _CaptureMiddleware:
 
         await self._capture_correlated(scope, receive, send, path, rollout_from_path, token_capture_requested, dialect)
 
-    async def _capture_correlated(self, scope, receive, send, path, rollout_from_path, token_capture_requested, dialect, model_call_id=None):
+    async def _capture_correlated(
+        self, scope, receive, send, path, rollout_from_path, token_capture_requested, dialect, model_call_id=None
+    ):
         # Metadata and training-token capture share the existing request-scoped sink.
         # Metadata mode never opens the content-buffering evaluation path.
         store = None if self._metadata_only else self._store
