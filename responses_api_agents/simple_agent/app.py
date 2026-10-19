@@ -18,7 +18,7 @@ from time import perf_counter, time
 from typing import Any, List
 
 from fastapi import Request, Response
-from pydantic import ConfigDict, ValidationError
+from pydantic import ConfigDict, Field, ValidationError
 
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
@@ -61,6 +61,7 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
     max_steps: int = None
     presented_tools_only: bool = False
+    max_tool_calls: int | None = Field(default=None, ge=0, strict=True)
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -77,6 +78,10 @@ class SimpleAgentVerifyResponse(BaseVerifyResponse):
 
 class _UnpresentedToolError(ValueError):
     """A model requested a function outside the episode tool schemas."""
+
+
+class _ToolBudgetError(ValueError):
+    """A model requested a function after its episode tool budget closed."""
 
 
 class SimpleAgent(SimpleResponsesAPIAgent):
@@ -106,12 +111,20 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         new_outputs = []
         usage = None
         step = 0
+        tool_calls = 0
         invocation_status = "completed"
         model_server_cookies = None
 
         while True:
             step += 1
             new_body = body.model_copy(update={"input": body.input + new_outputs})
+            final_answer_turn = self.config.max_tool_calls is not None and (
+                tool_calls >= self.config.max_tool_calls
+                or bool(self.config.max_steps and step >= self.config.max_steps)
+            )
+            if final_answer_turn:
+                new_body.tools = []
+                new_body.tool_choice = "none"
             if collect_trajectory:
                 turn_timestamp = time()
 
@@ -182,15 +195,20 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     started_at = time()
                     started_monotonic = perf_counter()
                 try:
+                    tool_calls += 1
+                    if self.config.max_tool_calls is not None and (
+                        final_answer_turn or tool_calls > self.config.max_tool_calls
+                    ):
+                        raise _ToolBudgetError("Tool-call budget exhausted; reply without a tool call.")
                     if self.config.presented_tools_only and output_function_call.name not in presented_tools:
                         raise _UnpresentedToolError(
                             f"Tool {output_function_call.name!r} was not presented in this request."
                         )
                     parsed_arguments = json.loads(output_function_call.arguments)
-                except _UnpresentedToolError as e:
+                except (_UnpresentedToolError, _ToolBudgetError) as e:
                     tool_output = json.dumps({"error": str(e)})
                     if collect_trajectory:
-                        error_type = "unpresented_tool"
+                        error_type = "tool_budget_exhausted" if isinstance(e, _ToolBudgetError) else "unpresented_tool"
                         tool_status = "failed"
                 except (json.JSONDecodeError, TypeError) as e:
                     tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})
