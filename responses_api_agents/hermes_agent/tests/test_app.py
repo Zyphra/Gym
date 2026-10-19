@@ -14,6 +14,8 @@
 # limitations under the License.
 import asyncio
 import json
+import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -34,6 +36,7 @@ from responses_api_agents.hermes_agent.app import (
     HermesAgentRunRequest,
     ModelServerRef,
     ResourcesServerRef,
+    _execute_every_tool_call,
     _split_input_to_user_and_history,
     _trajectory_to_output_items,
 )
@@ -64,6 +67,21 @@ def _config(**kwargs) -> HermesAgentConfig:
 
 
 class TestSanity:
+    @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+    def test_api_timeout_rejects_invalid_budget(self, timeout) -> None:
+        with pytest.raises(ValueError):
+            _config(api_timeout=timeout)
+
+    def test_api_timeout_projects_episode_budget(self, monkeypatch) -> None:
+        monkeypatch.setenv("HERMES_API_TIMEOUT", "1800")
+        HermesAgent(config=_config(api_timeout=21600), server_client=MagicMock(spec=ServerClient))
+        assert float(os.environ["HERMES_API_TIMEOUT"]) == 21600
+
+    def test_unset_api_timeout_preserves_runtime_setting(self, monkeypatch) -> None:
+        monkeypatch.setenv("HERMES_API_TIMEOUT", "2400")
+        HermesAgent(config=_config(), server_client=MagicMock(spec=ServerClient))
+        assert os.environ["HERMES_API_TIMEOUT"] == "2400"
+
     def test_construct(self) -> None:
         HermesAgent(config=_config(), server_client=MagicMock(spec=ServerClient))
 
@@ -363,7 +381,7 @@ class TestRolloutCorrelation:
 
 
 class TestMaxTokens:
-    def _agent_and_seen(self, monkeypatch, **config_kwargs) -> tuple[HermesAgent, dict]:
+    def _agent_and_seen(self, monkeypatch, *, retained_result=None, **config_kwargs) -> tuple[HermesAgent, dict]:
         import nemo_gym.base_responses_api_agent as base_agent
 
         monkeypatch.setattr(base_agent, "get_first_server_config_dict", lambda _gc, _name: {"host": "h", "port": 1})
@@ -382,10 +400,30 @@ class TestMaxTokens:
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
-                return {"messages": [{"role": "assistant", "content": "ok"}]}
+                return retained_result if retained_result is not None else {"messages": [{"role": "assistant", "content": "ok"}]}
 
         monkeypatch.setattr("run_agent.AIAgent", _StubAIAgent)
         return agent, seen
+
+    @pytest.mark.parametrize("context_stop", [True, False])
+    def test_retained_context_stop_is_typed_and_other_errors_stay_failed(self, monkeypatch, context_stop):
+        from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+
+        raw = json.loads((Path(__file__).parent / "fixtures/context-stop.json").read_text())
+        message = raw["error"]["message"] if context_stop else "API request failed"
+        agent, _ = self._agent_and_seen(monkeypatch, retained_result={
+            "error": message, "completed": False, "partial": True, "api_calls": int(raw["metadata"]["turns"]),
+            "messages": [{"role": "assistant", "content": "retained partial output"}],
+        })
+        response = asyncio.run(agent._create_response(NeMoGymResponseCreateParamsNonStreaming(input="continue")))
+        assert response.metadata["hermes_error"] == message
+        assert response.metadata["turns"] == raw["metadata"]["turns"]
+        if context_stop:
+            assert response.status == "incomplete" and response.error is None
+            assert response.metadata["stop_reason"] == "context_exhausted"
+        else:
+            assert response.status == "failed" and response.error.code == "server_error"
+            assert "stop_reason" not in response.metadata
 
     def test_max_tokens_passed_to_ai_agent(self, monkeypatch) -> None:
         from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
@@ -531,3 +569,24 @@ class TestObservability:
                     rollout_id="rid",
                 )
             )
+
+
+class TestEveryToolCallExecutes:
+    def test_hermes_guardrails_keep_duplicate_and_excess_delegate_calls(self) -> None:
+        from types import SimpleNamespace
+
+        from run_agent import AIAgent  # pyright: ignore[reportMissingImports]
+        from tools.delegate_tool import MAX_CONCURRENT_CHILDREN  # pyright: ignore[reportMissingImports]
+
+        def call(name: str, arguments: str) -> SimpleNamespace:
+            return SimpleNamespace(function=SimpleNamespace(name=name, arguments=arguments))
+
+        calls = [call("terminal", '{"command": "ls"}'), call("terminal", '{"command": "ls"}')] + [
+            call("delegate_task", json.dumps({"goal": str(index)})) for index in range(MAX_CONCURRENT_CHILDREN + 1)
+        ]
+        agent = object.__new__(AIAgent)
+        # Stock Hermes drops the duplicate and the delegate call past the cap.
+        assert len(agent._cap_delegate_task_calls(agent._deduplicate_tool_calls(calls))) == len(calls) - 2
+
+        _execute_every_tool_call(agent)
+        assert agent._cap_delegate_task_calls(agent._deduplicate_tool_calls(calls)) == calls

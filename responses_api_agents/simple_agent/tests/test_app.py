@@ -12,15 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, call
 
 import orjson
 import pytest
+import uvicorn
+from aiohttp import ClientSession, web
 from fastapi import Response
 from fastapi.testclient import TestClient
+from omegaconf import OmegaConf
 from pytest import MonkeyPatch
 
+from nemo_gym.config_types import BaseServerConfig
 from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
@@ -33,6 +38,7 @@ from nemo_gym.openai_utils import (
 from nemo_gym.rollout_collection import _attach_trajectory_record
 from nemo_gym.rollout_observability import TrajectoryRecord
 from nemo_gym.server_utils import ServerClient
+from nemo_gym import server_utils
 from responses_api_agents.simple_agent.app import (
     ModelServerRef,
     ResourcesServerRef,
@@ -974,3 +980,178 @@ class TestApp:
         assert post_call_kwargs[0]["server_name"] == "my resources server"
         assert post_call_kwargs[1]["server_name"] == "simple_agent"
         assert post_call_kwargs[1]["cookies"] == {"session": "seeded"}
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("successful_turns", "context_error", "expected_status"),
+    [(1, True, 200), (2, True, 200), (0, True, 400), (1, False, 400)],
+)
+async def test_run_context_exhaustion_uses_real_http_and_provider_state(
+    monkeypatch: MonkeyPatch,
+    successful_turns: int,
+    context_error: bool,
+    expected_status: int,
+) -> None:
+    """A later context 400 ends the real tool loop and reaches /verify once."""
+    state = {"world": 0, "active": False, "model_calls": 0, "verify_calls": 0, "last_error_body": None}
+    context_body = {
+        "error": {
+            "type": "invalid_request_error",
+            "message": (
+                "This model's maximum context length is 61440 tokens. "
+                "However, you requested 65536 tokens in the messages and completion."
+            ),
+        }
+    }
+    unrelated_body = {"error": {"type": "invalid_request_error", "message": "unknown model"}}
+
+    async def model(request: web.Request) -> web.Response:
+        state["model_calls"] += 1
+        if state["model_calls"] > successful_turns:
+            state["last_error_body"] = context_body if context_error else unrelated_body
+            return web.json_response(state["last_error_body"], status=400)
+        number = state["model_calls"]
+        return web.json_response(
+            {
+                "id": f"resp-tool-{number}",
+                "created_at": float(number),
+                "model": "policy",
+                "object": "response",
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+                "usage": {
+                    "input_tokens": number * 100,
+                    "output_tokens": number * 10,
+                    "total_tokens": number * 110,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                },
+                "output": [
+                    {
+                        "id": f"fc-{number}",
+                        "call_id": f"call-{number}",
+                        "name": "advance",
+                        "arguments": "{}",
+                        "type": "function_call",
+                        "status": "completed",
+                    }
+                ],
+            }
+        )
+
+    async def seed(request: web.Request) -> web.Response:
+        state["world"] = 0
+        state["active"] = True
+        response = web.json_response({})
+        response.set_cookie("provider_session", "active")
+        return response
+
+    async def advance(request: web.Request) -> web.Response:
+        assert state["active"]
+        state["world"] += 1
+        return web.json_response({"output": "advanced"})
+
+    async def verify(request: web.Request) -> web.Response:
+        assert state["active"]
+        state["verify_calls"] += 1
+        state["active"] = False
+        body = await request.json()
+        return web.json_response(body | {"reward": state["world"] / 2})
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", model)
+    upstream.router.add_post("/ng-rollout/{rollout_id}/v1/responses", model)
+    upstream.router.add_post("/seed_session", seed)
+    upstream.router.add_post("/advance", advance)
+    upstream.router.add_post("/verify", verify)
+    upstream_runner = web.AppRunner(upstream)
+    await upstream_runner.setup()
+    upstream_site = web.TCPSite(upstream_runner, "127.0.0.1", 0)
+    await upstream_site.start()
+    upstream_port = upstream_site._server.sockets[0].getsockname()[1]
+    upstream_url = f"http://127.0.0.1:{upstream_port}"
+
+    gym_session = ClientSession()
+    monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", gym_session)
+    client = ServerClient(
+        head_server_config=BaseServerConfig(host="127.0.0.1", port=1),
+        global_config_dict=OmegaConf.create({"observability_enabled": True}),
+    )
+    client._server_base_urls.update({"model": upstream_url, "resources": upstream_url})
+    agent = SimpleAgent(
+        config=SimpleAgentConfig(
+            host="127.0.0.1",
+            port=0,
+            entrypoint="",
+            name="simple",
+            model_server=ModelServerRef(type="responses_api_models", name="model"),
+            resources_server=ResourcesServerRef(type="resources_servers", name="resources"),
+        ),
+        server_client=client,
+    )
+    agent_app = agent.setup_webserver()
+    agent.setup_exception_middleware(agent_app)
+    server = uvicorn.Server(uvicorn.Config(agent_app, host="127.0.0.1", port=0, lifespan="off", log_level="error"))
+    server_task = asyncio.create_task(server.serve())
+    try:
+        for _ in range(500):
+            if server.started and server.servers:
+                break
+            if server_task.done():
+                await server_task
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("agent HTTP server did not start")
+        agent_port = server.servers[0].sockets[0].getsockname()[1]
+        agent_url = f"http://127.0.0.1:{agent_port}"
+        client._server_base_urls["simple"] = agent_url
+
+        async with ClientSession() as caller:
+            async with caller.post(
+                f"{agent_url}/run",
+                json={
+                    "responses_create_params": {"input": [{"role": "user", "content": "task"}]},
+                    TASK_INDEX_KEY_NAME: 4,
+                    ROLLOUT_INDEX_KEY_NAME: 1,
+                },
+            ) as response:
+                assert response.status == expected_status
+                result = await response.json()
+
+        assert state["model_calls"] == successful_turns + 1
+        assert state["world"] == successful_turns
+        if expected_status == 200:
+            assert state["verify_calls"] == 1
+            assert state["active"] is False
+            assert result["reward"] == successful_turns / 2
+            assert result["response"]["status"] == "incomplete"
+            assert result["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+            assert [item["type"] for item in result["response"]["output"]].count("function_call_output") == successful_turns
+            expected_units = sum(range(1, successful_turns + 1))
+            assert result["response"]["usage"]["input_tokens"] == 100 * expected_units
+            assert result["response"]["usage"]["output_tokens"] == 10 * expected_units
+            assert result["response"]["usage"]["total_tokens"] == 110 * expected_units
+            trajectory = result["ng_trajectory"]
+            assert len(trajectory["turns"]) == successful_turns
+            assert len(trajectory["tool_calls"]) == successful_turns
+            assert len(trajectory["invocations"][0]["model_calls"]) == successful_turns
+            assert trajectory["invocations"][0]["status"] == "incomplete"
+            assert [item["type"] for item in trajectory["invocations"][0]["conversation"]].count(
+                "function_call_output"
+            ) == successful_turns
+        else:
+            assert state["verify_calls"] == 0
+            assert ("maximum context length" if context_error else "unknown model") in result
+            assert state["last_error_body"] == (context_body if context_error else unrelated_body)
+    finally:
+        server.should_exit = True
+        await asyncio.wait_for(server_task, timeout=5)
+        await gym_session.close()
+        await upstream_runner.cleanup()

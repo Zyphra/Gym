@@ -26,7 +26,7 @@ import shutil
 import signal
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ from nemo_gym.sandbox.providers.base import (
     SandboxSpec,
     SandboxStatus,
 )
+from nemo_gym.setup_timeout import setup_timeout_seconds
 
 
 LOGGER = logging.getLogger(__name__)
@@ -265,6 +266,15 @@ class DockerProvider:
         self._exec_config = _coerce_config(exec, DockerExecConfig)
         self._create_config = _coerce_config(create, DockerCreateConfig)
         self._probe = _coerce_config(probe, DockerProbeConfig)
+        self._create_config = replace(
+            self._create_config,
+            start_timeout_s=setup_timeout_seconds(self._create_config.start_timeout_s),
+        )
+        self._probe = replace(
+            self._probe,
+            timeout_s=setup_timeout_seconds(self._probe.timeout_s),
+            deadline_s=setup_timeout_seconds(self._probe.deadline_s),
+        )
         self._binary = _require_docker()
         self._semaphore = asyncio.Semaphore(self._exec_config.concurrency)
 

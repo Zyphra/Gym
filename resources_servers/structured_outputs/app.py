@@ -15,6 +15,7 @@
 import csv
 import io
 import json
+import re
 import tomllib
 from collections import defaultdict
 from enum import StrEnum
@@ -36,6 +37,21 @@ from nemo_gym.base_resources_server import (
 
 class StructuredOutputsResourcesServerConfig(BaseResourcesServerConfig):
     xml_coerce_types: bool = True
+    # Opt-in. Grade every format by its own faithful representations of the schema: the schema's own required
+    # lists, whitespace strip, fences only where the row allows them, XML root unwrapping and union-type coercion,
+    # TOML nulls by omission, and schema-guided CSV decoding of nested objects. Off grades exactly as before.
+    faithful_format_grading: bool = False
+
+
+class _YamlStringDatesLoader(yaml.SafeLoader):
+    """SafeLoader that keeps YAML timestamps as the text the model wrote (JSON Schema has no date type)."""
+
+
+_YamlStringDatesLoader.yaml_implicit_resolvers = {
+    k: [(tag, regexp) for tag, regexp in v if tag != "tag:yaml.org,2002:timestamp"]
+    for k, v in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_FENCE = re.compile(r"```[A-Za-z0-9_+-]*[ \t]*\n(.*?)\n?```", re.S)
 
 
 class SchemaType(StrEnum):
@@ -70,6 +86,7 @@ class StructuredOutputsVerifyRequest(BaseVerifyRequest):
     tool_name_style: Optional[str] = None
     distractor_style: Optional[str] = None
     tool_union_mode: Optional[str] = None
+    fences_allowed: Optional[bool] = None
 
 
 class StructuredOutputsVerifyResponse(BaseVerifyResponse):
@@ -98,6 +115,7 @@ class StructuredOutputsVerifyResponse(BaseVerifyResponse):
     tool_name_style: Optional[str] = None
     distractor_style: Optional[str] = None
     tool_union_mode: Optional[str] = None
+    fences_allowed: Optional[bool] = None
 
 
 class StructuredOutputsResourcesServer(SimpleResourcesServer):
@@ -227,7 +245,7 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         response_text = "".join(assistant_responses)
 
         reward, error_type, error_message = self.evaluate_structured_output_response(
-            schema_type, schema_str, response_text
+            schema_type, schema_str, response_text, fences_allowed=body.fences_allowed
         )
         return StructuredOutputsVerifyResponse(
             **body.model_dump(), reward=reward, error_type=error_type, error_message=error_message
@@ -423,7 +441,7 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         except Exception as e:
             return 0.0, "schema_error", str(e)[:200]
 
-        self.strictify_schema(schema)
+        self.strict_schema(schema)
 
         try:
             validate_against_schema_openapi(response_obj, schema)
@@ -432,7 +450,11 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
             return 0.0, "validation_error", f"{type(e).__name__}: {str(e)[:200]}"
 
     def evaluate_structured_output_response(
-        self, schema_type: SchemaType, schema_str: str, response_text: str
+        self,
+        schema_type: SchemaType,
+        schema_str: str,
+        response_text: str,
+        fences_allowed: Optional[bool] = None,
     ) -> Tuple[float, Optional[str], Optional[str]]:
         """Returns (reward, error_type, error_message)."""
         if not response_text or not response_text.strip():
@@ -443,22 +465,296 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         except Exception as e:
             return 0.0, "schema_error", str(e)[:200]
 
-        self.strictify_schema(schema)
+        self.strict_schema(schema)
+        faithful = self.config.faithful_format_grading
+        if faithful:
+            response_text = self.faithful_text(response_text, fences_allowed)
 
         try:
-            response_obj = self.parse_content(schema_type, response_text)
+            if faithful:
+                response_obj = self.faithful_parse(schema_type, response_text, schema)
+            else:
+                response_obj = self.parse_content(schema_type, response_text)
         except Exception as e:
             return 0.0, "parse_error", f"{type(e).__name__}: {str(e)[:200]}"
 
         try:
-            if schema_type == SchemaType.XML and self.config.xml_coerce_types:
-                response_obj = self.coerce_xml_types(response_obj, schema)
-            if schema_type == SchemaType.CSV:
-                response_obj = self.coerce_csv_types(response_obj, schema)
+            if faithful:
+                response_obj = self.faithful_coerce(schema_type, response_obj, schema)
+            else:
+                if schema_type == SchemaType.XML and self.config.xml_coerce_types:
+                    response_obj = self.coerce_xml_types(response_obj, schema)
+                if schema_type == SchemaType.CSV:
+                    response_obj = self.coerce_csv_types(response_obj, schema)
             validate_against_schema_openapi(response_obj, schema)
             return 1.0, None, None
         except Exception as e:
             return 0.0, "validation_error", f"{type(e).__name__}: {str(e)[:200]}"
+
+    # ----- Faithful format grading (opt-in) ----- #
+    def strict_schema(self, schema: Dict[str, Any]) -> None:
+        # Faithful grading uses the supplied schema unchanged. Requiring optional
+        # properties, forbidding unspecified extras, or deleting required names
+        # would change the task. Source contradictions belong to source repair.
+        if not self.config.faithful_format_grading:
+            self.strictify_schema(schema)
+
+    @staticmethod
+    def schema_types(schema: Any) -> List[str]:
+        if not isinstance(schema, dict):
+            return []
+        t = schema.get("type")
+        if isinstance(t, list):
+            return [str(x) for x in t]
+        if t is None:
+            if "properties" in schema:
+                return ["object"]
+            if "items" in schema:
+                return ["array"]
+            return []
+        return [str(t)]
+
+    def faithful_text(self, text: str, fences_allowed: Optional[bool]) -> str:
+        """Strip surrounding whitespace; unwrap one whole-answer code fence only where the row allows fences."""
+        text = text.strip()
+        if fences_allowed:
+            m = _FENCE.fullmatch(text)
+            if m:
+                text = m.group(1).strip()
+        return text
+
+    def faithful_parse(self, schema_type: SchemaType, text: str, schema: Dict[str, Any]) -> Any:
+        match schema_type.lower():
+            case SchemaType.JSON:
+                return json.loads(text)
+            case SchemaType.YAML:
+                return yaml.load(text, Loader=_YamlStringDatesLoader)
+            case SchemaType.XML:
+                parsed = xmltodict.parse(text)
+                if isinstance(parsed, dict) and len(parsed) == 1:
+                    root, inner = next(iter(parsed.items()))
+                    types = self.schema_types(schema)
+                    # XML needs exactly one root element; unwrap it unless it is itself the schema's only property.
+                    # <p><p>...</p></p> for a schema whose property is p reads as wrapper plus property.
+                    nested_same = isinstance(inner, dict) and list(inner) == [root]
+                    if "array" in types or root not in (schema.get("properties") or {}) or nested_same:
+                        return {} if inner is None and "object" in types else inner
+                return parsed
+            case SchemaType.TOML:
+                parsed = tomllib.loads(text)
+                # A TOML document is a table; a top-level array can only be written under one key.
+                if "array" in self.schema_types(schema) and isinstance(parsed, dict) and len(parsed) == 1:
+                    only = next(iter(parsed.values()))
+                    if isinstance(only, list):
+                        return only
+                return parsed
+            case SchemaType.CSV:
+                return self.decode_csv(text, schema)
+            case _:
+                return None
+
+    def faithful_coerce(self, schema_type: SchemaType, data: Any, schema: Dict[str, Any]) -> Any:
+        if schema_type == SchemaType.XML:
+            if self.config.xml_coerce_types:
+                data = self.coerce_text_values(data, schema, xml=True)
+            return self.fill_omitted_nulls(data, schema)  # XML has no standard null: an omitted element is null
+        if schema_type == SchemaType.TOML:
+            return self.fill_omitted_nulls(data, schema)
+        return data
+
+    def coerce_text_values(self, data: Any, schema: Any, xml: bool = False) -> Any:
+        """Schema-guided coercion of text leaves (XML, CSV), aware of union types such as ["integer", "null"]."""
+        types = self.schema_types(schema)
+        if not types:
+            return data
+        if "object" in types and isinstance(data, dict):
+            props = schema.get("properties", {}) or {}
+            out = {}
+            for key, value in data.items():
+                name = key
+                # XML element names cannot start with a digit; "_401k" is the usual spelling of "401k".
+                if xml and name not in props and name.startswith("_") and name[1:] in props and name[1:] not in data:
+                    name = name[1:]
+                out[name] = self.coerce_text_values(value, props[name], xml) if name in props else value
+            return out
+        if "array" in types:
+            items = schema.get("items", {})
+            if xml and isinstance(data, dict) and len(data) == 1:
+                data = next(iter(data.values()))
+            if isinstance(data, dict) and not xml and "object" in self.schema_types(items):
+                data = [data]
+            if data is None:
+                return None if "null" in types else []
+            if not isinstance(data, list):
+                if not xml:  # CSV: a list in a cell must be a JSON array; plain text stays text and fails
+                    return data
+                data = [data]  # XML: a single child element is a list of one
+            return [self.coerce_text_values(item, items, xml) for item in data]
+        if xml and data is None and "object" in types and "null" not in types:
+            return {}  # an empty element is an empty object
+        if data is None or (isinstance(data, str) and data.strip() == ""):
+            if "null" in types:
+                return None
+            if "string" in types:
+                return ""
+            return data
+        if isinstance(data, str):
+            value = data.strip()
+            if "string" in types:
+                return data
+            if "null" in types and value.lower() in ("null", "none"):
+                return None
+            for t in types:
+                try:
+                    if t == "integer" and re.fullmatch(r"[-+]?\d+", value):
+                        return int(value)
+                    if t == "number" and re.fullmatch(r"[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?", value):
+                        return float(value) if re.search(r"[.eE]", value) else int(value)
+                    if t == "boolean" and value.lower() in ("true", "false", "1", "0"):
+                        return value.lower() in ("true", "1")
+                except ValueError:
+                    continue
+        return data
+
+    def fill_omitted_nulls(self, data: Any, schema: Any) -> Any:
+        """TOML and XML have no null value: an omitted property reads as null wherever the schema allows null."""
+        types = self.schema_types(schema)
+        if "object" in types and isinstance(data, dict):
+            props = schema.get("properties", {}) or {}
+            out = {k: self.fill_omitted_nulls(v, props.get(k, {})) for k, v in data.items()}
+            for k, sub in props.items():
+                if k not in out and "null" in self.schema_types(sub):
+                    out[k] = None
+            return out
+        if "array" in types and isinstance(data, list):
+            return [self.fill_omitted_nulls(v, schema.get("items", {})) for v in data]
+        return data
+
+    # CSV: one table per answer. Nested objects are written with path headers ("a.b", "a[0].b", "a.0.b", "a/b"),
+    # JSON values in cells, a long "path, ..., value" layout, or one row per item of an array of objects. Lists in a
+    # cell must be JSON arrays.
+    def decode_csv(self, text: str, schema: Dict[str, Any]) -> Any:
+        rows = [r for r in csv.reader(io.StringIO(text)) if len(r) > 1 or (r and r[0].strip())]  # skip blank lines
+        if not rows:
+            raise ValueError("empty CSV")
+        header = [h.strip() for h in rows[0]]
+        if len(set(header)) != len(header):
+            raise ValueError("duplicate CSV header")
+        body = rows[1:]
+        for r in body:
+            if len(r) != len(header):
+                raise ValueError(f"CSV row has {len(r)} cells, header has {len(header)}")
+        types = self.schema_types(schema)
+        if "array" in types:
+            items = schema.get("items", {})
+            return [self.csv_record(dict(zip(header, r)), items) for r in body]
+        if len(header) >= 2 and header[-1].lower() in ("value", "values") and len(body) >= 1 and not (
+            set(header) & set((schema.get("properties") or {}).keys())
+        ):
+            obj: Dict[str, Any] = {}
+            for r in body:
+                parts = [p for cell in r[:-1] for p in self.csv_path(cell.strip(), schema)]
+                if parts:
+                    self.set_path(obj, parts, r[-1])
+            return self.coerce_text_values(self.compact_lists(obj), schema)
+        if not body:
+            raise ValueError("CSV has a header but no data row")
+        record = self.csv_record(dict(zip(header, body[0])), schema)
+        for r in body[1:]:  # further rows add items to array fields
+            extra = self.csv_record(dict(zip(header, r)), schema)
+            for k, v in extra.items():
+                if isinstance(record.get(k), list) and isinstance(v, list):
+                    record[k].extend(v)
+                elif k not in record:
+                    record[k] = v
+                elif record[k] != v:
+                    raise ValueError(f"CSV rows disagree on non-list field {k!r}")
+        return record
+
+    def csv_record(self, flat: Dict[str, str], schema: Dict[str, Any]) -> Any:
+        obj: Dict[str, Any] = {}
+        for header, value in flat.items():
+            if value is None or value.strip() == "":
+                parts = self.csv_path(header, schema)
+                if parts and "null" in self.schema_types(self.schema_at(schema, parts)):
+                    self.set_path(obj, parts, None)
+                continue
+            parts = self.csv_path(header, schema)
+            if parts:
+                self.set_path(obj, parts, value)
+        obj = self.compact_lists(obj)
+        return self.coerce_csv_cells(obj, schema)
+
+    def coerce_csv_cells(self, data: Any, schema: Any) -> Any:
+        """Decode JSON cells where the schema expects an object or array, then coerce text leaves."""
+        types = self.schema_types(schema)
+        if isinstance(data, str) and ("object" in types or "array" in types) and data.strip()[:1] in "[{":
+            try:
+                data = json.loads(data)
+            except ValueError:
+                return data
+        if isinstance(data, dict) and "object" in types:
+            props = schema.get("properties", {}) or {}
+            data = {k: self.coerce_csv_cells(v, props[k]) if k in props else v for k, v in data.items()}
+        elif isinstance(data, list) and "array" in types:
+            data = [self.coerce_csv_cells(v, schema.get("items", {})) for v in data]
+        return self.coerce_text_values(data, schema)
+
+    def csv_path(self, header: str, schema: Dict[str, Any]) -> List[Any]:
+        if header in (schema.get("properties") or {}):
+            return [header]
+        parts: List[Any] = []
+        for token in re.split(r"\.|/|\[|\]", header):
+            if token == "":
+                continue
+            parts.append(int(token) if token.isdigit() else token)
+        return parts
+
+    def schema_at(self, schema: Any, parts: List[Any]) -> Any:
+        for p in parts:
+            if isinstance(p, int):
+                schema = schema.get("items", {}) if isinstance(schema, dict) else {}
+            else:
+                schema = ((schema.get("properties") or {}).get(p, {})) if isinstance(schema, dict) else {}
+        return schema
+
+    @staticmethod
+    def set_path(obj: Any, parts: List[Any], value: Any) -> None:
+        cur = obj
+        for i, p in enumerate(parts):
+            last = i == len(parts) - 1
+            nxt = None if last else parts[i + 1]
+            if isinstance(cur, list):
+                if not isinstance(p, int):
+                    raise ValueError(f"CSV path step {p!r} indexes a list")
+                while len(cur) <= p:
+                    cur.append(None)
+                if last:
+                    cur[p] = value
+                else:
+                    if cur[p] is None:
+                        cur[p] = [] if isinstance(nxt, int) else {}
+                    cur = cur[p]
+            else:
+                if isinstance(p, int):
+                    raise ValueError(f"CSV path index {p} on an object")
+                if last:
+                    if p in cur and cur[p] != value:
+                        raise ValueError(f"CSV path {p!r} written twice")
+                    cur[p] = value
+                else:
+                    if p not in cur or cur[p] is None:
+                        cur[p] = [] if isinstance(nxt, int) else {}
+                    cur = cur[p]
+
+    def compact_lists(self, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {k: self.compact_lists(v) for k, v in data.items()}
+        if isinstance(data, list):
+            if any(v is None for v in data):
+                raise ValueError("CSV list indices have gaps")
+            return [self.compact_lists(v) for v in data]
+        return data
 
 
 if __name__ == "__main__":

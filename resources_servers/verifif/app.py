@@ -32,7 +32,8 @@ from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
+from pydantic import ValidationError as PydanticValidationError
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -108,6 +109,9 @@ class AggregationMode(str, Enum):
 
 class TuringVIFResourcesServerConfig(BaseResourcesServerConfig):
     """Configuration for the VerifIF Resource Server."""
+
+    strict_judge_response: bool = False
+    """Keep invalid judge/validator outcomes out of semantic inversion and reward."""
 
     judge_server_name: Optional[str] = Field(
         default=None,
@@ -300,6 +304,26 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
     """
 
     config: TuringVIFResourcesServerConfig
+
+    def _invalid_judge(self, message: str) -> None:
+        if self.config.strict_judge_response:
+            errors = _JUDGE_ERRORS.get()
+            if errors is None:
+                raise JudgeError(message)
+            errors.append(message)
+
+    def _judge_chat_text(self, result: dict) -> str:
+        choices = result.get("choices") or []
+        if self.config.strict_judge_response and (
+            result.get("error") is not None
+            or len(choices) != 1
+            or choices[0].get("finish_reason") != "stop"
+            or not isinstance(choices[0].get("message", {}).get("content"), str)
+            or not choices[0]["message"]["content"].strip()
+        ):
+            raise JudgeError("VerifIF judge chat reply is incomplete, failed or empty")
+        return result["choices"][0]["message"]["content"]
+
     _judge_client: Optional[NeMoGymAsyncOpenAI] = None
     _definition_cache: Dict[Tuple[str, str], Tuple[str, bool]] = {}
 
@@ -376,12 +400,24 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
                 input=[{"role": "developer", "content": system_content}, {"role": "user", "content": user_content}],
                 max_output_tokens=max_tokens,
             )
+            if self.config.strict_judge_response and (
+                result.get("status") != "completed"
+                or result.get("error") is not None
+                or result.get("incomplete_details") is not None
+                or any(
+                    item.get("status") != "completed"
+                    for item in result.get("output", []) if item.get("type") == "message"
+                )
+            ):
+                raise JudgeError("VerifIF judge Responses reply is incomplete or failed")
             output_text = ""
             for output_item in result.get("output", []):
                 if output_item.get("type") == "message":
                     for content_item in output_item.get("content", []):
                         if content_item.get("type") == "output_text":
                             output_text += content_item.get("text", "")
+            if self.config.strict_judge_response and not output_text.strip():
+                raise JudgeError("VerifIF judge Responses reply has no visible text")
             return output_text
         else:
             result = await client.create_chat_completion(
@@ -391,7 +427,7 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
                 top_p=top_p,
                 max_tokens=max_tokens,
             )
-            return result["choices"][0]["message"]["content"]
+            return self._judge_chat_text(result)
 
     async def _judge_llm_api_async(
         self,
@@ -473,6 +509,13 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
 
             evaluation = _strip_thinking_traces(evaluation)
 
+            if self.config.strict_judge_response:
+                last_line = evaluation.strip().rsplit("\n", 1)[-1].strip()
+                if last_line not in ("[[YES]]", "[[NO]]"):
+                    self._invalid_judge("VerifIF judge reply has no terminal verdict marker")
+                    return False, "Invalid judge verdict"
+                return last_line == "[[YES]]", evaluation
+
             last_yes = evaluation.rfind("[[YES]]")
             last_no = evaluation.rfind("[[NO]]")
 
@@ -487,6 +530,7 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
             return False, f"No [[YES]]/[[NO]] marker found in judge response: {evaluation[:500]}"
 
         except Exception as e:
+            self._invalid_judge(f"VerifIF custom judge validation failed: {type(e).__name__}")
             return False, f"Validation error: {str(e)}"
 
     async def _get_dynamic_definition_async(self, inst_type: str, term: str) -> Tuple[str, bool]:
@@ -527,6 +571,8 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
                 evaluation = json_match.group(1)
 
             json_data = json.loads(evaluation)
+            if self.config.strict_judge_response:
+                DefinitionResponse.model_validate(json_data)
             definition = json_data.get("definition", "definition not found")
             status = json_data.get("status", "FAIL")
 
@@ -539,8 +585,10 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
             return result
 
         except (json.JSONDecodeError, KeyError) as e:
+            self._invalid_judge("VerifIF definition reply is malformed")
             return (f"Error parsing definition response: {e}", False)
         except Exception as e:
+            self._invalid_judge(f"VerifIF definition validation failed: {type(e).__name__}")
             return (f"Error in definition generation: {e}", False)
 
     async def _validate_llm_instruction_async(
@@ -610,15 +658,18 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
             json_data = json.loads(evaluation)
 
             if "model_response" in json_data or "question" in json_data:
+                self._invalid_judge("VerifIF judge returned input instead of a verdict")
                 return (False, "Judge returned input format instead of output format.")
 
             judge_response = JudgeResponse(**json_data)
             flag = judge_response.verdict == "YES"
             return (flag, judge_response.reasoning)
 
-        except (json.JSONDecodeError, ValidationError) as e:
+        except (json.JSONDecodeError, PydanticValidationError) as e:
+            self._invalid_judge("VerifIF judge reply is malformed")
             return (False, f"Error parsing LLM Judge response: {e}")
         except Exception as e:
+            self._invalid_judge(f"VerifIF judge validation failed: {type(e).__name__}")
             return (False, f"Validation error: {str(e)}")
 
     # ========================================================================
@@ -842,6 +893,7 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
             try:
                 is_valid, message = validate_instruction(final_response_text, inst_id, kwargs, language=language)
             except Exception as e:
+                self._invalid_judge(f"VerifIF instruction validator failed: {type(e).__name__}")
                 is_valid, message = False, f"Validator error: {str(e)}"
 
             # Apply misalignment check if source="user" and is_misalignment_check=True

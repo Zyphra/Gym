@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import re
 from typing import Any, cast
 
 import httpx
@@ -32,6 +31,7 @@ from tenacity import (
 )
 
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from responses_api_agents.terminus_2_agent.context_budget import record_served_context
 
 
 _RoutedExperts = list[list[list[int]]] | str
@@ -47,7 +47,6 @@ _CONTEXT_LENGTH_ERROR_PHRASES = (
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
-_THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 
 class NemoGymLLM(BaseLLM):
@@ -68,6 +67,7 @@ class NemoGymLLM(BaseLLM):
         self._api_base = api_base.rstrip("/")
         self._collect_rollout_details = collect_rollout_details
         self._model_info = model_info or {}
+        self._served_context_tokens: dict[tuple[int, bytes], int] = {}
         self._timeout_sec = timeout_sec
 
         # Reuse the session cookie so every turn reaches the same vLLM engine and
@@ -83,6 +83,7 @@ class NemoGymLLM(BaseLLM):
         self._ambiguous_routed_expert_keys: set[_RolloutDetailsKey] = set()
 
         self.context_length_exceeded = False
+        self.model_transport_error: str | None = None
         self._extra_chat_params = self._build_extra_chat_params(responses_create_params or {})
 
     @retry(
@@ -143,25 +144,23 @@ class NemoGymLLM(BaseLLM):
             content = ""
         reasoning_content = message.get("reasoning_content") if isinstance(message, dict) else None
 
-        # Preserve server-supplied reasoning; otherwise parse complete tags or an
-        # unmatched close tag whose opener came from the generation prompt.
-        if reasoning_content is None and isinstance(content, str):
-            if _THINK_OPEN in content:
-                matches = _THINK_PATTERN.findall(content)
-                remaining = _THINK_PATTERN.sub("", content)
-                if matches:
-                    if remaining:
-                        reasoning_content = matches[0]
-                        content = remaining
-                    else:
-                        # Keep reasoning-only output actionable without inventing tokens.
-                        content = matches[0]
-                        reasoning_content = None
-            elif _THINK_CLOSE in content:
-                parts = content.split(_THINK_CLOSE, 1)
-                reasoning_content = parts[0]
-                content = parts[1] if len(parts) > 1 else ""
+        # Raw reasoning is never executable, including unclosed think blocks.
+        # The generation prompt may supply the opener, so honor a close alone.
+        if isinstance(content, str):
+            if _THINK_CLOSE in content:
+                tagged_reasoning, content = content.rsplit(_THINK_CLOSE, 1)
+                if _THINK_OPEN in content:
+                    tagged_reasoning += _THINK_CLOSE + content
+                    content = ""
+                if reasoning_content is None:
+                    reasoning_content = tagged_reasoning.replace(_THINK_OPEN, "").replace(_THINK_CLOSE, "")
+            elif _THINK_OPEN in content:
+                if reasoning_content is None:
+                    reasoning_content = content.split(_THINK_OPEN, 1)[1]
+                content = ""
 
+        usage = self._extract_usage_info(response_dict)
+        record_served_context(self, messages, content, usage)
         if isinstance(choice, dict) and choice.get("finish_reason") == "length":
             raise OutputLengthExceededError(
                 f"Model {self._model_name} hit max_tokens limit. "
@@ -169,7 +168,6 @@ class NemoGymLLM(BaseLLM):
                 truncated_response=content,
             )
 
-        usage = self._extract_usage_info(response_dict)
         prompt_token_ids = None
         completion_token_ids = None
         logprobs = None
@@ -206,6 +204,10 @@ class NemoGymLLM(BaseLLM):
                 max_input_tokens = self._model_info.get("max_tokens")
 
             if isinstance(max_input_tokens, int) and max_input_tokens > 0:
+                joint = self._model_info.get("max_context_tokens")
+                output = self.get_model_output_limit()
+                if isinstance(joint, int) and joint > 0 and output is not None:
+                    return min(max_input_tokens, max(0, joint - output))
                 return max_input_tokens
 
             self._logger.warning(
@@ -242,13 +244,20 @@ class NemoGymLLM(BaseLLM):
         timeout = timeout_sec if timeout_sec is not None else self._timeout_sec
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=timeout)
-        response = await self._http_client.post(endpoint, json=payload, timeout=timeout)
+        self.model_transport_error = None
+        try:
+            response = await self._http_client.post(endpoint, json=payload, timeout=timeout)
+        except httpx.RequestError as error:
+            self.model_transport_error = f"{type(error).__name__}: {error}"[:2000]
+            raise
 
         if response.status_code >= 400:
             error_text = response.text.lower()
             if any(phrase in error_text for phrase in _CONTEXT_LENGTH_ERROR_PHRASES):
                 self.context_length_exceeded = True
                 raise ContextLengthExceededError(f"Model {self._model_name} context length exceeded: {response.text}")
+            if response.status_code in {401, 403, 404, 408, 429} or 500 <= response.status_code < 600:
+                self.model_transport_error = f"Model endpoint HTTP {response.status_code}"
             response.raise_for_status()
 
         return response.json()

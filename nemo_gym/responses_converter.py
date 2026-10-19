@@ -93,6 +93,7 @@ class ResponsesConverterState(BaseModel):
     refusal_buffer: str = ""
     tool_calls_buffer: List[NeMoGymChatCompletionMessageToolCallParam] = Field(default_factory=list)
     assistant_item_buffered: bool = False
+    explicit_assistant_message_buffered: bool = False
 
     token_information: Optional[TokenIDLogProbMixin] = None
 
@@ -102,7 +103,7 @@ class ResponsesConverterState(BaseModel):
             return
 
         shared_params = dict(
-            content=self.content_buffer or None,
+            content=self.content_buffer if self.explicit_assistant_message_buffered else self.content_buffer or None,
             role="assistant",
         )
         # Omit rather than send `tool_calls: []` — OpenAI rejects empty arrays.
@@ -125,6 +126,7 @@ class ResponsesConverterState(BaseModel):
         self.refusal_buffer = ""
         self.tool_calls_buffer = []
         self.assistant_item_buffered = False
+        self.explicit_assistant_message_buffered = False
         self.token_information = None
 
 
@@ -141,6 +143,7 @@ class ResponsesConverter(BaseModel):
 
     return_token_id_information: bool
     uses_reasoning_parser: bool = True
+    preserve_explicit_assistant_boundaries: bool = False
 
     THINK_TAG_PATTERN: ClassVar = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
@@ -402,7 +405,12 @@ class ResponsesConverter(BaseModel):
 
         match m["role"]:
             case "assistant":
+                if self.preserve_explicit_assistant_boundaries and (
+                    state.explicit_assistant_message_buffered or state.tool_calls_buffer
+                ):
+                    state.flush_assistant()
                 state.assistant_item_buffered = True
+                state.explicit_assistant_message_buffered = self.preserve_explicit_assistant_boundaries
                 final_content = ""
                 if content is None:
                     # Tool-call only turns have "None" according to the official API spec.
@@ -494,6 +502,10 @@ class ResponsesConverter(BaseModel):
         See: https://docs.nvidia.com/nemo/gym/main/infrastructure/engineering-notes/responses-api-evolution
         for background on reasoning in the Responses API.
         """
+        if self.preserve_explicit_assistant_boundaries and (
+            state.explicit_assistant_message_buffered or state.tool_calls_buffer
+        ):
+            state.flush_assistant()
         state.assistant_item_buffered = True
         if "summary" in m and m["summary"]:
             texts = [s["text"] for s in m["summary"]]
@@ -504,6 +516,8 @@ class ResponsesConverter(BaseModel):
         m: dict,
         state: ResponsesConverterState,
     ) -> None:
+        if self.preserve_explicit_assistant_boundaries and state.explicit_assistant_message_buffered:
+            state.flush_assistant()
         state.assistant_item_buffered = True
         assert "call_id" in m
         if m.get("namespace") is not None:

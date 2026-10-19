@@ -168,9 +168,8 @@ async def test_real_http_preserves_direct_status_and_existing_relay_status(statu
         async with http_server(relay) as relay_url:
             with pytest.raises(ClientResponseError) as relayed:
                 await client.post(f"{relay_url}/fail")
-    # This public branch already flattens every relayed HTTP error to500. A
-    # consumer's separate4xx-preserving patch is deliberately not changed here.
-    assert relayed.value.status == 500
+    # Managed deterministic client errors keep their status across relays.
+    assert relayed.value.status == (status if 400 <= status < 500 else 500)
     assert (
         relayed.value.response_content
         == JSONResponse(
@@ -181,11 +180,12 @@ async def test_real_http_preserves_direct_status_and_existing_relay_status(statu
 
 
 @pytest.mark.asyncio
-async def test_real_native_request_keeps_existing_http_retry_count(monkeypatch):
+@pytest.mark.parametrize("method,expected_calls", [("POST", 1), ("GET", 3)])
+async def test_real_native_request_preserves_managed_http_retry_policy(monkeypatch, method, expected_calls):
     _, app = server_app("origin")
     calls = 0
 
-    @app.post("/fail")
+    @app.api_route("/fail", methods=["GET", "POST"])
     async def fail():
         nonlocal calls
         calls += 1
@@ -194,8 +194,8 @@ async def test_real_native_request_keeps_existing_http_retry_count(monkeypatch):
     async with ClientSession(raise_for_status=raise_for_status) as client, http_server(app) as url:
         monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", client)
         with pytest.raises(ClientResponseError) as caught:
-            await server_utils.request("POST", f"{url}/fail")
-    assert calls == 3
+            await server_utils.request(method, f"{url}/fail")
+    assert calls == expected_calls
     assert caught.value.nemo_gym_failure_provenance.exception_class == "VerificationFailure"
 
 

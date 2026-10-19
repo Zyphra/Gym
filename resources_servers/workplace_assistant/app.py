@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request
@@ -31,6 +32,8 @@ from resources_servers.workplace_assistant.utils import get_tools, is_correct
 
 class WorkbenchResourcesServerConfig(BaseResourcesServerConfig):
     pass
+    csv_seed_root: Path | None = None
+    reject_noop_reference: bool = False
 
 
 class WorkbenchRequest(BaseModel):
@@ -55,6 +58,12 @@ class WorkbenchVerifyResponse(BaseVerifyResponse):
 class WorkbenchResourcesServer(SimpleResourcesServer):
     config: WorkbenchResourcesServerConfig
     session_id_to_tool_env: Dict[str, Any] = Field(default_factory=dict)
+
+    def model_post_init(self, context) -> None:
+        super().model_post_init(context)
+        from resources_servers.workplace_assistant.workplace_assistant_tools._csv import configure_seed_root
+
+        configure_seed_root(self.config.csv_seed_root)
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
@@ -124,7 +133,15 @@ class WorkbenchResourcesServer(SimpleResourcesServer):
                 if message.type == "output_text":
                     predicted_chat_content.append(message.model_dump())
 
-            total_score += is_correct(predicted_function_calls, ground_truth, None) * 1.0
+            total_score += (
+                is_correct(
+                    predicted_function_calls,
+                    ground_truth,
+                    None,
+                    reject_noop_reference=self.config.reject_noop_reference,
+                )
+                * 1.0
+            )
             return WorkbenchVerifyResponse(**body.model_dump(), reward=total_score)
         finally:
             self.session_id_to_tool_env.pop(session_id, None)

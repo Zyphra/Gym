@@ -14,7 +14,9 @@
 # limitations under the License.
 import os
 
-import pandas as pd
+import pandas as pd  # noqa: F401  (tests replace pd.read_csv through this module)
+
+from resources_servers.workplace_assistant.workplace_assistant_tools._csv import read_csv
 
 
 class CompanyDirectoryTool:
@@ -24,7 +26,7 @@ class CompanyDirectoryTool:
     def reset_state(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         data_path = os.path.join(current_dir, "..", "csv_data", "raw", "email_addresses.csv")
-        self._emails = pd.read_csv(data_path, header=None, names=["email_address"])
+        self._emails = read_csv(data_path, no_header=True, names=["email_address"])
 
     def find_email_address(self, name=""):
         """

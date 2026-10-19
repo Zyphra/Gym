@@ -109,6 +109,16 @@ Settings for starting the instance (`apptainer instance start`).
 | `start_timeout_s` | `600` | Max seconds to wait for `instance start` (`None` = no timeout). |
 | `extra_start_args` | `[]` | Extra raw flags appended to `instance start`. |
 | `apply_resource_limits` | `true` | Add CPU/memory cgroup flags from `SandboxSpec.resources`. |
+| `disk_backed_overlay` | `false` | Create a private sparse writable overlay sized from `resources.disk_gib`, replacing `--writable-tmpfs`. Requires a positive integer disk budget. |
+| `staging_root` | system temporary directory | Absolute host directory for owned staging and overlay files; created if absent. Disk overlay mode requires an explicitly mounted local disk filesystem, such as ext4 or xfs. |
+
+Disk overlay mode keeps writable task files on disk rather than charging every
+write as unswappable tmpfs memory. Each instance owns a separate image outside
+its staging bind. The provider disables implicit host home/tmp mounts and
+rejects binds exposing the overlay storage root. Start failures and cancellation
+drain the instance before removing its backing; failed teardown retains the
+backing for repair. The fixed filesystem image bounds writable storage, with
+filesystem metadata included in the budget. CPU and RAM limits are unchanged.
 
 ### `exec` — `ApptainerExecConfig`
 
@@ -231,7 +241,8 @@ are unaffected.
 | `cpu` | `--cpus <n>` |
 | `memory_mib` | `--memory <n>m` |
 | `gpu` (truthy) | `--nv` (NVIDIA passthrough) |
-| `disk_gib`, `gpu_type` | No direct Apptainer flag — ignored. |
+| `disk_gib` | With `create.disk_backed_overlay=true`, private overlay size in GiB; otherwise ignored. |
+| `gpu_type` | No direct Apptainer flag — ignored. |
 
 
 ### Status mapping

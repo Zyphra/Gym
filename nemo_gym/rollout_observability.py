@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional
 
+from openai.types.responses.response_error import ResponseError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nemo_gym.config_types import ModelServerRef
@@ -240,6 +242,29 @@ class AgentObservationBundle(ObservationModel):
                 current = parent
             checked.update(chain)
         return self
+
+
+def harness_response_error(
+    response: NeMoGymResponse, observations: Optional[AgentObservationBundle] = None
+) -> Optional[ResponseError]:
+    """Separate endpoint/no-call failures from the harness's policy-stop labels."""
+    if response.error is not None and (response.metadata or {}).get("model_transport_error") == "true":
+        return response.error
+    if response.error is not None and re.match(
+        r"Error code: (?:401|403|404|408|429|5[0-9]{2})\b", response.error.message
+    ):
+        return response.error
+    if observations is None:
+        return None
+    invocations = [record for record in observations.records if isinstance(record, AgentInvocation)]
+    if (
+        response.usage is not None
+        and response.usage.total_tokens == 0
+        and any(record.parent_invocation_id is None and record.status == "failed" for record in invocations)
+        and not any(record.model_calls for record in invocations)
+    ):
+        return response.error or ResponseError(code="server_error", message="Harness failed without any recorded model call")
+    return None
 
 
 class TrajectoryRecord(ObservationModel):

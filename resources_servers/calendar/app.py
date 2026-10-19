@@ -16,7 +16,6 @@
 from typing import Any
 
 from fastapi import FastAPI
-from utils import grade_assistant_response
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -25,6 +24,7 @@ from nemo_gym.base_resources_server import (
     BaseVerifyResponse,
     SimpleResourcesServer,
 )
+from resources_servers.calendar.utils import extract_json_list, grade_assistant_response
 
 
 class CalendarRunRequest(BaseRunRequest):
@@ -36,7 +36,8 @@ class CalendarVerifyRequest(CalendarRunRequest, BaseVerifyRequest):
 
 
 class CalendarResourcesServerConfig(BaseResourcesServerConfig):
-    pass
+    # Opt-in: enforce the event-name field required by the calendar output contract.
+    require_event_names: bool = False
 
 
 class CalendarResourcesServer(SimpleResourcesServer):
@@ -67,6 +68,16 @@ class CalendarResourcesServer(SimpleResourcesServer):
         # return zero reward
         if not assistant_response:
             return BaseVerifyResponse(**body.model_dump(), reward=0)
+
+        if self.config.require_event_names:
+            calendar = extract_json_list(assistant_response)
+            if calendar is not None and any(
+                not isinstance(event, dict)
+                or not isinstance(event.get("event_name"), str)
+                or not event["event_name"].strip()
+                for event in calendar
+            ):
+                return BaseVerifyResponse(**body.model_dump(), reward=0)
 
         exp_cal_state = body.exp_cal_state
         try:

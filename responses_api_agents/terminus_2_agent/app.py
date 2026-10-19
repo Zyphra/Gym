@@ -16,8 +16,11 @@
 """Run Harbor's Terminus-2 loop as a NeMo Gym agent server."""
 
 import asyncio
+import errno
+import importlib.util
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -26,16 +29,18 @@ import sys
 import tempfile
 from asyncio import Semaphore
 from collections.abc import Mapping
+from contextlib import ExitStack
+from contextvars import ContextVar
 from pathlib import Path
 from time import time
 from typing import Any, Literal, Optional
 from uuid import uuid4
 
 from fastapi import Request
-from harbor.agents.terminus_2.terminus_2 import Terminus2
 from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
+from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -52,11 +57,18 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseUsage,
 )
 from nemo_gym.server_utils import get_response_json, raise_for_status
+from responses_api_agents.terminus_2_agent.context_budget import ServedContextTerminus2
 from responses_api_agents.terminus_2_agent.llm import NemoGymLLM
 from responses_api_agents.terminus_2_agent.output import trajectory_to_responses
 
 
 LOG = logging.getLogger(__name__)
+# Runs under the harness interpreter; see its docstring for the boundary it keeps.
+COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
+NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
+NATIVE_POLICY_BRIDGE = Path("/native_policy_bridge.py")
+NATIVE_CGROUP_ROOT = Path("/sys/fs/cgroup")
+TMUX_CONTROL_TIMEOUT_SECONDS = 5.0
 
 
 def _message_text(item: Any) -> str:
@@ -88,12 +100,86 @@ def _extract_instruction(body_input: Any) -> tuple[str, Optional[str]]:
     return "\n\n".join(f"{role.title()}: {text}" for role, text in messages), None
 
 
+def _require_directory(path: Path, message: str) -> None:
+    """Validate directories through the kernel, avoiding fakeroot stat metadata."""
+    try:
+        descriptor = os.open(
+            path, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+    except OSError as error:
+        if error.errno not in (errno.ENOENT, errno.ENOTDIR):
+            raise
+        raise FileNotFoundError(message) from error
+    os.close(descriptor)
+
+
+def _tmux_control_operation(command: str) -> str | None:
+    # Reject executable shell syntax before shlex removes quoting/escaping
+    # and treats unquoted newlines as whitespace. Quoted literals stay data.
+    quote = None
+    escaped = False
+    for character in command:
+        if escaped:
+            escaped = False
+        elif quote == "'":
+            if character == quote:
+                quote = None
+        elif character == "\\":
+            escaped = True
+        elif character in {"$", "`"}:
+            return None
+        elif character == quote:
+            quote = None
+        elif quote is None:
+            if character in {"'", '"'}:
+                quote = character
+            elif character in "\n;&|<>()#":
+                return None
+    try:
+        words = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return None
+    return words[1] if (len(words) >= 2 and words[0] == "tmux"
+                        and words[1] in {"capture-pane", "send-keys", "has-session", "list-panes"}) else None
+
+
 class LocalEnvironment:
     """Execute Harbor environment commands in one local workspace."""
 
-    def __init__(self, cwd: Path, command_timeout_sec: float) -> None:
+    def __init__(self, cwd: Path, command_timeout_sec: float,
+                 tmux_control_timeout_sec: float = TMUX_CONTROL_TIMEOUT_SECONDS) -> None:
         self.cwd = cwd.resolve()
         self.command_timeout_sec = command_timeout_sec
+        self.tmux_control_timeout_sec = tmux_control_timeout_sec
+        self._memory_budget_events = []
+        self._memory_control = None
+        if not math.isfinite(tmux_control_timeout_sec) or tmux_control_timeout_sec <= 0:
+            raise ValueError("tmux control timeout must be finite and positive")
+        # Standalone Gym has no native pressure controller. An admitted native
+        # policy binding requires its paired helper; missing/import errors
+        # still propagate rather than silently disabling native recovery.
+        if NATIVE_COMMAND_PROCESS.exists() or NATIVE_POLICY_BRIDGE.exists():
+            spec = importlib.util.spec_from_file_location("native_command_process", NATIVE_COMMAND_PROCESS)
+            if spec is None or spec.loader is None:
+                raise ValueError("tmux reclaim recovery requires the admitted native command helper")
+            helper = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(helper)
+            self._memory_control = helper.MemoryReclaimControl
+        # Apptainer instances can share /tmp. Unique session names do not
+        # isolate the tmux server: later sessions inherit its first namespace.
+        self._tmux_directory = tempfile.TemporaryDirectory(prefix="gym-tmux-")
+
+    async def close(self, *, terminate: bool = True) -> None:
+        if self._tmux_directory is None:
+            return
+        try:
+            # exec always selects this environment's private server, including
+            # when the caller itself is running inside another tmux session.
+            if terminate:
+                await self.exec("tmux kill-server", cwd="/", timeout_sec=10)
+        finally:
+            self._tmux_directory.cleanup()
+            self._tmux_directory = None
 
     async def exec(
         self,
@@ -101,50 +187,89 @@ class LocalEnvironment:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_sec: int | float | None = None,
+        _control_retry: bool = True,
     ) -> ExecResult:
+        if self._tmux_directory is None:
+            raise RuntimeError("Terminus-2 environment is closed")
+        original_command = command
+        control_op = _tmux_control_operation(command)
+        boundary = self._memory_control(NATIVE_CGROUP_ROOT) if control_op and self._memory_control else None
         run_cwd = Path(cwd).resolve() if cwd else self.cwd
-        if not run_cwd.is_dir():
-            raise FileNotFoundError(f"Terminus-2 working directory does not exist: {run_cwd}")
+        _require_directory(run_cwd, f"Terminus-2 working directory does not exist: {run_cwd}")
 
         process_env = os.environ.copy()
         if env:
             process_env.update({str(key): str(value) for key, value in env.items()})
+        process_env.pop("TMUX", None)
+        process_env.pop("TMUX_PANE", None)
+        process_env["TMUX_TMPDIR"] = self._tmux_directory.name
+        # A task image's login profile may replace PATH. Keep the admitted
+        # agent runtime (including tmux) visible after bash reads that profile.
+        command = f"export PATH={shlex.quote(process_env.get('PATH', ''))}; {command}"
 
-        proc = await asyncio.create_subprocess_exec(
-            "bash",
-            "-lc",
-            command,
-            cwd=str(run_cwd),
-            env=process_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        timeout = self.command_timeout_sec if timeout_sec is None else float(timeout_sec)
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.CancelledError:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await proc.communicate()
-            raise
-        except asyncio.TimeoutError:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = await proc.communicate()
-            message = stderr.decode(errors="replace")
-            message += f"\nCommand timed out after {timeout:g} seconds"
-            return ExecResult(stdout=stdout.decode(errors="replace"), stderr=message.strip(), return_code=124)
+        with ExitStack() as streams:
+            # tmux passes output descriptors to its server through SCM_RIGHTS.
+            # A stopped server can retain a pipe in that socket queue even after
+            # the timed-out client is killed. Files let control cleanup reap
+            # its client without waiting for the unresponsive server's EOF.
+            control_stdout = streams.enter_context(tempfile.TemporaryFile()) if control_op is not None else None
+            control_stderr = streams.enter_context(tempfile.TemporaryFile()) if control_op is not None else None
+            proc = await asyncio.create_subprocess_exec(
+                "bash",
+                "-lc",
+                command,
+                cwd=str(run_cwd),
+                env=process_env,
+                stdout=control_stdout if control_stdout is not None else asyncio.subprocess.PIPE,
+                stderr=control_stderr if control_stderr is not None else asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            async def communicate():
+                stdout, stderr = await proc.communicate()
+                if control_stdout is not None:
+                    control_stdout.seek(0)
+                    control_stderr.seek(0)
+                    return control_stdout.read(), control_stderr.read()
+                return stdout, stderr
 
-        return ExecResult(
-            stdout=stdout.decode(errors="replace"),
-            stderr=stderr.decode(errors="replace"),
-            return_code=int(proc.returncode or 0),
-        )
+            timeout = self.command_timeout_sec if timeout_sec is None else float(timeout_sec)
+            if control_op is not None:
+                timeout = min(timeout, self.tmux_control_timeout_sec)
+            try:
+                stdout, stderr = await asyncio.wait_for(communicate(), timeout=timeout)
+            except asyncio.CancelledError:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                await communicate()
+                raise
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = await communicate()
+                if boundary is not None and _control_retry:
+                    event = boundary.recover()
+                    if event is not None:
+                        self._memory_budget_events.append(event)
+                        LOG.warning("Terminus tool resource feedback: %s", json.dumps(event, sort_keys=True))
+                        return await self.exec(command=original_command, cwd=cwd, env=env,
+                                               timeout_sec=timeout_sec, _control_retry=False)
+                message = stderr.decode(errors="replace")
+                message += f"\nCommand timed out after {timeout:g} seconds"
+                return ExecResult(stdout=stdout.decode(errors="replace"), stderr=message.strip(), return_code=124)
+
+            text = stdout.decode(errors="replace")
+            if control_op == "capture-pane" and self._memory_budget_events:
+                text = "\n".join(json.dumps(event, sort_keys=True) for event in self._memory_budget_events) + "\n" + text
+                self._memory_budget_events.clear()
+            return ExecResult(
+                stdout=text,
+                stderr=stderr.decode(errors="replace"),
+                return_code=int(proc.returncode or 0),
+            )
 
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         source = Path(source_path).resolve()
@@ -157,13 +282,80 @@ class LocalEnvironment:
         await self.upload_file(source_path, str(target_path))
 
 
+SETUP_FAILED_TMUX_UNAVAILABLE = "setup_failed:tmux_unavailable"
+_SETUP_CAUSE_MAX_CHARS = 200
+_SETUP_ERRORS: ContextVar[Optional[list[str]]] = ContextVar("terminus_2_setup_errors", default=None)
+
+
+class _SetupErrorRecorder(logging.Handler):
+    """Keep the first ERROR line Harbor logs while this task's Terminus setup runs.
+
+    Harbor's tmux installer logs its failure and returns. The recorder keeps only
+    the first nonempty cause (its first line, bounded) in the running task's own
+    list, so concurrent setups never see each other's causes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.ERROR)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        errors = _SETUP_ERRORS.get()
+        if errors is None or errors:
+            return
+        try:
+            message = record.getMessage()
+        except Exception:
+            message = str(record.msg)
+        cause = next((line.strip() for line in message.splitlines() if line.strip()), "")
+        if cause:
+            errors.append(cause[:_SETUP_CAUSE_MAX_CHARS])
+
+
+logging.getLogger("harbor.utils.logger").addHandler(_SetupErrorRecorder())
+
+
+class TerminusSetupError(RuntimeError):
+    """Terminus-2 could not start its tmux session: an infrastructure setup failure."""
+
+    def __init__(self, label: str, first_cause: str, detail: str) -> None:
+        self.label, self.first_cause = label, first_cause
+        super().__init__(f"{label}: first cause: {first_cause}; {detail}")
+
+
 class LocalTmuxSession(TmuxSession):
     """Use Harbor's Linux launcher and a BSD-compatible macOS launcher."""
+
+    async def start(self) -> None:
+        await super().start()
+        # Linux script can return zero even when its child tmux failed. Prove
+        # the session exists before allowing model calls against an empty pane.
+        result = await self.environment.exec(
+            f"tmux display-message -p -t {shlex.quote(self._session_name)} '#{{socket_path}}'"
+        )
+        if result.return_code != 0 or not result.stdout.strip():
+            errors = _SETUP_ERRORS.get() or []
+            detail = (result.stderr.strip().splitlines() or [""])[0][:_SETUP_CAUSE_MAX_CHARS]
+            raise TerminusSetupError(
+                SETUP_FAILED_TMUX_UNAVAILABLE,
+                errors[0] if errors else detail,
+                f"Terminus-2 tmux session is unavailable: {detail}",
+            )
+        socket = Path(result.stdout.strip())
+        private_root = Path(self.environment._tmux_directory.name)
+        if not socket.is_relative_to(private_root):
+            raise RuntimeError(f"Terminus-2 tmux socket is outside its private directory: {socket}")
+        self._logger.info("Terminus-2 tmux session=%s socket=%s", self._session_name, socket)
 
     @property
     def _tmux_start_session(self) -> str:
         if sys.platform != "darwin":
-            return super()._tmux_start_session
+            # The tmux server, and every command the agent types into it, starts
+            # in its own PID namespace as the preferred OOM victim: the agent's
+            # kill commands and the task's memory use cannot end this harness.
+            return (
+                f"{shlex.quote(sys.executable)} -I {shlex.quote(str(COMMAND_NAMESPACE))} "
+                f"bash -c {shlex.quote(super()._tmux_start_session)}"
+            )
 
         session_name = shlex.quote(self._session_name)
         login_shell = shlex.quote("bash --login")
@@ -176,7 +368,7 @@ class LocalTmuxSession(TmuxSession):
         )
 
 
-class StandaloneTerminus2(Terminus2):
+class StandaloneTerminus2(ServedContextTerminus2):
     """Run Terminus-2 in a unique tmux session."""
 
     async def _handle_llm_interaction(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
@@ -195,19 +387,32 @@ class StandaloneTerminus2(Terminus2):
     async def run(self, instruction: str, environment: LocalEnvironment, context: AgentContext) -> None:
         """Keep completed turns when Terminus fails so Gym can score the partial trajectory."""
         self.context_length_exceeded = False
+        self.agent_error = None
+        self.model_transport_error = None
         try:
+            session = getattr(self, "_session", None)
+            if session is not None and not await session.is_session_alive():
+                # Harbor ends its loop at once on a dead session, with no model call
+                # and no error: name it as a setup failure with the setup's first cause.
+                self.agent_error = SETUP_FAILED_TMUX_UNAVAILABLE
+                causes = getattr(self, "_setup_errors", None) or ["tmux session is not alive after setup"]
+                self.logger.warning("Agent setup failed: %s: %s", self.agent_error, causes[0])
             await super().run(instruction, environment, context)
         except Exception as exc:
-            self.logger.info("Agent error: %s: %s. Returning completed turns.", type(exc).__name__, exc)
+            # The partial trajectory is still scored; name the cause so a model
+            # or transport failure is not indistinguishable from a policy miss.
+            self.agent_error = self.agent_error or type(exc).__name__
+            self.logger.warning("Agent error: %s: %s. Returning completed turns.", type(exc).__name__, exc)
         finally:
             self._attach_routed_experts_to_trajectory()
             llm = getattr(self, "_llm", None)
             if isinstance(llm, NemoGymLLM):
                 self.context_length_exceeded = llm.context_length_exceeded
+                self.model_transport_error = getattr(llm, "model_transport_error", None)
                 try:
                     await llm.aclose()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.logger.warning("Model client close failed: %s: %s", type(exc).__name__, exc)
 
     def _attach_routed_experts_to_trajectory(self) -> None:
         llm = getattr(self, "_llm", None)
@@ -234,6 +439,14 @@ class StandaloneTerminus2(Terminus2):
             self._dump_trajectory()
 
     async def setup(self, environment: LocalEnvironment) -> None:
+        self._setup_errors = []
+        token = _SETUP_ERRORS.set(self._setup_errors)
+        try:
+            await self._setup_session(environment)
+        finally:
+            _SETUP_ERRORS.reset(token)
+
+    async def _setup_session(self, environment: LocalEnvironment) -> None:
         self._consecutive_completion_claims = 0
         self._standalone_session_name = f"terminus-2-{uuid4().hex[:12]}"
         recording_path = self.logs_dir / "recording.cast" if self._record_terminal_session else None
@@ -248,16 +461,17 @@ class StandaloneTerminus2(Terminus2):
         )
         await self._session.start()
 
-    async def close(self, environment: LocalEnvironment) -> None:
-        if self._session is not None:
+    async def close(self, environment: LocalEnvironment, *, terminate: bool = True) -> None:
+        if self._session is not None and terminate:
             try:
                 await self._session.stop()
             except Exception as exc:
                 self.logger.warning("Could not stop Terminus-2 recording cleanly: %s", exc)
         session_name = getattr(self, "_standalone_session_name", None)
-        if session_name:
+        if session_name and terminate:
             await environment.exec(
                 f"tmux kill-session -t {shlex.quote(session_name)}",
+                cwd="/",
                 timeout_sec=30,
             )
 
@@ -290,6 +504,7 @@ class Terminus2AgentConfig(BaseResponsesAPIAgentConfig):
     tmux_pane_height: int = 40
     store_all_messages: bool = False
     record_terminal_session: bool = False
+    teardown_tmux: bool = True
     interleaved_thinking: bool = False
     model_timeout_sec: float = 2400
     command_timeout_sec: float = 1800
@@ -308,6 +523,8 @@ class Terminus2AgentVerifyResponse(BaseVerifyResponse):
     finished_naturally: bool = False
     agent_timeout_error: int = 0
     context_length_exceeded_error: int = 0
+    agent_failed: bool = False
+    agent_error: Optional[str] = None
 
 
 class Terminus2Agent(SimpleResponsesAPIAgent):
@@ -381,20 +598,19 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
         body: NeMoGymResponseCreateParamsNonStreaming,
         instruction: str,
         api_base: str,
-    ) -> tuple[dict[str, Any], AgentContext, dict[str, bool], bool, bool]:
+    ) -> tuple[dict[str, Any], AgentContext, dict[str, Any], bool, bool]:
         logs_dir = self._logs_dir()
         temporary_workspace: Optional[Path] = None
         try:
             if self.config.workspace_root:
                 workspace = Path(self.config.workspace_root).expanduser().resolve()
-                if not workspace.is_dir():
-                    raise FileNotFoundError(f"Terminus-2 workspace does not exist: {workspace}")
+                _require_directory(workspace, f"Terminus-2 workspace does not exist: {workspace}")
             else:
                 workspace = temporary_workspace = Path(tempfile.mkdtemp(prefix="nemo-gym-terminus-2-workspace-"))
 
-            environment = LocalEnvironment(workspace, self.config.command_timeout_sec)
             context = AgentContext()
             agent = self._build_agent(body, logs_dir, api_base)
+            environment = LocalEnvironment(workspace, self.config.command_timeout_sec)
             timed_out = False
             try:
                 await agent.setup(environment)
@@ -404,11 +620,23 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                     timed_out = True
                     LOG.warning("Terminus-2 timed out after %gs", self.config.timeout)
             finally:
-                await agent.close(environment)
+                teardown_kwargs = {} if self.config.teardown_tmux else {"terminate": False}
+                try:
+                    await agent.close(environment, **teardown_kwargs)
+                except Exception as error:
+                    LOG.warning("Terminus-2 agent teardown failed (ignored): %s", error)
+                try:
+                    await environment.close(**teardown_kwargs)
+                except Exception as error:
+                    LOG.warning("Terminus-2 environment teardown failed (ignored): %s", error)
 
             trajectory_path = logs_dir / "trajectory.json"
             trajectory = json.loads(trajectory_path.read_text()) if trajectory_path.exists() else {"steps": []}
-            flags = {"context_length_exceeded": agent.context_length_exceeded}
+            flags = {
+                "context_length_exceeded": agent.context_length_exceeded,
+                "agent_error": getattr(agent, "agent_error", None),
+                "model_transport_error": getattr(agent, "model_transport_error", None),
+            }
             return trajectory, context, flags, timed_out, agent.finished_naturally
         finally:
             if not self.config.keep_logs:
@@ -474,7 +702,9 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             background=False,
             reasoning={"effort": None, "generate_summary": None, "summary": None},
             service_tier="default",
-            status="completed",
+            status="failed" if flags.get("model_transport_error") else "completed",
+            error=ResponseError(code="server_error", message=flags["model_transport_error"])
+            if flags.get("model_transport_error") else None,
             text={"format": {"type": "text"}, "verbosity": "medium"},
             top_logprobs=0,
             truncation="disabled",
@@ -494,7 +724,10 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                         "timed_out": timed_out,
                         "finished_naturally": finished_naturally,
                     }
-                )
+                ),
+                **({"model_transport_error": "true"} if flags.get("model_transport_error") else {}),
+                # Harness-neutral label a wrapping agent (anyterminal) carries.
+                **({"agent_error": flags["agent_error"]} if flags.get("agent_error") else {}),
             },
         )
 
@@ -550,6 +783,8 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 "finished_naturally": naturally and not timed_out,
                 "agent_timeout_error": int(timed_out),
                 "context_length_exceeded_error": int(flags.get("context_length_exceeded", False)),
+                "agent_failed": bool(flags.get("agent_error")),
+                "agent_error": flags.get("agent_error"),
             }
         )
 

@@ -17,8 +17,10 @@ from collections.abc import Mapping
 from time import perf_counter, time
 from typing import Any, List
 
+from aiohttp import ClientResponseError
 from fastapi import Request, Response
-from pydantic import ConfigDict, ValidationError
+from openai.types.responses.response import IncompleteDetails
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
@@ -42,6 +44,12 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputMessage,
     accumulate_response_usage,
 )
+from nemo_gym.rollout_correlation import (
+    FAILURE_ROLLOUT_HEADER,
+    FAILURE_TOOL_CALL_HEADER,
+    current_rollout_id,
+    failure_log_metadata,
+)
 from nemo_gym.rollout_observability import (
     AgentInvocation,
     ModelCallRef,
@@ -50,10 +58,31 @@ from nemo_gym.rollout_observability import (
     TrajectoryToolCall,
     TrajectoryTurn,
 )
-from nemo_gym.server_utils import get_response_json, raise_for_status
+from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypoint, raise_for_status
 
 
 _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
+
+
+def _is_policy_context_exhaustion(error: ClientResponseError) -> bool:
+    """Recognize the vLLM context rejection passed through Gym's model server."""
+    if error.status != 400:
+        return False
+    body = getattr(error, "response_content", None)
+    if not isinstance(body, bytes):
+        return False
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    detail = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(detail, dict) or detail.get("type") != "invalid_request_error":
+        return False
+    message = detail.get("message")
+    if not isinstance(message, str):
+        return False
+    message = message.lower()
+    return "maximum context length is " in message and "you requested " in message
 
 
 class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
@@ -61,6 +90,13 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     model_server: ModelServerRef
     max_steps: int = None
     presented_tools_only: bool = False
+    final_answer_after_max_steps: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def _check_finalization_limit(self):
+        if self.final_answer_after_max_steps and (self.max_steps is None or self.max_steps < 1):
+            raise ValueError("final_answer_after_max_steps requires a positive max_steps")
+        return self
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -77,6 +113,10 @@ class SimpleAgentVerifyResponse(BaseVerifyResponse):
 
 class _UnpresentedToolError(ValueError):
     """A model requested a function outside the episode tool schemas."""
+
+
+class _FinalAnswerToolError(ValueError):
+    """The optional final answer request cannot dispatch more tools."""
 
 
 class SimpleAgent(SimpleResponsesAPIAgent):
@@ -108,21 +148,38 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         step = 0
         invocation_status = "completed"
         model_server_cookies = None
+        last_successful_response: NeMoGymResponse | None = None
 
         while True:
             step += 1
             new_body = body.model_copy(update={"input": body.input + new_outputs})
+            final_answer_turn = bool(
+                self.config.final_answer_after_max_steps and step > self.config.max_steps
+            )
+            if final_answer_turn:
+                new_body.tools = []
+                new_body.tool_choice = "none"
             if collect_trajectory:
                 turn_timestamp = time()
 
-            model_response = await self.server_client.post(
-                server_name=self.config.model_server.name,
-                url_path=model_url_path,
-                json=new_body,
-                cookies=model_server_cookies,
-            )
-            # We raise for status here since we expect model calls to always work.
-            await raise_for_status(model_response)
+            try:
+                model_response = await self.server_client.post(
+                    server_name=self.config.model_server.name,
+                    url_path=model_url_path,
+                    json=new_body,
+                    cookies=model_server_cookies,
+                )
+                await raise_for_status(model_response)
+            except ClientResponseError as error:
+                if last_successful_response is None or not _is_policy_context_exhaustion(error):
+                    raise
+                # Preserve completed turns and let /run verify the actual
+                # resources-server state. No failed model turn is fabricated.
+                model_response = last_successful_response.model_copy(deep=True)
+                model_response.status = "incomplete"
+                model_response.incomplete_details = IncompleteDetails(reason="max_output_tokens")
+                invocation_status = "incomplete"
+                break
             model_response_json = await get_response_json(model_response)
             model_server_cookies = model_response.cookies
             try:
@@ -131,6 +188,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 raise RuntimeError(
                     f"Received an invalid response from model server: {json.dumps(model_response_json)}"
                 ) from e
+            last_successful_response = model_response
 
             output = model_response.output
             new_outputs.extend(output)
@@ -182,15 +240,17 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     started_at = time()
                     started_monotonic = perf_counter()
                 try:
+                    if final_answer_turn:
+                        raise _FinalAnswerToolError("Final answer required; no more tools may be called.")
                     if self.config.presented_tools_only and output_function_call.name not in presented_tools:
                         raise _UnpresentedToolError(
                             f"Tool {output_function_call.name!r} was not presented in this request."
                         )
                     parsed_arguments = json.loads(output_function_call.arguments)
-                except _UnpresentedToolError as e:
+                except (_UnpresentedToolError, _FinalAnswerToolError) as e:
                     tool_output = json.dumps({"error": str(e)})
                     if collect_trajectory:
-                        error_type = "unpresented_tool"
+                        error_type = "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
                         tool_status = "failed"
                 except (json.JSONDecodeError, TypeError) as e:
                     tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})
@@ -203,6 +263,10 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         server_name=self.config.resources_server.name,
                         url_path=f"/{output_function_call.name}",
                         json=parsed_arguments,
+                        headers={
+                            FAILURE_ROLLOUT_HEADER: failure_log_metadata(current_rollout_id() or (rollout_id if rollout_id != "unscoped" else None)),
+                            FAILURE_TOOL_CALL_HEADER: failure_log_metadata(output_function_call.call_id),
+                        },
                         cookies=resources_server_cookies,
                     )
                     tool_output = (await api_response.content.read()).decode()
@@ -241,6 +305,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
             # Check if max steps is not None and if we have exhausted it.
             if self.config.max_steps and step >= self.config.max_steps:
+                if self.config.final_answer_after_max_steps and step == self.config.max_steps:
+                    continue
                 invocation_status = "incomplete"
                 break
 
@@ -277,7 +343,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             body,
             model_url_path=self.url_path_for_request("/v1/responses", request),
             resources_server_cookies=request.cookies,
-            rollout_id=rollout_id or "unscoped",
+            rollout_id=rollout_id or request.headers.get(FAILURE_ROLLOUT_HEADER) or "unscoped",
             collect_trajectory=collect_trajectory,
         )
         # Propogate any extra cookies necessary for downstream verification
@@ -305,6 +371,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             server_name=self.config.name,
             url_path=self.url_path_for_run("/v1/responses", body),
             json=body.responses_create_params,
+            headers={FAILURE_ROLLOUT_HEADER: failure_log_metadata(body.capture_rollout_id)},
             cookies=cookies,
         )
         await raise_for_status(response)
@@ -382,3 +449,6 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
 if __name__ == "__main__":
     SimpleAgent.run_webserver()
+
+elif is_nemo_gym_fastapi_entrypoint(__file__):
+    app = SimpleAgent.run_webserver()

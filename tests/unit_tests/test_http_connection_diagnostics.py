@@ -29,7 +29,7 @@ from nemo_gym.server_utils import GlobalAIOHTTPAsyncClientConfig
 
 
 def build_connection_pool_connector(*, transport_debug=False, **kwargs):
-    connector = server_utils.DiagnosticTCPConnector if transport_debug else server_utils.TCPConnector
+    connector = server_utils.DiagnosticPollSafeTCPConnector if transport_debug else server_utils.PollSafeTCPConnector
     return connector(**kwargs)
 
 
@@ -62,7 +62,7 @@ async def raw_peer(handler):
 
 
 @asynccontextmanager
-async def http_server(app, *, debug=True, idle=30, protocol=HttpToolsProtocol):
+async def http_server(app, *, debug=True, idle=30, protocol=server_utils.HEAD_SERVER_HTTP_PROTOCOL):
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     sock.listen()
@@ -184,6 +184,7 @@ async def test_post_disconnect_is_one_attempt_and_keeps_existing_finality(monkey
             output = capsys.readouterr().out
             assert output.count("[request_retry") == 1
             assert '"final_attempt":true' in output
+            assert '"replay_allowed":false' in output
             assert '"operation":"enroll"' in output
         monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
 
@@ -254,7 +255,7 @@ async def test_concurrent_failures_and_cancellation_do_not_cross_contexts():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("debug", [False, True])
-@pytest.mark.parametrize("protocol", [HttpToolsProtocol, H11Protocol])
+@pytest.mark.parametrize("protocol", [server_utils.HEAD_SERVER_HTTP_PROTOCOL, H11Protocol])
 async def test_real_server_idle_close_is_labelled_close_not_failure(debug, protocol, capsys):
     app = FastAPI()
 
@@ -481,3 +482,36 @@ async def test_later_start_trace_failure_leaves_no_active_transport_context():
             assert _ACTIVE_TRACE.get() is None
             assert current_rollout_id() == "immutable-start-id"
         assert current_rollout_id() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("debug", [False, True])
+async def test_private_unknown_commit_post_is_not_replayed_with_default_budget(debug, monkeypatch, capsys):
+    committed = []
+
+    async def commit_then_drop(reader, writer):
+        committed.append(await reader.readuntil(b"\r\n\r\n"))
+        writer.transport.close()
+
+    monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
+    monkeypatch.setattr(server_utils, "_NUM_SERVER_DISCONNECTED_ERROR", 0)
+    client = server_utils.set_global_aiohttp_client(
+        GlobalAIOHTTPAsyncClientConfig(global_http_transport_diagnostics=debug)
+    )
+    try:
+        async with raw_peer(commit_then_drop) as url:
+            with rollout_context(EPISODE):
+                with pytest.raises(ServerDisconnectedError) as caught:
+                    await server_utils.request("POST", url + f"/policy/episodes/{EPISODE}")
+            assert len(committed) == 1
+            assert hasattr(caught.value, "_gym_transport_context") == debug
+            output = capsys.readouterr().out
+            assert output.count("[request_retry") == 1
+            assert '"replay_allowed":false' in output
+            assert '"final_attempt":true' in output
+            if debug:
+                assert caught.value._gym_transport_context["rollout_id"] == EPISODE
+                assert caught.value._gym_transport_context["connection"] == "new"
+    finally:
+        await client.close()
+        monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)

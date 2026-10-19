@@ -37,6 +37,7 @@ class MCQAResourcesServerConfig(BaseResourcesServerConfig):
             "lenient_boxed",
             "lenient_answer_colon",
             "lenient_answer_colon_md",
+            "ordered_regex",
         ]
     ] = None
 
@@ -282,19 +283,24 @@ def _normalize_extracted_answer(text: str) -> str:
 
 
 def _parse_answer_with_custom_regex(
-    text: str, regex_pattern: str, allowed_letters: set[str], options: Optional[list[dict[str, str]]]
+    text: str,
+    regex_pattern: str,
+    allowed_letters: set[str],
+    options: Optional[list[dict[str, str]]],
+    *,
+    flags: int = re.IGNORECASE,
 ) -> Optional[str]:
     """Parse answer using custom regex from template_metadata.
 
     Uses rightmost (last) match to handle reasoning before final answer.
-    Case-insensitive matching to handle capitalization variations.
+    Matching is case-insensitive by default. Callers may supply flags when the
+    patterns own case behavior.
 
     When using template_metadata with custom regex, we trust the regex pattern
     and allow extracted letters even if options metadata is incomplete.
     """
     try:
-        # Use IGNORECASE flag and findall to get all matches
-        matches = re.findall(regex_pattern, text, re.IGNORECASE)
+        matches = re.findall(regex_pattern, text, flags)
         if not matches:
             return None
 
@@ -330,13 +336,20 @@ def _parse_answer_with_custom_regex(
 
 
 def _parse_answer_with_custom_regexes(
-    text: str, regex_patterns: str | list[str], allowed_letters: set[str], options: Optional[list[dict[str, str]]]
+    text: str,
+    regex_patterns: str | list[str],
+    allowed_letters: set[str],
+    options: Optional[list[dict[str, str]]],
+    *,
+    flags: int = re.IGNORECASE,
 ) -> Optional[str]:
     if isinstance(regex_patterns, str):
-        return _parse_answer_with_custom_regex(text, regex_patterns, allowed_letters, options)
+        return _parse_answer_with_custom_regex(text, regex_patterns, allowed_letters, options, flags=flags)
 
     for regex_pattern in regex_patterns:
-        pred = _parse_answer_with_custom_regex(text, regex_pattern, allowed_letters, options)
+        pred = _parse_answer_with_custom_regex(
+            text, regex_pattern, allowed_letters, options, flags=flags
+        )
         if pred is not None:
             return pred
     return None
@@ -387,13 +400,20 @@ class MCQAResourcesServer(SimpleResourcesServer):
                 extracted_answer=None,
             )
 
-        # Check for template_metadata first (highest priority)
-        if body.template_metadata and "output_regex" in body.template_metadata:
+        if grading_mode == "ordered_regex" and re.fullmatch(r"[A-Za-z]", text):
+            pred = text.upper()
+        elif body.template_metadata and "output_regex" in body.template_metadata:
             regex_patterns = body.template_metadata["output_regex"]
-            pred = _parse_answer_with_custom_regexes(text, regex_patterns, allowed_letters, options)
+            pred = _parse_answer_with_custom_regexes(
+                text,
+                regex_patterns,
+                allowed_letters,
+                options,
+                flags=0 if grading_mode == "ordered_regex" else re.IGNORECASE,
+            )
 
         # Fallback to existing grading_mode logic if template_metadata didn't work
-        if pred is None:
+        if pred is None and grading_mode != "ordered_regex":
             if grading_mode == "strict_single_letter_boxed":
                 pred, _, _ = _parse_answer_letter_strict_boxed(text, allowed_letters)
             elif grading_mode == "lenient_boxed":

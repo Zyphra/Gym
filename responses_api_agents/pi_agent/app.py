@@ -24,10 +24,11 @@ from asyncio import Semaphore
 from collections.abc import Mapping
 from pathlib import Path
 from time import time
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 from uuid import uuid4
 
 from fastapi import Request
+from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -57,6 +58,7 @@ from nemo_gym.rollout_observability import (
     ModelCallRef,
     ObservationGap,
     ToolCallObservation,
+    harness_response_error,
 )
 from nemo_gym.server_utils import get_response_json, raise_for_status
 from responses_api_agents.pi_agent.setup_pi import ensure_pi
@@ -64,6 +66,15 @@ from responses_api_agents.pi_agent.setup_pi import ensure_pi
 
 LOG = logging.getLogger(__name__)
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
+
+
+class _PiRunResult(NamedTuple):
+    output: list[Any]
+    usage: dict[str, int]
+    model: str
+    events: list[tuple[float, dict[str, Any]]]
+    return_code: Optional[int] = 0
+    timed_out: bool = False
 
 
 def parse_pi_events(stdout: str | bytes) -> tuple[list[Any], dict[str, int]]:
@@ -177,6 +188,8 @@ def _build_pi_observations(
     conversation: list[Any],
     *,
     transcript_available: bool = True,
+    return_code: Optional[int] = None,
+    timed_out: bool = False,
 ) -> AgentObservationBundle:
     def gap(code: str, detail: Optional[str] = None) -> ObservationGap:
         return ObservationGap(code=code, invocation_id=invocation_id, detail=detail)
@@ -308,6 +321,11 @@ def _build_pi_observations(
             if outcome == "unknown":
                 gaps.append(gap("compaction_outcome_unavailable"))
             compaction_start = None
+    process_error = (
+        "process_timeout" if timed_out else (f"process_exit_{return_code}" if return_code not in (0, None) else None)
+    )
+    if process_error is not None:
+        invocation_status = "failed"
     if not model_calls or model_call_join_missing:
         gaps.append(gap("model_call_ownership_unavailable"))
     if invocation_status == "unknown":
@@ -366,6 +384,7 @@ def _build_pi_observations(
             AgentInvocation(
                 invocation_id=invocation_id,
                 status=invocation_status,
+                error_type=process_error,
                 model_calls=model_calls,
                 conversation=conversation,
             ),
@@ -408,6 +427,44 @@ def _extract_instruction(body_input) -> tuple[str, Optional[str]]:
     return user_message, system_message
 
 
+def build_pi_settings(
+    settings_config: dict[str, Any],
+    *,
+    timeout: int,
+    compaction_enabled: Optional[bool] = None,
+    episode_bound: bool = False,
+) -> dict[str, Any]:
+    """Render pi's ``settings.json`` for one run.
+
+    ``episode_bound`` marks a policy served by Gym, where the model endpoint holds one
+    append-only episode per rollout: every request must extend the context the endpoint
+    already served. Two of pi's defaults break that contract, so the episode-bound
+    defaults turn them off while leaving an explicit operator setting untouched.
+
+    * Client retries re-send a request the episode may already have served. The episode
+      has advanced by then, so the replay no longer appends and the endpoint rejects it.
+    * Context compaction replaces the conversation with a fresh summarization prompt,
+      which is a new conversation rather than a continuation of the current one.
+    """
+    config = copy.deepcopy(settings_config)
+    config.setdefault("httpIdleTimeoutMs", timeout * 1000)
+    if compaction_enabled is None and episode_bound:
+        compaction_enabled = False
+    if compaction_enabled is not None:
+        compaction = config.setdefault("compaction", {})
+        if isinstance(compaction, dict):
+            compaction.setdefault("enabled", compaction_enabled)
+    if episode_bound:
+        retry = config.setdefault("retry", {})
+        if isinstance(retry, dict):
+            retry.setdefault("enabled", False)
+            retry.setdefault("maxRetries", 0)
+            provider = retry.setdefault("provider", {})
+            if isinstance(provider, dict):
+                provider.setdefault("maxRetries", 0)
+    return config
+
+
 class PiAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: Optional[ModelServerRef] = None
@@ -416,11 +473,14 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     model: str = "nvinf/nvidia/qwen/qwen3-next-80b-a3b-instruct"
     env: dict[str, str] = Field(default_factory=dict)
     workspace_root: str = "outputs/pi_agent/workspaces"
+    working_directory: Optional[str] = None
     thinking: Optional[str] = None
     system_prompt: Optional[str] = None
     timeout: int = 900
     extra_args: list[str] = []
     models_config: dict[str, Any] = Field(default_factory=dict)
+    settings_config: dict[str, Any] = Field(default_factory=dict)
+    compaction_enabled: Optional[bool] = None
     context_window: int = 262144
     max_output_tokens: int = 131072
     pi_version: Optional[str] = None
@@ -499,6 +559,22 @@ class PiAgent(SimpleResponsesAPIAgent):
         }
         return config
 
+    def _build_settings_config(self) -> dict[str, Any]:
+        return build_pi_settings(
+            self.config.settings_config,
+            timeout=self.config.timeout,
+            compaction_enabled=self.config.compaction_enabled,
+            episode_bound=self.config.model_server is not None,
+        )
+
+    def _write_pi_config(self, home: Path, rollout_id: Optional[str] = None) -> None:
+        agent_dir = home / ".pi" / "agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        models_config = self._build_models_config(rollout_id)
+        if models_config:
+            (agent_dir / "models.json").write_text(json.dumps(models_config, indent=2))
+        (agent_dir / "settings.json").write_text(json.dumps(self._build_settings_config(), indent=2))
+
     async def _run_pi(
         self,
         instruction: str,
@@ -506,15 +582,12 @@ class PiAgent(SimpleResponsesAPIAgent):
         *,
         rollout_id: Optional[str] = None,
         collect_observations: bool = True,
-    ) -> tuple[list[Any], dict[str, int], str, list[tuple[float, dict[str, Any]]]]:
+    ) -> _PiRunResult:
         effective_model = self._effective_model()
         provider, _, model_id = effective_model.partition("/")
         work_dir = self._workspace_root()
         home = work_dir / ".pi-home"
-        (home / ".pi" / "agent").mkdir(parents=True, exist_ok=True)
-        models_config = self._build_models_config(rollout_id)
-        if models_config:
-            (home / ".pi" / "agent" / "models.json").write_text(json.dumps(models_config, indent=2))
+        self._write_pi_config(home, rollout_id)
         env = self._env(home)
 
         cmd = [*self.config.command_parts, "--print", "--mode", "json", "--no-session"]
@@ -532,7 +605,7 @@ class PiAgent(SimpleResponsesAPIAgent):
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                cwd=str(work_dir),
+                cwd=self.config.working_directory or str(work_dir),
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -551,22 +624,40 @@ class PiAgent(SimpleResponsesAPIAgent):
                 except asyncio.TimeoutError:
                     if proc.returncode is None:
                         proc.kill()
-                    (_, events), _, _ = await output_task
+                    (stdout, events), _, _ = await output_task
                     LOG.warning("pi timed out after %ds", self.config.timeout)
-                    return [], {"input_tokens": 0, "output_tokens": 0}, self.config.model, events
+                    output_items, usage = parse_pi_events(stdout)
+                    return _PiRunResult(
+                        output_items,
+                        usage,
+                        self.config.model,
+                        events,
+                        proc.returncode,
+                        True,
+                    )
             else:
+                output_task = asyncio.create_task(proc.communicate())
                 try:
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.config.timeout)
+                    stdout, stderr = await asyncio.wait_for(asyncio.shield(output_task), timeout=self.config.timeout)
                 except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.communicate()
+                    if proc.returncode is None:
+                        proc.kill()
+                    stdout, _ = await output_task
                     LOG.warning("pi timed out after %ds", self.config.timeout)
-                    return [], {"input_tokens": 0, "output_tokens": 0}, self.config.model, events
+                    output_items, usage = parse_pi_events(stdout)
+                    return _PiRunResult(
+                        output_items,
+                        usage,
+                        self.config.model,
+                        events,
+                        proc.returncode,
+                        True,
+                    )
 
             if proc.returncode not in (0, None):
                 LOG.warning("pi exited %d: %s", proc.returncode, stderr.decode(errors="replace")[:500])
             output_items, usage = parse_pi_events(stdout)
-            return output_items, usage, self.config.model, events
+            return _PiRunResult(output_items, usage, self.config.model, events, proc.returncode)
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -589,17 +680,23 @@ class PiAgent(SimpleResponsesAPIAgent):
         )
         conversation_input.append(NeMoGymEasyInputMessage(role="user", content=user_message))
 
-        output_items, usage, model_name, events = await self._run_pi(
+        result = await self._run_pi(
             user_message,
             system_prompt,
             rollout_id=rollout_id,
             collect_observations=collect_observations,
         )
+        output_items, usage, model_name, events = result.output, result.usage, result.model, result.events
+        process_error = (
+            "process_timeout"
+            if result.timed_out
+            else (f"process_exit_{result.return_code}" if result.return_code not in (0, None) else None)
+        )
         observed_output_items = list(output_items)
         if not observed_output_items and events:
             observed_output_items, _ = parse_pi_events("\n".join(json.dumps(event) for _, event in events))
 
-        if not any(
+        if process_error is None and not any(
             getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant"
             for item in output_items
         ):
@@ -623,6 +720,11 @@ class PiAgent(SimpleResponsesAPIAgent):
             model=model_name,
             object="response",
             output=output_items,
+            status="incomplete" if result.timed_out else ("failed" if process_error else None),
+            error=(ResponseError(code="server_error", message=f"Pi {process_error}") if process_error else None),
+            metadata=(
+                {"agent_error": process_error, "pi_return_code": str(result.return_code)} if process_error else None
+            ),
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
@@ -644,6 +746,8 @@ class PiAgent(SimpleResponsesAPIAgent):
                     self.config.model_server,
                     [*conversation_input, *observed_output_items],
                     transcript_available=bool(observed_output_items),
+                    return_code=result.return_code,
+                    timed_out=result.timed_out,
                 )
             except Exception:
                 LOG.exception("failed to build Pi observations")
@@ -651,6 +755,16 @@ class PiAgent(SimpleResponsesAPIAgent):
                     source="pi", gaps=[ObservationGap(code="observation_parse_failed")]
                 )
             observations.gaps.append(ObservationGap(code="no_sandbox_runtime"))
+        elif process_error and not observed_output_items and input_tokens + output_tokens == 0:
+            # Keep the existing no-call failure witness even without full observations.
+            observations.records.append(
+                AgentInvocation(
+                    invocation_id=rollout_id or response.id,
+                    status="failed",
+                    error_type=process_error,
+                    conversation=conversation_input,
+                )
+            )
         return AgentEpisode(response=response, observations=observations)
 
     async def responses(
@@ -665,7 +779,7 @@ class PiAgent(SimpleResponsesAPIAgent):
             rollout_id=rollout_id,
             collect_observations=isinstance(rollout_id, str),
         )
-        if not isinstance(rollout_id, str):
+        if not isinstance(rollout_id, str) and not episode.observations.records:
             return episode.response
         return episode.response.model_copy(
             update={_INTERNAL_OBSERVATIONS_KEY: episode.observations.model_dump(mode="json")}
@@ -684,7 +798,6 @@ class PiAgent(SimpleResponsesAPIAgent):
             await raise_for_status(seed_resp)
             cookies = seed_resp.cookies
 
-            rollout_id = self.rollout_id_from_run(body)
             agent_resp = await self.server_client.post(
                 server_name=self.config.name,
                 url_path=self.url_path_for_run("/v1/responses", body),
@@ -694,12 +807,14 @@ class PiAgent(SimpleResponsesAPIAgent):
             await raise_for_status(agent_resp)
             cookies = agent_resp.cookies
             agent_resp_json = await get_response_json(agent_resp)
-            raw_observations = (
-                agent_resp_json.pop(_INTERNAL_OBSERVATIONS_KEY, None) if rollout_id is not None else None
-            )
+            raw_observations = agent_resp_json.pop(_INTERNAL_OBSERVATIONS_KEY, None)
             observations = (
                 AgentObservationBundle.model_validate(raw_observations) if isinstance(raw_observations, dict) else None
             )
+            gym_resp = NeMoGymResponse.model_validate(agent_resp_json)
+            harness_error = harness_response_error(gym_resp, observations)
+            if harness_error is not None:
+                raise RuntimeError(harness_error.message)
 
             verify_resp = await self.server_client.post(
                 server_name=self.config.resources_server.name,
@@ -710,14 +825,17 @@ class PiAgent(SimpleResponsesAPIAgent):
             await raise_for_status(verify_resp)
             verify_json = await get_response_json(verify_resp)
 
-            gym_resp = NeMoGymResponse.model_validate(agent_resp_json)
             turns = sum(
                 1
                 for item in gym_resp.output
                 if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant"
             )
             last = gym_resp.output[-1] if gym_resp.output else None
-            naturally = getattr(last, "type", None) == "message" and getattr(last, "role", None) == "assistant"
+            naturally = (
+                gym_resp.status not in ("failed", "incomplete", "cancelled")
+                and getattr(last, "type", None) == "message"
+                and getattr(last, "role", None) == "assistant"
+            )
 
             return PiAgentVerifyResponse.model_validate(
                 verify_json

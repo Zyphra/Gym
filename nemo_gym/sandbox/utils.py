@@ -28,8 +28,8 @@ from pathlib import Path
 # also tames `make -j$(nproc)` builds; PYTHON_CPU_COUNT caps os/multiprocessing
 # .cpu_count() itself on Python 3.13+. MAKEFLAGS is deliberately absent:
 # injecting `-j` would flip plain `make` runs from serial to parallel, and
-# explicit `-j` flags override MAKEFLAGS anyway. Injection is intentionally
-# per-call-site (no sandbox-layer default); callers merge explicit env over it.
+# explicit `-j` flags override MAKEFLAGS anyway. SandboxSpec derives these
+# defaults from its CPU allotment; caller-declared environment takes precedence.
 CPU_CAP_ENV_VARS: tuple[str, ...] = (
     "OMP_NUM_THREADS",
     "OMP_THREAD_LIMIT",

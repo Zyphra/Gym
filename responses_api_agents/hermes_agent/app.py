@@ -167,6 +167,22 @@ def _split_input_to_user_and_history(input_items) -> tuple[str, list[dict], Opti
     return user_message, history, system_message
 
 
+def _execute_every_tool_call(agent: Any) -> None:
+    """Run every tool call the policy emits in a turn.
+
+    Hermes' post-call guardrails drop duplicate (name, arguments) pairs and
+    delegate_task calls past MAX_CONCURRENT_CHILDREN with only a log line; the
+    dropped calls get no tool result and leave the served turn. Every emitted
+    call executes instead, in Hermes' own sequential or parallel-safe order.
+    """
+    agent._deduplicate_tool_calls = _keep_tool_calls
+    agent._cap_delegate_task_calls = _keep_tool_calls
+
+
+def _keep_tool_calls(tool_calls: list) -> list:
+    return tool_calls
+
+
 class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
@@ -179,6 +195,7 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     temperature: float | None = None
     terminal_backend: str = "local"
     terminal_timeout: int = 180
+    api_timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     system_prompt: Optional[str] = None
     compression_enabled: bool = True
     compression_threshold: float = 0.85
@@ -271,6 +288,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
         # process-global, so multiple HermesAgent instances in one process share them
         os.environ["TERMINAL_ENV"] = self.config.terminal_backend
         os.environ["TERMINAL_TIMEOUT"] = str(self.config.terminal_timeout)
+        if self.config.api_timeout is not None:
+            os.environ["HERMES_API_TIMEOUT"] = str(self.config.api_timeout)
 
         # Build config.yaml with config parameters
         hermes_home = tempfile.mkdtemp(prefix="hermes_agent_")
@@ -330,6 +349,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             return kw
 
         agent._build_api_kwargs = _patched_build_api_kwargs
+        _execute_every_tool_call(agent)
         observer = None
         if observation_collector is not None:
             try:
@@ -432,7 +452,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
         was_interrupted = bool(result.get("interrupted")) or interrupted_by_dispatch
 
         harness_error = result.get("error")
-        agent_failed = bool(harness_error) or bool(result.get("failed"))
+        context_exhausted = isinstance(harness_error, str) and harness_error.startswith("Context length exceeded") and harness_error.endswith("Cannot compress further.")
+        agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not context_exhausted
         metadata: dict[str, str] = {
             "interrupted": "true" if was_interrupted else "false",
             # `failed` = the underlying run flagged an API/provider failure (bad response shape,
@@ -446,11 +467,13 @@ class HermesAgent(SimpleResponsesAPIAgent):
             metadata["turns"] = str(result["api_calls"])
         if harness_error:
             metadata["hermes_error"] = str(harness_error)[:2000]
+        if context_exhausted:
+            metadata["stop_reason"] = "context_exhausted"
 
         # Populate the structured error field too. `code` must be one of OpenAI's Literals, so we
         # use the generic "server_error"; the real text lives in `message`.
         response_error = None
-        if harness_error:
+        if harness_error and not context_exhausted:
             from openai.types.responses import ResponseError  # pyright: ignore[reportMissingImports]
 
             response_error = ResponseError(code="server_error", message=str(harness_error)[:2000])
@@ -461,7 +484,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             model=model_name,
             object="response",
             output=output_items,
-            status="failed" if agent_failed else ("completed" if agent_completed else "incomplete"),
+            status="incomplete" if context_exhausted else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
             error=response_error,
             metadata=metadata,
             tool_choice=body.tool_choice,

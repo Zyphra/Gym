@@ -23,6 +23,14 @@ apt-get install -y ./apptainer_1.4.2_amd64.deb
 apptainer --version
 ```
 
+Tasks can opt into private outbound networking through an artifact-admitted
+`task_network` metadata JSON descriptor with `tools_root`, `tools_sha256` and
+`mode: private`. The registered `apptainer_services` provider uses the original
+sandbox resource limits and the profile PID limit, with a separate network
+namespace per instance and host loopback disabled. Its immutable native tools
+manifest must match the admitted task artifact. The verifier inherits that same
+instance network; tasks without this descriptor keep their existing provider.
+
 ## Quickstart
 
 **1. Prepare the dataset** — downloads tasks via Harbor and writes the input JSONL:
@@ -107,6 +115,7 @@ either:
 | `tb_tasks_cache_dir` | `~/.cache/harbor/tasks` | Where Harbor stores downloaded task definitions |
 | `tb_sif_dir` | `null` | Pre-built SIF directory; `null` = pull docker:// at runtime |
 | `tb_agent_timeout` | `1800` | Seconds before the agent is killed |
+| `agent_timeout_is_failure` | `false` | Opt in to counting agent timeouts as unmasked reward-zero failures; independent infrastructure remains masked. |
 | `tb_eval_timeout` | `300` | Seconds for `test.sh` to complete |
 | `apptainer_memory_limit_mb` | `32768` | Per-container memory cap via `ulimit -v` |
 | `concurrency` | `256` | Max concurrent tasks dispatched to Ray |

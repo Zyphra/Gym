@@ -52,6 +52,9 @@ from nemo_gym.telemetry.span_groups import GymSpanGroup
 class BaseResponsesAPIAgentConfig(BaseRunServerInstanceConfig):
     skip_verification: bool = False
     skip_verification_reward: float = 0.0
+    # A sandbox relay already owns upstream rollout routing. Keep its explicit
+    # endpoint separate from the identity carried by the agent invocation.
+    sandbox_model_base_url: Optional[str] = None
     # Whether this agent's rollouts participate in training token capture.
     # Native agents already receive token ids inline and normally leave this disabled.
     # Opaque external harnesses enable it because their returned output has no token ids.
@@ -93,7 +96,12 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
             body = kwargs.get("body")
             if body is None:
                 body = next((arg for arg in args if isinstance(arg, BaseRunRequest)), None)
-            with rollout_context(self.rollout_id_from_run(body)):
+            from nemo_gym.sandbox.episode import sandbox_episode_control
+
+            with rollout_context(self.rollout_id_from_run(body)), sandbox_episode_control(
+                getattr(body, "episode_control", None), getattr(body, "capture_rollout_id", None),
+                getattr(body, "episode_excluded_node_ids", ()),
+            ):
                 return await run(*args, **kwargs)
 
         app.post("/run")(run_with_rollout_context)
@@ -179,6 +187,9 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
 
     def resolve_model_base_url(self, model_server_name: str, rollout_id: Optional[str] = None) -> str:
         """Resolve a model-server URL with an optional rollout prefix."""
+        if self.config.sandbox_model_base_url is not None:
+            base_url = self.config.sandbox_model_base_url.rstrip("/")
+            return base_url if base_url.endswith("/v1") else f"{base_url}/v1"
         server_config = get_first_server_config_dict(self.server_client.global_config_dict, model_server_name)
         base_url = self.server_client._build_server_base_url(server_config)
         return f"{apply_rollout_prefix(base_url, rollout_id, token_capture=self._token_id_capture_enabled())}/v1"

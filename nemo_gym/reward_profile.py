@@ -20,14 +20,18 @@ import statistics
 import warnings
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import orjson
-from pandas import DataFrame, Series, notna
-from pandas.core.groupby.generic import DataFrameGroupBy
 from pydantic import Field
-from scipy import stats
-from wandb import Histogram
+
+# pandas, scipy and wandb cost every importer of base_resources_server (each Gym
+# server and each placed episode worker) ~3 s of CPU and ~150 MB of RSS, and only
+# the aggregate-metrics paths below use them. Import them where they are used.
+if TYPE_CHECKING:
+    from pandas import DataFrame, Series
+    from pandas.core.groupby.generic import DataFrameGroupBy
+    from wandb import Histogram
 
 from nemo_gym.config_types import AggregateMetrics, BaseNeMoGymCLIConfig
 from nemo_gym.global_config import (
@@ -197,6 +201,8 @@ class RewardProfiler:
         return rollout_info
 
     def histogram(self, data: Series) -> Optional[Histogram]:
+        from wandb import Histogram
+
         # W&B doesn't accept empty histograms
         data = data.dropna()
         if data.empty:
@@ -205,6 +211,8 @@ class RewardProfiler:
         return Histogram(data)
 
     def describe_dataframe(self, df: DataFrame) -> DataFrame:
+        from pandas import DataFrame
+
         stat_index = [
             MEAN_STAT_NAME,
             MAX_STAT_NAME,
@@ -234,6 +242,8 @@ class RewardProfiler:
         return DataFrame(d, index=stat_index).stack(future_stack=True)
 
     def calculate_metrics_single_df(self, grouped_df: DataFrameGroupBy) -> List[Dict[str, Any]]:
+        from pandas import notna
+
         grouped_metrics_df: DataFrame = grouped_df.apply(self.describe_dataframe, include_groups=False)
         grouped_metrics_df.columns = grouped_metrics_df.columns.map("/".join)
         grouped_metrics_df: DataFrame = grouped_metrics_df.reset_index()
@@ -257,6 +267,8 @@ class RewardProfiler:
                 stacklevel=2,
             )
             return mean, mean
+        from scipy import stats
+
         ci_low, ci_high = stats.t.interval(confidence, df=n - 1, loc=mean, scale=sem)
         return float(ci_low), float(ci_high)
 
@@ -337,6 +349,8 @@ class RewardProfiler:
         """
         if not repeat_level_metrics:
             return []
+
+        from pandas import DataFrame
 
         df = DataFrame.from_records(repeat_level_metrics)
         df["agent_name"] = df[AGENT_REF_KEY_NAME].apply(lambda ref: ref["name"])
@@ -435,6 +449,8 @@ class RewardProfiler:
 
         if not filtered_results:
             return [], [], []
+
+        from pandas import DataFrame
 
         df = DataFrame.from_records(filtered_results)
 
@@ -856,6 +872,8 @@ def _stat(values: List[float], stat: str) -> float:
     if stat.startswith("p"):
         # Series.quantile() default (linear interpolation) matches numpy.percentile's default
         # and, unlike statistics.quantiles, handles a single-value series with no special-casing.
+        from pandas import Series
+
         return float(Series(values).quantile(int(stat[1:]) / 100))
     raise ValueError(f"Unknown stat {stat!r}")
 

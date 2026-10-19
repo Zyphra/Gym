@@ -16,6 +16,8 @@ import os
 
 import pandas as pd
 
+from resources_servers.workplace_assistant.workplace_assistant_tools._csv import read_csv
+
 
 METRICS = ["total_visits", "session_duration_seconds", "user_engaged"]
 METRIC_NAMES = ["total visits", "average session duration", "engaged users"]
@@ -31,7 +33,7 @@ class AnalyticsTool:
         """
         current_dir = os.path.dirname(os.path.abspath(__file__))
         data_path = os.path.join(current_dir, "..", "csv_data", "processed", "analytics_data.csv")
-        self._analytics_data = pd.read_csv(data_path, dtype=str)
+        self._analytics_data = read_csv(data_path, dtype=str)
         self._analytics_data["user_engaged"] = self._analytics_data["user_engaged"] == "True"  # Convert to boolean
         self._plots_data = pd.DataFrame(columns=["file_path"])
 
