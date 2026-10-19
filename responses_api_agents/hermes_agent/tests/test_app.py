@@ -590,3 +590,161 @@ class TestEveryToolCallExecutes:
 
         _execute_every_tool_call(agent)
         assert agent._cap_delegate_task_calls(agent._deduplicate_tool_calls(calls)) == calls
+
+
+class _ScriptedChatServer:
+    """OpenAI chat-completions endpoint that replays scripted assistant turns."""
+
+    def __init__(self, turns: list[dict]) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+
+        self.turns = list(turns)
+        self.requests: list[dict] = []
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args) -> None:
+                pass
+
+            def do_POST(self) -> None:
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                server.requests.append(body)
+                message = server.turns.pop(0) if server.turns else {"role": "assistant", "content": "unscripted"}
+                payload = json.dumps(
+                    {
+                        "id": f"chatcmpl-{len(server.requests)}",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": body.get("model", "model"),
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": message,
+                                "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/v1"
+        Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _tool_turn(*calls: tuple[str, dict]) -> dict:
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": f"call_{index}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+            for index, (name, args) in enumerate(calls)
+        ],
+    }
+
+
+class TestFinishTool:
+    """Real Hermes `AIAgent` loop against a scripted OpenAI-compatible endpoint."""
+
+    def _run(self, monkeypatch, tmp_path, turns: list[dict], **config_kwargs):
+        import nemo_gym.base_responses_api_agent as base_agent
+        from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+
+        server = _ScriptedChatServer(turns)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(base_agent, "get_first_server_config_dict", lambda _gc, _name: {})
+        server_client = MagicMock(spec=ServerClient)
+        server_client.global_config_dict = {}
+        server_client._build_server_base_url = lambda _cfg: server.url.removesuffix("/v1")
+        agent = HermesAgent(
+            config=_config(
+                model="model",
+                enabled_toolsets=["terminal", "file"],
+                disabled_toolsets=["code_execution"],
+                compression_enabled=False,
+                chat_template_kwargs_enabled=False,
+                **config_kwargs,
+            ),
+            server_client=server_client,
+        )
+        monkeypatch.setattr(agent, "_ensure_sigterm_handler", lambda: None)
+        try:
+            episode = asyncio.run(
+                agent._create_episode(body=NeMoGymResponseCreateParamsNonStreaming(input="fix it"), rollout_id="rid")
+            )
+        finally:
+            server.close()
+        return episode, server.requests
+
+    @staticmethod
+    def _offered(request: dict) -> set[str]:
+        return {tool["function"]["name"] for tool in request.get("tools") or []}
+
+    def test_unoffered_finish_is_rejected_and_the_run_continues(self, monkeypatch, tmp_path) -> None:
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [_tool_turn(("finish", {"message": "done"})), {"role": "assistant", "content": "done"}],
+        )
+        assert "finish" not in self._offered(requests[0])
+        assert len(requests) == 2
+        rejection = [item for item in episode.response.output if item.type == "function_call_output"]
+        assert rejection[0].output.startswith("Tool 'finish' does not exist.")
+        assert episode.response.status == "completed"
+
+    def test_finish_is_offered_and_ends_the_run_without_another_request(self, monkeypatch, tmp_path) -> None:
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [
+                _tool_turn(
+                    ("terminal", {"command": "echo checked > out.txt"}), ("finish", {"message": "Fix verified"})
+                ),
+                {"role": "assistant", "content": "unreachable"},
+            ],
+            finish_tool=True,
+        )
+        assert len(requests) == 1
+        finish = next(tool["function"] for tool in requests[0]["tools"] if tool["function"]["name"] == "finish")
+        assert finish["parameters"]["required"] == ["message"]
+        # Every call in the finishing turn still executes.
+        assert (tmp_path / "out.txt").read_text().strip() == "checked"
+        output = episode.response.output
+        assert [item.name for item in output if item.type == "function_call"] == ["terminal", "finish"]
+        assert output[-1].type == "function_call_output" and output[-1].output == "Fix verified"
+        assert episode.response.status == "completed"
+        assert episode.response.metadata["interrupted"] == "false"
+        root = next(
+            record for record in episode.observations.records if getattr(record, "invocation_id", None) == "root"
+        )
+        assert root.status == "completed"
+
+    def test_finish_on_the_last_turn_skips_the_iteration_limit_summary(self, monkeypatch, tmp_path) -> None:
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [_tool_turn(("finish", {"message": "done"})), {"role": "assistant", "content": "summary"}],
+            finish_tool=True,
+            max_turns=1,
+        )
+        assert len(requests) == 1
+        assert episode.response.status == "completed"
+
+    def test_runs_without_finish_keep_hermes_completion(self, monkeypatch, tmp_path) -> None:
+        episode, requests = self._run(
+            monkeypatch, tmp_path, [{"role": "assistant", "content": "all done"}], finish_tool=True
+        )
+        assert len(requests) == 1
+        assert "finish" in self._offered(requests[0])
+        assert episode.response.output[-1].content[0].text == "all done"
+        assert episode.response.status == "completed"
