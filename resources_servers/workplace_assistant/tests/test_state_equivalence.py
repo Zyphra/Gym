@@ -174,3 +174,57 @@ def test_existing_case_rules_and_error_rejection_are_preserved():
         )
     ]
     assert not is_correct(wrong, gold, None)
+
+
+def first_generated_email_id():
+    seed = execute_actions_and_reset_state([])["containers"]["email"]._emails
+    return str(int(seed["email_id"].max()) + 1)
+
+
+def send(body, recipient="amir.ali@atlas.com", subject="Weekly update"):
+    return action("email_send_email", recipient=recipient, subject=subject, body=body)
+
+
+def test_a_deleted_wrong_send_still_counts_as_sent():
+    gold = [send("Revenue is up 4%.")]
+    assert is_correct(gold, gold, None)
+    resent = [send("Revenue is up N%."), action("email_delete_email", email_id=first_generated_email_id()), gold[0]]
+    # The final mailbox matches the reference; the recipient still received the wrong email.
+    final_mailbox = execute_actions_and_reset_state(resent)["containers"]["email"]._emails
+    assert final_mailbox.equals(execute_actions_and_reset_state(gold)["containers"]["email"]._emails)
+    assert not is_correct(resent, gold, None)
+    assert not is_correct([gold[0], gold[0]], gold, None)
+    assert not is_correct(
+        [gold[0], gold[0], action("email_delete_email", email_id=first_generated_email_id())], gold, None
+    )
+
+
+def test_deleted_wrong_reply_and_forward_still_count_as_sent():
+    for gold, wrong in [
+        (
+            action("email_reply_email", email_id="00000031", body="Approved."),
+            action("email_reply_email", email_id="00000031", body="Approved N."),
+        ),
+        (
+            action("email_forward_email", email_id="00000031", recipient="amir.ali@atlas.com"),
+            action("email_forward_email", email_id="00000031", recipient="aisha.chen@atlas.com"),
+        ),
+    ]:
+        assert is_correct([gold], [gold], None)
+        retried = [wrong, action("email_delete_email", email_id=first_generated_email_id()), gold]
+        assert not is_correct(retried, [gold], None)
+
+
+def test_send_ledger_keeps_reference_behaviour_and_seeded_deletes():
+    # A reference that itself sends and deletes is matched by the same actions.
+    gold = [send("Draft"), action("email_delete_email", email_id=first_generated_email_id()), send("Final")]
+    assert is_correct(gold, gold, None)
+    assert not is_correct(gold[2:], gold, None)
+    # Deleting seeded mail sends nothing.
+    seeded_delete = [action("email_delete_email", email_id="00000031")]
+    assert is_correct(seeded_delete, seeded_delete, None)
+    assert execute_actions_and_reset_state(seeded_delete)["sent_emails"] == []
+    # No-op handling is unchanged.
+    assert is_correct([], [], None)
+    assert not is_correct([], [], None, reject_noop_reference=True)
+    assert not is_correct([send("x")], [], None)
