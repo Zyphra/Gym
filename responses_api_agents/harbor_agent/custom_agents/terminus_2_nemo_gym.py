@@ -16,16 +16,16 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from harbor.agents.terminus_2.terminus_2 import Terminus2
 from harbor.environments.base import BaseEnvironment
 from harbor.llms.base import BaseLLM
 from harbor.models.agent.context import AgentContext
 
 from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import NemoGymLLM
 from responses_api_agents.harbor_agent.custom_envs.singularity.singularity import MemoryLimitExceededError
+from responses_api_agents.terminus_2_agent.context_budget import ServedContextTerminus2
 
 
-class Terminus2NemoGym(Terminus2):
+class Terminus2NemoGym(ServedContextTerminus2):
     """Terminus2 variant that uses a NeMo Gym model server-compatible BaseLLM."""
 
     @staticmethod

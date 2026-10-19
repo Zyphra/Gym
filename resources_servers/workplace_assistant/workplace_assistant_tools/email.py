@@ -16,6 +16,8 @@ import os
 
 import pandas as pd
 
+from resources_servers.workplace_assistant.workplace_assistant_tools._csv import read_csv
+
 
 HARDCODED_CURRENT_TIME = pd.to_datetime("2023-11-30T23:59:00")
 
@@ -27,7 +29,7 @@ class EmailTool:
     def reset_state(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         data_path = os.path.join(current_dir, "..", "csv_data", "processed", "emails.csv")
-        self._emails = pd.read_csv(data_path, dtype=str)
+        self._emails = read_csv(data_path, dtype=str)
 
     def get_email_information_by_id(self, email_id=None, field=None):
         if not email_id:

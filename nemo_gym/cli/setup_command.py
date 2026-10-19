@@ -25,6 +25,8 @@ from omegaconf import DictConfig
 from nemo_gym import PARENT_DIR
 from nemo_gym.global_config import (
     HEAD_SERVER_DEPS_KEY_NAME,
+    NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
+    NEMO_GYM_CONFIG_FILE_ENV_VAR_NAME,
     NEMO_GYM_LOG_DIR_KEY_NAME,
     PIP_INSTALL_VERBOSE_KEY_NAME,
     PYTHON_VERSION_KEY_NAME,
@@ -188,12 +190,19 @@ def run_command(
     global_config_dict: DictConfig | None = None,
     stdout_target: IO[Any] | None = None,
     stderr_target: IO[Any] | None = None,
+    start_new_session: bool = False,
+    global_config_file: Path | None = None,
 ) -> Popen:
     if global_config_dict is None:
         global_config_dict = get_global_config_dict()
 
     work_dir = f"{working_dir_path.absolute()}"
     custom_env = environ.copy()
+    if global_config_file is not None:
+        # Clear legacy inline YAML before spawning bash: env entries share the
+        # same per-string exec limit as argv, even if the child would ignore it.
+        custom_env.pop(NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME, None)
+        custom_env[NEMO_GYM_CONFIG_FILE_ENV_VAR_NAME] = str(global_config_file)
     # The server dir on PYTHONPATH lets `import app` work. When a caller passes `project_root` (the
     # dir containing resources_servers/, responses_api_agents/, ...), it's added so generated
     # `resources_servers.<name>.app`-style imports resolve from outside a repo checkout — opt-in, so
@@ -224,4 +233,5 @@ def run_command(
         env=custom_env,
         stdout=redirect_stdout,
         stderr=redirect_stderr,
+        **({"start_new_session": True} if start_new_session else {}),
     )

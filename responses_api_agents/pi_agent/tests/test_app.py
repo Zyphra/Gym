@@ -38,6 +38,7 @@ from responses_api_agents.pi_agent.app import (
     ResourcesServerRef,
     _build_pi_observations,
     _extract_instruction,
+    _PiRunResult,
     _read_pi_stdout,
     parse_pi_events,
 )
@@ -191,6 +192,31 @@ class TestModelServer:
         agent = _make_agent(models_config=config)
         assert agent._effective_model() == agent.config.model
         assert agent._build_models_config() == config
+
+    def test_writes_settings_with_task_timeout_and_compaction(self, tmp_path) -> None:
+        agent = _make_agent(timeout=3600, compaction_enabled=False)
+
+        agent._write_pi_config(tmp_path)
+
+        settings = json.loads((tmp_path / ".pi" / "agent" / "settings.json").read_text())
+        assert settings == {"httpIdleTimeoutMs": 3_600_000, "compaction": {"enabled": False}}
+
+    def test_explicit_settings_take_precedence(self, tmp_path) -> None:
+        explicit = {
+            "httpIdleTimeoutMs": 123_000,
+            "compaction": {"enabled": True, "reserveTokens": 4096},
+            "transport": "sse",
+        }
+        agent = _make_agent(timeout=3600, compaction_enabled=False, settings_config=explicit)
+
+        agent._write_pi_config(tmp_path)
+
+        settings = json.loads((tmp_path / ".pi" / "agent" / "settings.json").read_text())
+        assert settings == explicit
+        assert agent.config.settings_config == explicit
+
+        disabled = _make_agent(compaction_enabled=True, settings_config={"compaction": None})
+        assert disabled._build_settings_config()["compaction"] is None
 
 
 class TestRolloutObservability:
@@ -404,7 +430,7 @@ class TestRolloutObservability:
             model_server=ModelServerRef(type="responses_api_models", name="policy"),
             system_prompt="configured system",
         )
-        agent._run_pi = AsyncMock(return_value=(items, usage, "model", [(1.0, event)]))
+        agent._run_pi = AsyncMock(return_value=_PiRunResult(items, usage, "model", [(1.0, event)]))
 
         episode = asyncio.run(
             agent._create_episode(
@@ -434,7 +460,7 @@ class TestRolloutObservability:
 
     def test_padding_is_not_reported_as_agent_evidence(self) -> None:
         agent = _make_agent()
-        agent._run_pi = AsyncMock(return_value=([], {"input_tokens": 0, "output_tokens": 0}, "model", []))
+        agent._run_pi = AsyncMock(return_value=_PiRunResult([], {"input_tokens": 0, "output_tokens": 0}, "model", []))
 
         episode = asyncio.run(agent._create_episode(NeMoGymResponseCreateParamsNonStreaming(input="solve")))
 
@@ -446,7 +472,9 @@ class TestRolloutObservability:
     def test_partial_events_survive_empty_scoring_output(self) -> None:
         event = {"type": "tool_execution_start", "toolCallId": "call-1", "toolName": "bash"}
         agent = _make_agent()
-        agent._run_pi = AsyncMock(return_value=([], {"input_tokens": 0, "output_tokens": 0}, "model", [(1.0, event)]))
+        agent._run_pi = AsyncMock(
+            return_value=_PiRunResult([], {"input_tokens": 0, "output_tokens": 0}, "model", [(1.0, event)])
+        )
 
         episode = asyncio.run(agent._create_episode(NeMoGymResponseCreateParamsNonStreaming(input="solve")))
 
@@ -457,7 +485,7 @@ class TestRolloutObservability:
     def test_run_uses_prefixed_response_boundary(self) -> None:
         agent = _make_agent()
         agent.server_client.global_config_dict = {"observability_enabled": True}
-        agent._run_pi = AsyncMock(return_value=([], {"input_tokens": 0, "output_tokens": 0}, "model", []))
+        agent._run_pi = AsyncMock(return_value=_PiRunResult([], {"input_tokens": 0, "output_tokens": 0}, "model", []))
 
         def response(payload):
             result = MagicMock(ok=True, cookies={})
@@ -493,7 +521,7 @@ class TestRolloutObservability:
         from fastapi.testclient import TestClient
 
         agent = _make_agent()
-        agent._run_pi = AsyncMock(return_value=([], {"input_tokens": 0, "output_tokens": 0}, "model", []))
+        agent._run_pi = AsyncMock(return_value=_PiRunResult([], {"input_tokens": 0, "output_tokens": 0}, "model", []))
 
         response = TestClient(agent.setup_webserver()).post(
             "/ng-rollout/1-2/v1/responses",

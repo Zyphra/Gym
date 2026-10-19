@@ -379,12 +379,17 @@ def test_rewrite_image_validation() -> None:
 
 
 def test_sandbox_resources_validation() -> None:
-    spec = SandboxSpec(resources={"cpu": "0.5", "memory_mib": "4096", "disk_gib": "8"}, ports=[8000, "9222"])
-    assert spec.resources == SandboxResources(cpu=0.5, memory_mib=4096, disk_gib=8)
+    spec = SandboxSpec(
+        resources={"cpu": "0.5", "memory_mib": "4096", "pids": "64", "disk_gib": "8"},
+        ports=[8000, "9222"],
+    )
+    assert spec.resources == SandboxResources(cpu=0.5, memory_mib=4096, pids=64, disk_gib=8)
     assert spec.ports == (8000, 9222)
 
     with pytest.raises(ValueError, match="Unknown sandbox resource keys"):
         SandboxSpec(resources={"memory": "4Gi"})
+    with pytest.raises(ValueError, match="pids must be > 0"):
+        SandboxSpec(resources={"pids": 0})
     with pytest.raises(ValueError, match="Duplicate sandbox TCP port"):
         SandboxSpec(ports=[8000, 8000])
     with pytest.raises(ValueError, match="between 1 and 65535"):

@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import pytest
 
+from nemo_gym.judge import JudgeError
 from resources_servers.inverse_if.app import (
     AggregationMode,
     InverseIFConfig,
@@ -67,6 +70,21 @@ class TestExtractVerdict:
         text = "Criterion not satisfied.\nFAIL"
         verdict, _ = _extract_verdict(text)
         assert verdict == "FAIL"
+
+    @pytest.mark.parametrize("text", ["PASS", "Uncertain; may PASS", '{"result":"UNKNOWN"} PASS'])
+    def test_strict_mode_does_not_promote_keywords(self, text):
+        with pytest.raises(JudgeError, match="structured PASS/FAIL"):
+            _extract_verdict(text, allow_keyword_fallback=False)
+
+    @pytest.mark.parametrize("explanation", [None, 1, []])
+    def test_strict_mode_classifies_invalid_explanation_type(self, explanation):
+        text = json.dumps({"result": "PASS", "explanation": explanation})
+        with pytest.raises(JudgeError, match="explanation must be a string"):
+            _extract_verdict(text, allow_keyword_fallback=False)
+
+    def test_strict_mode_accepts_native_output_prefix(self):
+        text = 'Output:\n```json\n{"result":"PASS","explanation":"Reported quotation."}\n```'
+        assert _extract_verdict(text, allow_keyword_fallback=False) == ("PASS", "Reported quotation.")
 
     def test_default_to_fail(self):
         """When nothing is extractable, default to FAIL."""
@@ -283,3 +301,84 @@ class TestAggregation:
         for mode in AggregationMode:
             config.aggregation_mode = mode
             assert server._aggregate_scores(evaluations) == 1.0, f"Failed for mode {mode}"
+
+
+class TestJudgePromptSelection:
+    """Task-level judge prompts are used unless use_default_judge_prompts is set."""
+
+    @staticmethod
+    def _server(use_default: bool):
+        from unittest.mock import MagicMock
+
+        from nemo_gym.config_types import ModelServerRef
+        from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+        from nemo_gym.server_utils import ServerClient
+        from resources_servers.inverse_if.app import InverseIFServer
+
+        config = InverseIFConfig(
+            host="",
+            port=0,
+            entrypoint="",
+            name="test",
+            judge_model_server=ModelServerRef(type="responses_api_models", name="test"),
+            judge_responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            default_judge_prompt_template="DEFAULT {criteria}",
+            default_judge_system_prompt="DEFAULT SYSTEM",
+            use_default_judge_prompts=use_default,
+        )
+        return InverseIFServer.model_construct(config=config, server_client=MagicMock(spec=ServerClient))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("use_default", "expected"),
+        [(False, ("TASK {criteria}", "TASK SYSTEM")), (True, ("DEFAULT {criteria}", "DEFAULT SYSTEM"))],
+    )
+    async def test_prompt_selection(self, use_default, expected):
+        from nemo_gym.openai_utils import NeMoGymResponse
+        from resources_servers.inverse_if.app import InverseIFVerifyRequest
+
+        server = self._server(use_default)
+        seen = []
+
+        async def evaluate(item, prompt, response, reference, template, system):
+            seen.append((template, system))
+            return RubricEvaluation(
+                criterion_id=item["id"],
+                criteria=item["criteria"],
+                judge_prompt="",
+                judge_response="",
+                verdict="PASS",
+                explanation="",
+                score=1.0,
+            )
+
+        object.__setattr__(server, "_evaluate_criterion", evaluate)
+        response = NeMoGymResponse(
+            id="r",
+            created_at=0.0,
+            model="m",
+            object="response",
+            parallel_tool_calls=False,
+            tool_choice="auto",
+            tools=[],
+            output=[
+                {
+                    "id": "msg",
+                    "role": "assistant",
+                    "status": "completed",
+                    "type": "message",
+                    "content": [{"annotations": [], "text": "answer", "type": "output_text"}],
+                }
+            ],
+        )
+        await server.verify(
+            InverseIFVerifyRequest(
+                responses_create_params={"input": []},
+                response=response,
+                prompt="question",
+                rubric=[{"id": "C1", "criteria": "one"}, {"id": "C2", "criteria": "two"}],
+                judge_prompt_template="TASK {criteria}",
+                judge_system_prompt="TASK SYSTEM",
+            )
+        )
+        assert seen == [expected, expected]

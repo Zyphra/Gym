@@ -23,6 +23,7 @@ liveness, ``#``-registry URIs, pinned ``ENROOT_*`` paths).
 """
 
 import asyncio
+from nemo_gym.sandbox.providers.base import notify_exec_timeout
 import contextlib
 import hashlib
 import logging
@@ -35,7 +36,7 @@ import stat
 import tempfile
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import IO, Any
 
@@ -50,6 +51,7 @@ from nemo_gym.sandbox.providers.base import (
 )
 from nemo_gym.sandbox.providers.utils import coerce_config as _coerce_config
 from nemo_gym.sandbox.providers.utils import path_under_mount as _path_under_mount
+from nemo_gym.setup_timeout import setup_timeout_seconds
 
 
 LOGGER = logging.getLogger(__name__)
@@ -185,10 +187,13 @@ class EnrootExecConfig:
     extra_exec_args: list[str] = field(default_factory=list)
     concurrency: int = 32
     exec_shell: str = "sh"
+    max_output_bytes: int = 1024 * 1024
 
     def __post_init__(self) -> None:
         if self.default_timeout_s is not None and self.default_timeout_s <= 0:
             raise ValueError("exec.default_timeout_s must be > 0")
+        if self.max_output_bytes < 1:
+            raise ValueError("exec.max_output_bytes must be positive")
         if self.concurrency < 1:
             raise ValueError("exec.concurrency must be >= 1")
 
@@ -304,6 +309,18 @@ class EnrootProvider:
         self._exec_config = _coerce_config(exec, EnrootExecConfig)
         self._create_config = _coerce_config(create, EnrootCreateConfig)
         self._probe = _coerce_config(probe, EnrootProbeConfig)
+        self._create_config = replace(
+            self._create_config,
+            **{
+                name: setup_timeout_seconds(getattr(self._create_config, name))
+                for name in ("import_timeout_s", "create_timeout_s", "start_timeout_s")
+            },
+        )
+        self._probe = replace(
+            self._probe,
+            timeout_s=setup_timeout_seconds(self._probe.timeout_s),
+            deadline_s=setup_timeout_seconds(self._probe.deadline_s),
+        )
         self._binary = _require_enroot()
         self._semaphore = asyncio.Semaphore(self._exec_config.concurrency)
 
@@ -338,6 +355,8 @@ class EnrootProvider:
         *,
         timeout_s: float | None,
         stdin: bytes | None = None,
+        capture_facts: dict[str, int | bool] | None = None,
+        environment: Mapping[str, str] | None = None,
     ) -> tuple[int, str, str]:
         """Run an enroot CLI command. Returns (return_code, stdout, stderr).
 
@@ -353,7 +372,7 @@ class EnrootProvider:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
-                env=self._enroot_env,
+                env={**self._enroot_env, **(environment or {})},
             )
             try:
                 stdout_b, stderr_b = await asyncio.wait_for(
@@ -361,6 +380,7 @@ class EnrootProvider:
                     timeout=timeout_s,
                 )
             except asyncio.TimeoutError as e:
+                notify_exec_timeout()
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                 with contextlib.suppress(Exception):
@@ -368,6 +388,12 @@ class EnrootProvider:
                 raise TimeoutError(f"enroot command timed out after {timeout_s:g}s: {argv}") from e
 
             return_code = proc.returncode if proc.returncode is not None else SANDBOX_RUNTIME_RETURN_CODE
+            if capture_facts is not None:
+                limit = self._exec_config.max_output_bytes
+                capture_facts.update(stdout_bytes=len(stdout_b), stderr_bytes=len(stderr_b),
+                                     stdout_truncated=len(stdout_b) > limit,
+                                     stderr_truncated=len(stderr_b) > limit, capture_complete=True)
+                stdout_b, stderr_b = stdout_b[:limit], stderr_b[:limit]
             return return_code, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
 
     async def _start_detached(self, argv: list[str]) -> tuple[Any, IO[bytes], IO[bytes]]:
@@ -486,8 +512,14 @@ class EnrootProvider:
         for mount in extra_mounts:
             argv += ["-m", mount]
         start_env = {**_resource_gpu_env(resources), **spec.env}
-        for key, value in start_env.items():
-            argv += ["-e", f"{key}={value}"]
+        self._enroot_env = {**self._enroot_env, **start_env}
+        # Enroot invokes sibling helper binaries after consuming its environment.
+        # Keep the selected CLI's helper directory reachable when a task supplies
+        # its own PATH; task paths retain precedence.
+        if "PATH" in start_env:
+            self._enroot_env["PATH"] = start_env["PATH"] + os.pathsep + str(Path(self._binary).parent)
+        for key in start_env:
+            argv += ["-e", key]
         # Clear the Docker ENTRYPOINT so images with a non-shell entrypoint
         # (e.g. ENTRYPOINT ["python"]) don't wrap the init and exit immediately.
         # Enroot bakes the ENTRYPOINT into /etc/rc inside the rootfs during
@@ -708,10 +740,12 @@ class EnrootProvider:
         merged_env = dict(getattr(instance, "env", {}))
         if env:
             merged_env.update(env)
+        if "PATH" in merged_env:
+            merged_env["PATH"] += os.pathsep + str(Path(self._binary).parent)
 
         flags: list[str] = []
-        for key, value in merged_env.items():
-            flags += ["-e", f"{key}={value}"]
+        for key in merged_env:
+            flags += ["-e", key]
         flags += list(self._exec_config.extra_exec_args)
 
         effective_command = command
@@ -732,8 +766,10 @@ class EnrootProvider:
         ]
         effective_timeout = timeout_s if timeout_s is not None else self._exec_config.default_timeout_s
 
+        capture_facts: dict[str, int | bool] = {}
         try:
-            code, out, err = await self._run(argv, timeout_s=effective_timeout, stdin=stdin)
+            code, out, err = await self._run(argv, timeout_s=effective_timeout, stdin=stdin,
+                                             capture_facts=capture_facts, environment=merged_env)
         except TimeoutError as e:
             return SandboxExecResult(
                 stdout=None,
@@ -749,7 +785,8 @@ class EnrootProvider:
                 return_code=SANDBOX_RUNTIME_RETURN_CODE,
                 error_type="sandbox",
             )
-        return SandboxExecResult(stdout=out, stderr=err, return_code=code, error_type=None)
+        return SandboxExecResult(stdout=out, stderr=err, return_code=code, error_type=None,
+                                 **capture_facts)
 
     async def upload_file(self, handle: SandboxHandle, source_path: Path, target_path: str) -> None:
         """Upload one host file into the sandbox.

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -91,6 +92,22 @@ class TestComponentSearchRoots:
         assert resolved.count(PARENT_DIR.resolve()) == 1  # not duplicated
         assert resolved[-2:] == [Path.cwd().resolve(), PARENT_DIR.resolve()]  # cwd then built-ins, always last
 
+    def test_another_gym_install_never_shadows_the_running_builtins(self, tmp_path: Path, monkeypatch) -> None:
+        # A sandbox runtime bundles an older Gym in site-packages while the host checkout is mounted: the
+        # running install root moves ahead of that copy, and cwd (the task workspace) stays last.
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        monkeypatch.delenv(NEMO_GYM_EXTRA_ROOTS_ENV_VAR_NAME, raising=False)
+        bundle = tmp_path / "site-packages"
+        (bundle / "nemo_gym").mkdir(parents=True)
+        (bundle / "nemo_gym" / "__init__.py").touch()
+        stdlib = tmp_path / "lib"
+
+        resolved = [r.resolve() for r in component_search_roots(sys_path=[stdlib, PARENT_DIR, bundle])]
+
+        assert resolved == [stdlib.resolve(), PARENT_DIR.resolve(), bundle.resolve(), Path.cwd().resolve()]
+
 
 class TestAugmentSysPath:
     def test_rebuilds_sys_path_from_component_search_roots(self, tmp_path: Path, monkeypatch) -> None:
@@ -125,6 +142,29 @@ class TestAugmentSysPath:
 
         # existing entries preserved, then cwd, then built-ins last.
         assert sys.path == first == ["/some/site-packages", cwd_on_path, str(PARENT_DIR)]
+
+    def test_mounted_checkout_agent_wins_over_a_bundled_gym(self, tmp_path: Path) -> None:
+        # The sandbox runner contract: the mounted checkout goes first, nemo_gym is imported (running this
+        # augmentation), then the agent package resolves. A runtime's bundled Gym must not win it.
+        bundle = tmp_path / "site-packages"
+        for package in ("nemo_gym", "responses_api_agents/terminus_2_agent"):
+            (bundle / package).mkdir(parents=True)
+            (bundle / package / "__init__.py").touch()
+        probe = (
+            f"import importlib.util, sys; sys.path.insert(0, {str(PARENT_DIR)!r}); import nemo_gym; "
+            "print(importlib.util.find_spec('responses_api_agents.terminus_2_agent').origin)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=tmp_path,
+            env={"PATH": os.environ["PATH"], "PYTHONPATH": str(bundle)},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == str(PARENT_DIR / "responses_api_agents" / "terminus_2_agent" / "__init__.py")
 
 
 class TestMergeByName:

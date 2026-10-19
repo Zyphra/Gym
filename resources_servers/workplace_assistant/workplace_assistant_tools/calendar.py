@@ -16,6 +16,8 @@ import os
 
 import pandas as pd
 
+from resources_servers.workplace_assistant.workplace_assistant_tools._csv import read_csv
+
 
 class CalendarTool:
     def __init__(self):
@@ -24,7 +26,7 @@ class CalendarTool:
     def reset_state(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         data_path = os.path.join(current_dir, "..", "csv_data", "processed", "calendar_events.csv")
-        self._calendar_events = pd.read_csv(data_path, dtype=str)
+        self._calendar_events = read_csv(data_path, dtype=str)
 
     def get_event_information_by_id(self, event_id=None, field=None):
         if not event_id:
@@ -228,7 +230,7 @@ schema_search_events = {
             },
             "time_min": {
                 "type": "string",
-                "description": "Lower bound (inclusive) for an event's end time to filter by. Format: YYYY-MM-DD HH:MM:SS",
+                "description": "Lower bound (inclusive) for an event's start time to filter by. Format: YYYY-MM-DD HH:MM:SS",
             },
             "time_max": {
                 "type": "string",

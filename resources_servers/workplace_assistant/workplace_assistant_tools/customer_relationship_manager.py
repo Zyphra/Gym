@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
 
 import pandas as pd
+
+from resources_servers.workplace_assistant.workplace_assistant_tools._csv import read_csv
 
 
 class CustomerRelationshipManagerTool:
@@ -30,7 +33,7 @@ class CustomerRelationshipManagerTool:
             "processed",
             "customer_relationship_manager_data.csv",
         )
-        self._crm_data = pd.read_csv(data_path, dtype=str)
+        self._crm_data = read_csv(data_path, dtype=str)
 
     def search_customers(
         self,
@@ -72,14 +75,22 @@ class CustomerRelationshipManagerTool:
             customers = customers[customers["status"].str.contains(status, case=False)]
         if assigned_to_email:
             customers = customers[customers["assigned_to_email"].str.contains(assigned_to_email, case=False)]
-        if last_contact_date_min:
-            customers = customers[customers["last_contact_date"] >= last_contact_date_min]
-        if last_contact_date_max:
-            customers = customers[customers["last_contact_date"] <= last_contact_date_max]
-        if follow_up_by_min:
-            customers = customers[customers["follow_up_by"] >= follow_up_by_min]
-        if follow_up_by_max:
-            customers = customers[customers["follow_up_by"] <= follow_up_by_max]
+        for column, minimum, maximum in (
+            ("last_contact_date", last_contact_date_min, last_contact_date_max),
+            ("follow_up_by", follow_up_by_min, follow_up_by_max),
+        ):
+            values = pd.to_datetime(customers[column], format="mixed", errors="coerce")
+            if minimum:
+                customers = customers[values >= pd.Timestamp(minimum)]
+                values = values.loc[customers.index]
+            if maximum:
+                bound = pd.Timestamp(maximum)
+                # A date-only inclusive upper bound covers the entire day;
+                # explicit timestamps retain their precise inclusive meaning.
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", maximum):
+                    customers = customers[values < bound + pd.Timedelta(days=1)]
+                else:
+                    customers = customers[values <= bound]
 
         # Convert to records for pagination
         customer_records = customers.to_dict(orient="records")

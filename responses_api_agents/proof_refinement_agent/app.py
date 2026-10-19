@@ -28,6 +28,7 @@ The agent controls the retry loop and turn counting.
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from fastapi import Request, Response
 from pydantic import ConfigDict
@@ -248,18 +249,14 @@ class ProofRefinementAgent(SimpleResponsesAPIAgent):
 
             LOG.info("Turn %d: Preparing correction turn with error feedback", turn_index)
 
-            # Create new input with the correction prompt (Nemotron single-turn style)
-            # Access Pydantic model attributes properly
-            params = body.responses_create_params
-            current_input = {
-                "input": [{"role": "user", "content": correction_prompt}],
-                "model": getattr(params, "model", None),
-            }
-            # Preserve any other params like temperature, max_tokens
-            for key in ["temperature", "max_tokens", "top_p"]:
-                value = getattr(params, key, None)
-                if value is not None:
-                    current_input[key] = value
+            # Replace context without losing settings or mutating the caller's request.
+            current_input = current_input.model_copy(deep=True)
+            current_input.input = [NeMoGymEasyInputMessage(role="user", content=correction_prompt)]
+            current_input.previous_response_id = None
+            current_input.conversation = None
+            if current_input.metadata and "traj_id" in current_input.metadata:
+                current_input.metadata["parent_traj_id"] = current_input.metadata["traj_id"]
+                current_input.metadata["traj_id"] = uuid4().hex
 
             turn_index += 1
 

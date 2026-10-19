@@ -518,6 +518,16 @@ class AsyncSandbox:
             raise TypeError(f"Sandbox provider endpoint() must return SandboxEndpoint, got {type(resolved).__name__}")
         return resolved
 
+    def memory_events(self) -> dict[str, int]:
+        """Take a live counter snapshot when this provider explicitly supports it."""
+        read = getattr(self._provider, "memory_events", None)
+        return {} if read is None or self._handle is None else read(self._handle)
+
+    def retained_memory_events(self) -> dict[str, int]:
+        """Memory events the provider kept for this sandbox at close; empty when it keeps none."""
+        read = getattr(self._provider, "retained_memory_events", None)
+        return {} if read is None or self._handle is None else read(self._handle)
+
     async def stop(self) -> None:
         if self._closed:
             return

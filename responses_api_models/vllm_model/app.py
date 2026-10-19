@@ -187,6 +187,10 @@ class VLLMModelConfig(BaseResponsesAPIModelConfig):
     # Response parsing remains controlled independently by
     # ``uses_reasoning_parser``.
     preserve_reasoning_in_assistant_content: bool = False
+    # Keep explicit assistant turns separate in the model's Chat history.
+    preserve_explicit_assistant_boundaries: bool = False
+    # Retain `strict` in function schemas for templates that render it.
+    preserve_function_tool_strict_for_template: bool = False
     replace_developer_role_with_system: bool = False
 
     # Whether or not the model can generate a reasoning output, and called again to produce additional reasoning output.
@@ -327,6 +331,7 @@ class VLLMModel(SimpleResponsesAPIModel):
         return VLLMConverter(
             return_token_id_information=self.config.return_token_id_information,
             uses_reasoning_parser=self.config.uses_reasoning_parser,
+            preserve_explicit_assistant_boundaries=self.config.preserve_explicit_assistant_boundaries,
         )
 
     def model_post_init(self, context):
@@ -428,7 +433,15 @@ class VLLMModel(SimpleResponsesAPIModel):
             return await self._responses_native(request, body)
 
         # Response Create Params -> Chat Completion Create Params
-        chat_completion_create_params = self._converter.responses_to_chat_completion_create_params(body)
+        converter = self._converter
+        boundary_mode = (body.metadata or {}).get("preserve_explicit_assistant_boundaries")
+        if boundary_mode is not None:
+            if boundary_mode not in {"true", "false"}:
+                raise ValueError("preserve_explicit_assistant_boundaries metadata must be true or false")
+            converter = converter.model_copy(update={
+                "preserve_explicit_assistant_boundaries": boundary_mode == "true",
+            })
+        chat_completion_create_params = converter.responses_to_chat_completion_create_params(body)
         body.model = self.config.model
 
         # Chat Completion Create Params -> Chat Completion
@@ -453,6 +466,8 @@ class VLLMModel(SimpleResponsesAPIModel):
         """
         if self.config.sampling_overrides:
             body_dict.update(self.config.sampling_overrides)
+        from nemo_gym.model_call_metadata import record_request_metadata
+        record_request_metadata(body_dict, resolved=True)
         return body_dict
 
     async def _responses_native(
@@ -472,8 +487,11 @@ class VLLMModel(SimpleResponsesAPIModel):
 
         body_dict = body.model_dump(exclude_unset=True)
         body_dict["model"] = self.config.model
-        if self.config.chat_template_kwargs:
-            body_dict["chat_template_kwargs"] = deepcopy(self.config.chat_template_kwargs)
+        chat_template_kwargs = deepcopy(self.config.chat_template_kwargs or {})
+        metadata = body_dict.get("metadata") or {}
+        chat_template_kwargs.update(json.loads(metadata.get("chat_template_kwargs") or "{}"))
+        if chat_template_kwargs:
+            body_dict["chat_template_kwargs"] = chat_template_kwargs
         if self.config.extra_body:
             body_dict = self.config.extra_body | body_dict
         self._apply_sampling_overrides(body_dict)
@@ -564,7 +582,8 @@ class VLLMModel(SimpleResponsesAPIModel):
             The (possibly mutated) ``body_dict`` that will be forwarded to
             ``client.create_chat_completion``.
         """
-        self._strip_hosted_only_tool_fields(body_dict)
+        if not self.config.preserve_function_tool_strict_for_template:
+            self._strip_hosted_only_tool_fields(body_dict)
 
         if self.config.replace_developer_role_with_system:
             for message_dict in body_dict["messages"]:
@@ -582,6 +601,8 @@ class VLLMModel(SimpleResponsesAPIModel):
         # Merge global config chat_template_kwargs with per-request overrides in metadata (e.g. per-sample reasoning on/off)
         metadata_chat_template_kwargs_str = metadata.get("chat_template_kwargs") or "{}"
         chat_template_kwargs.update(json.loads(metadata_chat_template_kwargs_str))
+
+        chat_template_kwargs.update(body_dict.get("chat_template_kwargs") or {})
 
         if chat_template_kwargs:
             body_dict["chat_template_kwargs"] = chat_template_kwargs
@@ -1500,10 +1521,8 @@ class VLLMModel(SimpleResponsesAPIModel):
         Assistant and tool messages, plus any tool definitions, are passed
         through to the template unchanged.
 
-        ``chat_template_kwargs`` is merged from two sources: the
-        server-level value from config, plus an optional per-request
-        override JSON-encoded under ``metadata.chat_template_kwargs``. The
-        per-request override wins on key conflicts.
+        ``chat_template_kwargs`` starts with config, then metadata overrides,
+        then explicit request options, which win on key conflicts.
         """
         messages = body_dict.get("messages") or []
         tools = body_dict.get("tools") or None
@@ -1517,6 +1536,7 @@ class VLLMModel(SimpleResponsesAPIModel):
         metadata = body_dict.get("metadata") or {}
         metadata_kwargs_str = metadata.get("chat_template_kwargs") or "{}"
         chat_template_kwargs.update(json.loads(metadata_kwargs_str))
+        chat_template_kwargs.update(body_dict.get("chat_template_kwargs") or {})
 
         return self._chat_template_tokenizer.apply_chat_template(
             messages,

@@ -13,9 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import contextlib
 import json
+import os
 import shlex
 import shutil
+import signal
+import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
@@ -48,9 +53,23 @@ class RunRecorder:
         self._responder = responder
 
     async def __call__(
-        self, argv: list[str], *, timeout_s: float | None, stdin: bytes | None = None, daemonize: bool = False
+        self,
+        argv: list[str],
+        *,
+        timeout_s: float | None,
+        stdin: bytes | None = None,
+        daemonize: bool = False,
+        cgroup: Any = None,
     ) -> tuple[int, str, str]:
-        self.calls.append({"argv": list(argv), "timeout_s": timeout_s, "stdin": stdin, "daemonize": daemonize})
+        self.calls.append(
+            {
+                "argv": list(argv),
+                "timeout_s": timeout_s,
+                "stdin": stdin,
+                "daemonize": daemonize,
+                "cgroup": cgroup,
+            }
+        )
         return self._responder(list(argv))
 
 
@@ -82,6 +101,7 @@ def _make_handle(
 @pytest.fixture
 def fake_binary(monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: FAKE_BINARY)
+    monkeypatch.delenv("NEMO_GYM_EPISODE_CGROUP_ROOT", raising=False)
     return FAKE_BINARY
 
 
@@ -113,12 +133,16 @@ def test_require_apptainer_uses_configured_binpath(monkeypatch: pytest.MonkeyPat
     assert apptainer_provider._require_apptainer(str(tmp_path)) == str(binary)
 
 
-def test_apptainer_subprocess_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_apptainer_subprocess_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("APPTAINER_CONFIGDIR", str(tmp_path))
 
-    assert apptainer_provider._apptainer_subprocess_env("/workspace/apptainer/bin")["PATH"] == (
-        "/workspace/apptainer/bin:/usr/bin"
-    )
+    env = apptainer_provider._apptainer_subprocess_env("/workspace/apptainer/bin")
+    assert env["PATH"] == ("/workspace/apptainer/bin:/usr/bin")
+    config_path = Path(env["APPTAINER_CONFIG_FILE"])
+    assert config_path.parent == tmp_path
+    assert config_path.read_text() == "systemd cgroups = no\n"
+    assert "APPTAINER_SYSTEMD_CGROUPS" not in env
 
 
 def test_coerce_config() -> None:
@@ -139,6 +163,11 @@ def test_config_validation() -> None:
         apptainer_provider.ApptainerCreateConfig(start_timeout_s=0)
     with pytest.raises(ValueError, match="absolute"):
         apptainer_provider.ApptainerCreateConfig(mount_point="relative")
+    with pytest.raises(ValueError, match="cgroup_root must be an absolute"):
+        apptainer_provider.ApptainerCreateConfig(cgroup_root="relative")
+    with pytest.raises(ValueError, match="cannot be false"):
+        apptainer_provider.ApptainerCreateConfig(cgroup_root="/sys/fs/cgroup", apply_resource_limits=False)
+    assert apptainer_provider.ApptainerCreateConfig().cgroup_root is None
     with pytest.raises(ValueError, match="default_timeout_s"):
         apptainer_provider.ApptainerExecConfig(default_timeout_s=-1)
     with pytest.raises(ValueError, match="timeout_grace_s"):
@@ -155,6 +184,83 @@ def test_config_validation() -> None:
         apptainer_provider.ApptainerProbeConfig(stable_delay_s=-1)
     # command=None disables the timeout_s validation gate.
     assert apptainer_provider.ApptainerProbeConfig(command=None, timeout_s=0).command is None
+
+
+def test_cgroup_module_is_lazy_and_required_only_when_configured(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(apptainer_provider.ACTIVE_EPISODE_CGROUP_ENV, raising=False)
+
+    def unavailable() -> Any:
+        raise RuntimeError("task cgroup module unavailable")
+
+    monkeypatch.setattr(apptainer_provider, "_load_cgroup_module", unavailable)
+    create = apptainer_provider.ApptainerCreateConfig()
+    provider = apptainer_provider.ApptainerProvider(create=create)
+    assert provider._create_config is create
+    assert provider._cgroup_root is None
+
+    with pytest.raises(RuntimeError, match="task cgroup module unavailable"):
+        apptainer_provider.ApptainerProvider(create={"cgroup_root": "/delegated"})
+
+
+def test_active_episode_projects_real_create_config(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    active = tmp_path / "episode"
+    active.mkdir()
+    monkeypatch.setenv(apptainer_provider.ACTIVE_EPISODE_CGROUP_ENV, str(active))
+
+    class FakeRoot:
+        def __init__(self, path: str) -> None:
+            self.path = Path(path)
+
+    class FakeCgroups:
+        DelegatedCgroupRoot = FakeRoot
+
+    monkeypatch.setattr(apptainer_provider, "_load_cgroup_module", lambda: FakeCgroups)
+    create = apptainer_provider.ApptainerCreateConfig()
+    provider = apptainer_provider.ApptainerProvider(create=create)
+
+    assert create.cgroup_root is None
+    assert provider._create_config.cgroup_root == str(active.resolve())
+    assert provider._cgroup_root.path == active.resolve()
+
+
+def test_active_episode_rejects_cgroup_escape_and_accepts_descendant(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    active = tmp_path / "episode"
+    descendant = active / "provider"
+    sibling = tmp_path / "other"
+    descendant.mkdir(parents=True)
+    sibling.mkdir()
+    monkeypatch.setenv(apptainer_provider.ACTIVE_EPISODE_CGROUP_ENV, str(active))
+
+    class FakeRoot:
+        def __init__(self, path: str) -> None:
+            self.path = Path(path)
+
+    class FakeCgroups:
+        DelegatedCgroupRoot = FakeRoot
+
+    monkeypatch.setattr(apptainer_provider, "_load_cgroup_module", lambda: FakeCgroups)
+
+    same = apptainer_provider.ApptainerProvider(
+        create=apptainer_provider.ApptainerCreateConfig(cgroup_root=str(active))
+    )
+    assert same._create_config.cgroup_root == str(active.resolve())
+
+    nested = apptainer_provider.ApptainerProvider(
+        create=apptainer_provider.ApptainerCreateConfig(cgroup_root=str(descendant))
+    )
+    assert nested._create_config.cgroup_root == str(descendant.resolve())
+
+    for escaped in (sibling, tmp_path):
+        with pytest.raises(ValueError, match="active episode cgroup"):
+            apptainer_provider.ApptainerProvider(
+                create=apptainer_provider.ApptainerCreateConfig(cgroup_root=str(escaped))
+            )
 
 
 def test_resource_flags() -> None:
@@ -238,9 +344,15 @@ def test_path_under_mount() -> None:
 
 
 def test_is_runtime_failure() -> None:
-    assert apptainer_provider._is_runtime_failure("FATAL: no instance found") is True
-    assert apptainer_provider._is_runtime_failure("instance not found") is True
-    assert apptainer_provider._is_runtime_failure("ls: cannot access") is False
+    fatal = "FATAL:   While setting image/instance: no instance found with name x"
+    assert apptainer_provider._is_runtime_failure(255, fatal) is True
+    assert apptainer_provider._is_runtime_failure(255, f"INFO:    starting\n{fatal}\n") is True
+    assert apptainer_provider._is_runtime_failure(255, "ls: cannot access") is False
+    # The command's own output and status: never Apptainer's failure.
+    assert apptainer_provider._is_runtime_failure(1, "ls: Directory does not exist") is False
+    assert apptainer_provider._is_runtime_failure(143, "echo 'Directory does not exist'") is False
+    assert apptainer_provider._is_runtime_failure(1, fatal) is False
+    assert apptainer_provider._is_runtime_failure(255, "FATAL: from the command\nlast line") is False
 
 
 def test_constructor_requires_binary(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -264,7 +376,8 @@ async def test_create_builds_argv_and_runs_probe(
         if "--env-file" in argv:
             env_file = _env_file_path(argv)
             env_files.append(env_file)
-            assert env_file.read_bytes() == b"FOO=bar\n"
+            assert env_file.read_bytes() == "".join(f"{k}={v}\n" for k, v in spec.env.items()).encode()
+            assert spec.env["OMP_NUM_THREADS"] == "2"
             assert env_file.stat().st_mode & 0o777 == 0o600
         assert "FOO=bar" not in argv
         if "start" in argv:
@@ -296,10 +409,12 @@ async def test_create_builds_argv_and_runs_probe(
     assert handle.raw.staging_dir == staging
     assert handle.raw.mount_point == "/sandbox"
     assert handle.raw.image == "docker://ubuntu:22.04"
-    assert handle.raw.env == {"FOO": "bar"}
+    assert handle.raw.env == spec.env
 
     start_argv = rec.calls[0]["argv"]
     assert start_argv[:3] == [FAKE_BINARY, "instance", "start"]
+    # The host process's working directory is never bound into a sandbox.
+    assert _contains_seq(start_argv, ["--no-mount", "cwd"])
     assert _contains_seq(start_argv, ["--bind", f"{staging}:/sandbox"])
     assert _contains_seq(start_argv, ["--bind", "/data:/data"])
     assert _contains_seq(start_argv, ["--no-eval", "--env-file", str(env_files[0])])
@@ -392,6 +507,13 @@ async def test_create_requires_image(fake_binary: str, monkeypatch: pytest.Monke
     provider, _rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
     with pytest.raises(apptainer_provider.ApptainerCreateError, match="image is required"):
         await provider.create(SandboxSpec(image=None))
+
+
+async def test_create_rejects_pids_without_delegated_cgroup(fake_binary: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
+    with pytest.raises(apptainer_provider.ApptainerCreateError, match="pids requires create.cgroup_root"):
+        await provider.create(SandboxSpec(image="docker://img", resources={"pids": 8}))
+    assert rec.calls == []
 
 
 async def test_create_start_failure_cleans_up(
@@ -591,12 +713,25 @@ async def test_exec_timeout(fake_binary: str, monkeypatch: pytest.MonkeyPatch, t
 
 
 async def test_exec_runtime_failure(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    provider, _rec = _make_provider(monkeypatch, lambda argv: (1, "", "FATAL: no instance found"))
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (255, "", "FATAL:   no instance found"))
     result = await provider.exec(_make_handle(tmp_path), "echo hi")
 
     assert result.return_code == apptainer_provider.SANDBOX_RUNTIME_RETURN_CODE
     assert result.error_type == "sandbox"
     assert "FATAL" in result.stderr
+
+
+async def test_exec_signal_exit_keeps_command_status_despite_marker_text(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A harness whose log quotes an agent command, then killed by that command.
+    stderr = "DEBUG: Sending keys: [\"ls /git || echo 'Directory does not exist'\"]\n"
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (143, "", stderr))
+    result = await provider.exec(_make_handle(tmp_path), "python agent_runner.py")
+
+    assert result.return_code == 143
+    assert result.error_type is None
+    assert result.stderr == stderr
 
 
 async def test_exec_command_failure_is_not_runtime_error(
@@ -767,7 +902,43 @@ async def test_close_success(fake_binary: str, monkeypatch: pytest.MonkeyPatch, 
     await provider.close(_make_handle(staging))
 
     assert not staging.exists()
-    assert _contains_seq(rec.calls[0]["argv"], [FAKE_BINARY, "instance", "stop", "nemo-gym-x"])
+    # The starter is looked up first so a subreaper can reap it during the stop.
+    assert rec.calls[0]["argv"] == [FAKE_BINARY, "instance", "list", "--json", "nemo-gym-x"]
+    assert rec.calls[-1]["argv"] == [FAKE_BINARY, "instance", "stop", "nemo-gym-x"]
+
+
+def test_open_starter_pidfd_names_the_instance_parent() -> None:
+    # A real parent/child pair stands in for the starter and its container process.
+    starter = subprocess.Popen(["bash", "-c", "sleep 30 & echo $!; wait"], stdout=subprocess.PIPE, text=True)
+    container_pid = int(starter.stdout.readline())
+    killed = False
+    try:
+        listing = json.dumps({"instances": [{"instance": "nemo-gym-x", "pid": container_pid}]})
+        pidfd = apptainer_provider._open_starter_pidfd(listing, "nemo-gym-x")
+        assert pidfd is not None
+        try:
+            assert os.waitid(os.P_PIDFD, pidfd, os.WEXITED | os.WNOHANG) is None  # alive, and our child
+            os.kill(container_pid, signal.SIGKILL)
+            killed = True
+            asyncio.run(asyncio.wait_for(apptainer_provider._reap_adopted_instance(pidfd), 10))
+        finally:
+            os.close(pidfd)
+    finally:
+        if not killed:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(container_pid, signal.SIGKILL)
+        starter.kill()
+        starter.wait()
+    assert apptainer_provider._open_starter_pidfd(listing, "other") is None
+    assert apptainer_provider._open_starter_pidfd("not-json", "nemo-gym-x") is None
+
+
+def test_reap_adopted_instance_leaves_a_non_child_to_its_parent() -> None:
+    pidfd = os.pidfd_open(os.getppid())
+    try:
+        asyncio.run(asyncio.wait_for(apptainer_provider._reap_adopted_instance(pidfd), 5))
+    finally:
+        os.close(pidfd)
 
 
 async def test_close_missing_instance_is_success(
@@ -813,6 +984,68 @@ async def test_close_timeout_raises(fake_binary: str, monkeypatch: pytest.Monkey
     with pytest.raises(TimeoutError):
         await provider.close(_make_handle(staging))
     assert not staging.exists()
+
+
+async def test_close_retains_staging_when_cgroup_cleanup_fails(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
+    handle = _make_handle(staging)
+
+    class FailedCleanup:
+        async def cleanup(self, grace_s: float) -> None:
+            raise RuntimeError("cgroup still populated")
+
+    handle.raw.cgroup = FailedCleanup()
+    with pytest.raises(RuntimeError, match="still populated"):
+        await provider.close(handle)
+    assert staging.exists()
+
+
+async def test_failed_create_cleanup_retains_staging_when_cgroup_cleanup_fails(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
+    handle = _make_handle(staging)
+
+    class FailedCleanup:
+        async def cleanup(self, grace_s: float) -> None:
+            raise RuntimeError("cgroup still populated")
+
+    handle.raw.cgroup = FailedCleanup()
+    with pytest.raises(RuntimeError, match="still populated"):
+        await provider._cleanup_failed_create_handle(handle)
+    assert staging.exists()
+
+
+async def test_close_drains_after_repeated_cancellation(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider, _rec = _make_provider(monkeypatch, lambda argv: (0, "", ""))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    completed = False
+
+    async def delayed_close(handle: SandboxHandle) -> None:
+        nonlocal completed
+        entered.set()
+        await release.wait()
+        completed = True
+
+    monkeypatch.setattr(provider, "_close", delayed_close)
+    task = asyncio.create_task(provider.close(_make_handle(tmp_path)))
+    await entered.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert completed
 
 
 async def test_close_staging_removal_failure_is_logged(
@@ -951,3 +1184,142 @@ async def test_create_uses_daemonize_for_instance_start(
     # The readiness probe (exec) must NOT use the daemonizing path.
     exec_calls = [c for c in rec.calls if "exec" in c["argv"]]
     assert exec_calls and all(c["daemonize"] is False for c in exec_calls)
+
+
+async def test_exec_removes_empty_leaf_from_sandbox_owner(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from core.sandbox.cgroups import CgroupLeaf, SandboxCgroup
+
+    async def terminate(leaf: CgroupLeaf, grace_s: float, *, reap_owned_children: bool = False) -> None:
+        assert grace_s == 0 and reap_owned_children
+
+    monkeypatch.setattr(CgroupLeaf, "terminate", terminate)
+    provider, recorder = _make_provider(monkeypatch, lambda argv: (0, "ok", ""))
+    handle = _make_handle(tmp_path)
+    handle.raw.cgroup = SandboxCgroup(tmp_path, CgroupLeaf(tmp_path / "instance"))
+    result = await provider.exec(handle, "true")
+    leaf = recorder.calls[-1]["cgroup"]
+    assert result.return_code == 0
+    assert not leaf.path.exists()
+    assert handle.raw.cgroup.exec_leaves == {}
+
+async def test_bounded_exec_capture_drains_oversized_first_chunk_on_both_streams(fake_binary: str) -> None:
+    provider = apptainer_provider.ApptainerProvider(exec={"max_output_bytes": 8})
+    facts: dict[str, int | bool] = {}
+    script = (
+        "import sys; "
+        "sys.stdout.buffer.write(b'A' * 131072); sys.stdout.buffer.flush(); "
+        "sys.stderr.buffer.write(b'B' * 131073); sys.stderr.buffer.flush()"
+    )
+    code, stdout, stderr = await provider._run(
+        [shutil.which("python3"), "-c", script], timeout_s=5, capture_facts=facts
+    )
+    assert code == 0 and stdout == "A" * 8 and stderr == "B" * 8
+    assert facts == {
+        "stdout_bytes": 131072, "stderr_bytes": 131073,
+        "stdout_truncated": True, "stderr_truncated": True,
+        "capture_complete": True,
+    }
+
+
+async def test_bounded_exec_capture_retains_partial_output_on_timeout(fake_binary: str) -> None:
+    provider = apptainer_provider.ApptainerProvider(
+        exec={"max_output_bytes": 8, "timeout_grace_s": 0}
+    )
+    facts: dict[str, int | bool] = {}
+    script = (
+        "import sys,time; "
+        "sys.stdout.write('head'); sys.stdout.flush(); "
+        "sys.stderr.write('detail'); sys.stderr.flush(); time.sleep(30)"
+    )
+    with pytest.raises(apptainer_provider._CapturedTimeout) as raised:
+        await provider._run([shutil.which("python3"), "-c", script],
+                            timeout_s=0.2, capture_facts=facts)
+    assert raised.value.stdout == "head" and raised.value.stderr == "detail"
+    assert facts == {
+        "stdout_bytes": 4, "stderr_bytes": 6,
+        "stdout_truncated": False, "stderr_truncated": False,
+        "capture_complete": True,
+    }
+
+
+async def test_default_exec_capture_keeps_full_output_and_old_result_shape(fake_binary: str) -> None:
+    provider = apptainer_provider.ApptainerProvider()
+    code, stdout, stderr = await provider._run(
+        [shutil.which("python3"), "-c", "print('X' * 50000)"], timeout_s=5
+    )
+    assert code == 0 and stdout == "X" * 50000 + "\n" and stderr == ""
+    result = SandboxExecResult(stdout=stdout, stderr=stderr, return_code=code)
+    assert result.stdout_bytes is None and result.stderr_bytes is None
+    assert result.stdout_truncated is False and result.stderr_truncated is False
+    assert result.capture_complete is None
+
+
+def test_bounded_exec_capture_rejects_nonpositive_limit() -> None:
+    with pytest.raises(ValueError, match="max_output_bytes"):
+        apptainer_provider.ApptainerExecConfig(max_output_bytes=0)
+
+async def test_bounded_timeout_with_descendant_held_pipes_returns_incomplete(
+    fake_binary: str, tmp_path: Path
+) -> None:
+    provider = apptainer_provider.ApptainerProvider(
+        exec={"max_output_bytes": 8, "timeout_grace_s": 0}
+    )
+    facts: dict[str, int | bool] = {}
+    child_pid = tmp_path / "escaped-child.pid"
+    script = (
+        "import subprocess,sys,time,pathlib; "
+        "sys.stdout.write('head'); sys.stdout.flush(); "
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],"
+        "start_new_session=True); "
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(child.pid)); "
+        "time.sleep(30)"
+    )
+    started = asyncio.get_running_loop().time()
+    try:
+        with pytest.raises(apptainer_provider._CapturedTimeout) as raised:
+            await provider._run([shutil.which("python3"), "-c", script],
+                                timeout_s=0.1, capture_facts=facts)
+    finally:
+        if child_pid.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(int(child_pid.read_text()), signal.SIGKILL)
+    assert asyncio.get_running_loop().time() - started < 2.3
+    assert raised.value.stdout == "head"
+    assert facts["stdout_bytes"] >= 4
+    assert facts["capture_complete"] is False
+    assert facts["stdout_truncated"] is True and facts["stderr_truncated"] is True
+
+
+async def test_bounded_provider_exec_returns_typed_counts(fake_binary: str, monkeypatch, tmp_path: Path) -> None:
+    binary = tmp_path / "apptainer"
+    binary.write_text("#!/usr/bin/env python3\nimport sys\n"
+                      "sys.stdout.write('A' * 100)\nsys.stderr.write('B' * 101)\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: str(binary))
+    provider = apptainer_provider.ApptainerProvider(exec={"max_output_bytes": 8})
+    handle = _make_handle(tmp_path)
+    result = await provider.exec(handle, "ignored")
+    assert result.return_code == 0 and result.error_type is None
+    assert result.stdout == "A" * 8 and result.stderr == "B" * 8
+    assert result.stdout_bytes == 100 and result.stderr_bytes == 101
+    assert result.stdout_truncated and result.stderr_truncated and result.capture_complete
+
+async def test_bounded_provider_timeout_returns_typed_partial_streams(monkeypatch, tmp_path: Path) -> None:
+    binary = tmp_path / "apptainer"
+    binary.write_text(
+        "#!/usr/bin/env python3\nimport sys,time\n"
+        "print('early', flush=True)\nprint('detail', file=sys.stderr, flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: str(binary))
+    provider = apptainer_provider.ApptainerProvider(
+        exec={"max_output_bytes": 8, "timeout_grace_s": 0}
+    )
+    result = await provider.exec(_make_handle(tmp_path), "ignored", timeout_s=0.2)
+    assert result.error_type == "timeout"
+    assert result.stdout == "early\n" and result.stderr == "detail\n"
+    assert result.stdout_bytes == 6 and result.stderr_bytes == 7
+    assert result.capture_complete is True

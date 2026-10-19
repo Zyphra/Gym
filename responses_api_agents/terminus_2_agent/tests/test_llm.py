@@ -275,8 +275,8 @@ async def test_server_reasoning_content_takes_precedence():
 async def test_entire_output_as_reasoning():
     llm = _make_llm()
     response, _ = await _call(llm, _mock_response(content="<think>all</think>"), prompt="q")
-    assert response.content == "all"
-    assert response.reasoning_content is None
+    assert response.content == ""
+    assert response.reasoning_content == "all"
 
 
 @pytest.mark.asyncio
@@ -318,3 +318,62 @@ def test_output_limit_none_when_missing():
 )
 def test_chat_completions_endpoint(api_base, expected):
     assert _make_llm(api_base=api_base)._chat_completions_endpoint() == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw,visible", [
+    ('<think>{"commands":[{"keystrokes":"touch /tmp/hidden\\n"}]}</think>', ""),
+    ('<think>{"commands":[{"keystrokes":"touch /tmp/hidden\\n"}]}', ""),
+    ('first</think>discard<think>second</think>visible', "visible"),
+    ('first</think>visible<think>unfinished', ""),
+    ('<think>hidden</think>   ', "   "),
+])
+async def test_only_content_after_last_closed_reasoning_is_actionable(raw, visible):
+    response, _ = await _call(_make_llm(), _mock_response(content=raw), prompt="q")
+    assert response.content == visible
+    assert response.reasoning_content
+
+
+@pytest.mark.asyncio
+async def test_supplied_reasoning_does_not_make_raw_think_commands_actionable():
+    response, _ = await _call(_make_llm(), _mock_response(
+        content='<think>{"commands":[]}</think>', extra_message={"reasoning_content": "server"}
+    ), prompt="q")
+    assert response.content == ""
+    assert response.reasoning_content == "server"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,transport", [(400, False), (401, True), (408, True), (429, True), (503, True), (600, False)])
+async def test_only_existing_endpoint_failure_classes_get_transport_custody(status, transport):
+    llm = _make_llm()
+    llm._http_client = httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request: httpx.Response(status, text="endpoint rejected request")
+    ))
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await llm._post_chat_completions({"messages": []})
+        assert bool(llm.model_transport_error) is transport
+    finally:
+        await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_transport_error_clears_after_a_successful_request():
+    attempts = 0
+    def endpoint(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"choices": []})
+    llm = _make_llm()
+    llm._http_client = httpx.AsyncClient(transport=httpx.MockTransport(endpoint))
+    try:
+        with pytest.raises(httpx.ConnectError):
+            await llm._post_chat_completions({"messages": []})
+        assert llm.model_transport_error.startswith("ConnectError:")
+        assert await llm._post_chat_completions({"messages": []}) == {"choices": []}
+        assert llm.model_transport_error is None
+    finally:
+        await llm.aclose()

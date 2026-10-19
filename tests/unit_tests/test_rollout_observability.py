@@ -1,11 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from nemo_gym.base_responses_api_model import ModelCallRecord
 from nemo_gym.config_types import ModelServerRef
+from nemo_gym.openai_utils import NeMoGymResponse
 from nemo_gym.rollout_observability import (
     AgentInvocation,
     AgentObservationBundle,
@@ -16,8 +20,47 @@ from nemo_gym.rollout_observability import (
     ToolCallObservation,
     TrajectoryModelCall,
     TrajectoryRecord,
+    harness_response_error,
     join_model_call_observations,
 )
+
+
+@pytest.mark.parametrize("index", [0, 1], ids=["pi-no-call-failure", "hermes-route-denial"])
+def test_saved_harness_failure_survives_response_projection(index: int) -> None:
+    raw = json.loads((Path(__file__).parent / "fixtures/sandbox-harness-failures.json").read_text())[index]["response"]
+    observations = AgentObservationBundle.model_validate(raw.pop("_ng_agent_observations"))
+    response = NeMoGymResponse.model_validate(raw)
+    error = harness_response_error(response, observations)
+    assert error is not None
+    if response.error is not None:
+        assert error == response.error
+
+
+@pytest.mark.parametrize("status,calls", [("completed", []), ("failed", [ModelCallRef(model_call_id="empty-stop")])])
+def test_empty_model_stop_is_not_a_zero_call_harness_failure(status: str, calls: list[ModelCallRef]) -> None:
+    raw = json.loads((Path(__file__).parent / "fixtures/sandbox-harness-failures.json").read_text())[0]["response"]
+    raw.pop("_ng_agent_observations")
+    response = NeMoGymResponse.model_validate(raw)
+    observations = AgentObservationBundle(source="test", records=[AgentInvocation(
+        invocation_id="root", status=status, model_calls=calls,
+    )])
+    assert harness_response_error(response, observations) is None
+    assert harness_response_error(response) is None  # Missing evidence is not a zero-call receipt.
+
+
+@pytest.mark.parametrize("message", [
+    "Model used all output tokens on reasoning with none left for the response. Try lowering reasoning effort or increasing max_tokens.",
+    "Model generated invalid tool call: finish",
+    "Context length exceeded: max compression attempts (3) reached.",
+])
+def test_policy_errors_remain_scored_outcomes(message: str) -> None:
+    raw = json.loads((Path(__file__).parent / "fixtures/sandbox-harness-failures.json").read_text())[1]["response"]
+    observations = AgentObservationBundle.model_validate(raw.pop("_ng_agent_observations"))
+    raw["error"]["message"] = message
+    raw["usage"]["total_tokens"] = 100
+    raw["usage"]["input_tokens"] = 100
+    response = NeMoGymResponse.model_validate(raw)
+    assert harness_response_error(response, observations) is None
 
 
 @pytest.mark.parametrize(

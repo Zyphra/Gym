@@ -14,12 +14,40 @@
 
 """Provider-facing sandbox protocol."""
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import urlsplit
+
+from nemo_gym.sandbox.utils import cpu_cap_env
+
+
+_EXEC_TIMEOUT_OBSERVER = ContextVar("sandbox_exec_timeout_observer", default=None)
+
+
+@contextmanager
+def exec_timeout_observer(callback: Callable[[], None]):
+    """Observe one task-owned execution deadline before its process is killed."""
+    token = _EXEC_TIMEOUT_OBSERVER.set(callback)
+    try:
+        yield
+    finally:
+        _EXEC_TIMEOUT_OBSERVER.reset(token)
+
+
+def notify_exec_timeout() -> None:
+    callback = _EXEC_TIMEOUT_OBSERVER.get()
+    if callback is not None:
+        try:
+            callback()
+        except Exception:
+            # Observer failures must never bypass owned process cleanup.
+            logging.getLogger(__name__).error("sandbox exec timeout observer failed")
 
 
 class SandboxStatus(str, Enum):
@@ -70,6 +98,11 @@ class SandboxResources:
     disk_gib: int | None = None
     gpu: int | None = None
     gpu_type: str | None = None
+    pids: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.pids is not None and self.pids <= 0:
+            raise ValueError("Sandbox pids must be > 0")
 
     @classmethod
     def from_mapping(cls, resources: Mapping[str, Any] | None) -> "SandboxResources":
@@ -84,6 +117,7 @@ class SandboxResources:
         return cls(
             cpu=float(resources["cpu"]) if resources.get("cpu") is not None else None,
             memory_mib=int(resources["memory_mib"]) if resources.get("memory_mib") is not None else None,
+            pids=int(resources["pids"]) if resources.get("pids") is not None else None,
             disk_gib=int(resources["disk_gib"]) if resources.get("disk_gib") is not None else None,
             gpu=int(resources["gpu"]) if resources.get("gpu") is not None else None,
             gpu_type=str(resources["gpu_type"]) if resources.get("gpu_type") is not None else None,
@@ -109,6 +143,7 @@ class SandboxSpec:
     def __post_init__(self) -> None:
         if not isinstance(self.resources, SandboxResources):
             object.__setattr__(self, "resources", SandboxResources.from_mapping(self.resources))
+        object.__setattr__(self, "env", {**cpu_cap_env(self.resources.cpu), **self.env})
         if not isinstance(self.ports, (list, tuple)):
             raise TypeError("Sandbox ports must be a list or tuple of TCP port numbers")
         normalized_ports: list[int] = []
@@ -157,6 +192,11 @@ class SandboxExecResult:
     stderr: str | None
     return_code: int
     error_type: str | None = None
+    stdout_bytes: int | None = None
+    stderr_bytes: int | None = None
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    capture_complete: bool | None = None
 
 
 ExecResult = SandboxExecResult

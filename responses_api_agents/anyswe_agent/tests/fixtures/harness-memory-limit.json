@@ -1,0 +1,31 @@
+[
+  {
+    "name": "django-full-suite",
+    "return_code": 137,
+    "sandbox_oom": 5,
+    "sandbox_oom_kill": 5,
+    "sandbox_memory_max_events": 3701,
+    "mask_sample": true,
+    "policy_command": "cd /testbed && python3 tests/runtests.py --settings=tests.test_sqlite 2>&1 | grep -E \"Ran.*tests|test_serialize_enums|test_serialize\"",
+    "provenance": {
+      "native_metrics_sha256": "80f5decdbd9912395df6a9360c3cb5c4a20c1c3efc2cc11e4764c0408529100b",
+      "capture_sha256": "58118e871d0bd9e148e429305a9e4d317b0dd79b245512283d43f1cf08f6e620",
+      "exact_native_kernel_cgroup_match": true
+    }
+  },
+  {
+    "name": "trace-script",
+    "return_code": 137,
+    "sandbox_oom": 1,
+    "sandbox_oom_kill": 1,
+    "sandbox_memory_max_events": 7796,
+    "mask_sample": true,
+    "policy_command": "cd /workspace/bluetooth-data-tools && PYTHONPATH=/workspace/bluetooth-data-tools/src:$PYTHONPATH python trace.py 2>&1",
+    "provenance": {
+      "exact_native_kernel_cgroup_match": true,
+      "kernel_anonymous_bytes": 17132900352,
+      "killed_python_anonymous_kib": 16633240,
+      "kernel_receipt_sha256": "71662643f4d5fef6eab4b06f997e23493bbe2857a754382f2f45833d38b7333b"
+    }
+  }
+]

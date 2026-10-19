@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for anyterminal_agent.
+"""Contracts for anyterminal_agent, including an opt-in allocated sandbox test.
 
 Modeled on anyswe_agent's tests: these exercise pure logic (no real Apptainer/Docker) —
 runner-script generation, provider selection, container discovery, deps-key derivation,
@@ -34,9 +34,17 @@ from pydantic import ValidationError
 
 from nemo_gym import PARENT_DIR
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxHandle
+from nemo_gym.sandbox.episode import (
+    EPISODE_MEMORY_HEADROOM_MIB,
+    harness_memory_kill,
+    sandbox_episode_resources,
+    verifier_memory_kill,
+)
 from nemo_gym.sandbox.providers.apptainer import ApptainerProvider
 from nemo_gym.sandbox.providers.apptainer import provider as apptainer_provider
 from nemo_gym.sandbox.providers.docker import DockerProvider
+from nemo_gym.sandbox.providers.docker import provider as docker_provider
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.anyterminal_agent import app
 from responses_api_agents.anyterminal_agent.app import (
@@ -48,6 +56,7 @@ from responses_api_agents.anyterminal_agent.app import (
     GymAgentHarnessProcessor,
     RunTerminalAgent,
     _build_provider,
+    _episode_sandbox_resources,
     _file_lock,
     _format_container,
     _instruction_from_input,
@@ -56,6 +65,64 @@ from responses_api_agents.anyterminal_agent.app import (
     update_metrics,
 )
 
+
+def test_shared_episode_runtime_env_forwards_gym_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    pythonpath = os.pathsep.join((str(PARENT_DIR), "/existing/path"))
+    monkeypatch.setenv("PYTHONPATH", pythonpath)
+    monkeypatch.setenv("NEMO_GYM_EXTRA_ROOTS", "/tasks")
+
+    import sys
+
+    from core.sandbox.executor import _episode_runtime_env
+
+    monkeypatch.setenv("RAY_process_group_cleanup_enabled", "1")
+    monkeypatch.setenv("NEMO_GYM_SERVICE_PYTHON", sys.executable)
+    runtime_env = _episode_runtime_env()
+
+    assert runtime_env["py_executable"]
+    assert runtime_env["env_vars"]["PYTHONPATH"] == pythonpath
+    assert runtime_env["env_vars"]["NEMO_GYM_EXTRA_ROOTS"] == "/tasks"
+    assert runtime_env["env_vars"]["RAY_process_group_cleanup_enabled"] == "1"
+
+
+def test_shared_episode_python_survives_submit_environment_removal(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    import sysconfig
+    import venv
+
+    submit_env = tmp_path / "submit-node-only"
+    venv.EnvBuilder(system_site_packages=True, with_pip=False).create(submit_env)
+    pythonpath = os.pathsep.join(
+        (str(PARENT_DIR), sysconfig.get_paths()["purelib"], os.environ.get("PYTHONPATH", ""))
+    )
+    monkeypatch.setenv("PYTHONPATH", pythonpath)
+    monkeypatch.setenv("NEMO_GYM_SERVICE_PYTHON", sys.executable)
+    monkeypatch.setenv("RAY_process_group_cleanup_enabled", "1")
+    probe = """
+import json, os, sys
+from core.sandbox.executor import _episode_runtime_env
+configured = _episode_runtime_env()
+print(json.dumps({'configured': configured, 'python': sys.executable}))
+"""
+    result = json.loads(subprocess.check_output(
+        [str(submit_env / "bin/python"), "-c", probe], text=True,
+    ))
+    assert result["configured"]["py_executable"] == sys.executable
+    shutil.rmtree(submit_env)
+    assert not Path(result["python"]).exists()
+    env = {**os.environ, **result["configured"]["env_vars"]}
+    worker_probe = """
+from pathlib import Path
+import ray
+from nemo_gym.sandbox.providers.apptainer import provider
+path = Path(provider.__file__).resolve()
+print('worker imports PASS')
+"""
+    output = subprocess.check_output(
+        [result["configured"]["py_executable"], "-c", worker_probe], env=env, text=True,
+    )
+    assert "worker imports PASS" in output
 
 def _config(**overrides) -> AnyTerminalAgentConfig:
     base = dict(
@@ -136,6 +203,16 @@ class TestFormatContainer:
         assert _format_container("./images/{task_name}.sif", "t", "ubuntu:22.04") == "./images/t.sif"
 
 
+@pytest.mark.parametrize("image", [None, "", "relative.sif", "docker://ubuntu:22.04"])
+def test_admitted_image_formatter_rejects_missing_or_nonlocal_image(image):
+    with pytest.raises(ValueError, match="absolute admitted image"):
+        _format_container("{runtime_image}", "t", "ubuntu:22.04", runtime_image=image)
+
+
+def test_admitted_image_does_not_change_default_formatter():
+    assert _format_container(None, "t", "ubuntu:22.04", "/artifacts/task.sif") == "docker://ubuntu:22.04"
+
+
 class TestSetupScriptsExist:
     def test_supported_agents_have_deps_scripts(self) -> None:
         assert (PARENT_DIR / "responses_api_agents" / "hermes_agent" / "scripts" / "hermes_agent_deps.sh").exists()
@@ -198,7 +275,15 @@ def _make_instance_config(tmp_path: Path, **overrides) -> AnyTerminalInstanceCon
         model_name="test-model",
         nemo_gym_root=PARENT_DIR,
         agent_deps_dir=tmp_path / "deps",
-        problem_info={"task_name": "fix-git", "task_dir": str(tmp_path), "docker_image": "ubuntu:22.04"},
+        problem_info={
+            "task_name": "fix-git",
+            "task_dir": str(tmp_path),
+            "docker_image": "ubuntu:22.04",
+            "cpus": 2,
+            "memory_mb": 4096,
+            "pids": 512,
+            "gpus": 0,
+        },
         body=_make_body(),
         persistent_dir=persistent_dir,
         verifier_dir=verifier_dir,
@@ -209,6 +294,246 @@ def _make_instance_config(tmp_path: Path, **overrides) -> AnyTerminalInstanceCon
     )
     defaults.update(overrides)
     return AnyTerminalInstanceConfig(**defaults)
+
+
+def _verifier_runtime(tmp_path):
+    helper = tmp_path / "helper"
+    cache = tmp_path / "cache"
+    helper.mkdir()
+    cache.mkdir()
+    payload = b'{"schema":1}\n'
+    (helper / "helper-manifest.json").write_bytes(payload)
+    (cache / "verifier-cache.json").write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    return app.VerifierRuntime(
+        helper_dir=helper, cache_dir=cache,
+        helper_manifest_sha256=digest, cache_manifest_sha256=digest,
+    )
+
+
+@pytest.mark.parametrize("provider", ["docker", "apptainer"])
+def test_verifier_runtime_mounts_resolved_payloads_read_only(tmp_path, provider, monkeypatch):
+    monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: "/usr/bin/apptainer")
+    monkeypatch.setattr(docker_provider, "_require_docker", lambda: "/usr/bin/docker")
+    runtime = _verifier_runtime(tmp_path)
+    cfg = _make_instance_config(tmp_path, verifier_runtime=runtime, sandbox_provider={provider: {}})
+    actual = _build_provider(cfg)
+    if provider == "apptainer":
+        binds = actual._exec_config.default_binds
+    else:
+        binds = actual._create_config.extra_run_args
+    assert f"{runtime.helper_dir}:/staging/env_files:ro" in binds
+    assert f"{runtime.cache_dir}:/verifier_cache_mount:ro" in binds
+
+
+@pytest.mark.parametrize("change", ["symlink", "digest", "missing", "relative", "unknown"])
+def test_verifier_runtime_rejects_unbound_payloads(tmp_path, change):
+    runtime = _verifier_runtime(tmp_path)
+    values = runtime.model_dump()
+    if change == "symlink":
+        linked = tmp_path / "linked"
+        linked.symlink_to(runtime.helper_dir, target_is_directory=True)
+        values["helper_dir"] = linked
+    elif change == "digest":
+        values["cache_manifest_sha256"] = "0" * 64
+    elif change == "missing":
+        (runtime.cache_dir / "verifier-cache.json").unlink()
+    elif change == "relative":
+        values["helper_dir"] = Path("helper")
+    else:
+        values["setup_command"] = "arbitrary setup is not an input"
+    with pytest.raises(ValidationError):
+        app.VerifierRuntime(**values)
+
+
+@pytest.mark.asyncio
+async def test_absent_verifier_runtime_never_provisions(tmp_path):
+    cfg = _make_instance_config(tmp_path)
+    sandbox = AsyncMock()
+    assert await RunTerminalAgent(config=cfg)._prepare_verifier_runtime(sandbox, cfg) is None
+    sandbox.exec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_verifier_environment_is_private_and_passed_to_grading(tmp_path):
+    cfg = _make_instance_config(tmp_path, verifier_runtime=_verifier_runtime(tmp_path))
+    sandbox = AsyncMock()
+    result = SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+    sandbox.exec.side_effect = [SimpleNamespace(
+        return_code=0, error_type=None, stderr="", stdout=json.dumps({
+            "HOME": "/root", "PATH": "/task/bin:/usr/bin", "python_key": "cpython-3.13.7-linux-x86_64-gnu",
+        }),
+    ), result, result]
+    runner = RunTerminalAgent(config=cfg)
+    await runner._run_eval(sandbox, cfg)
+    inspection, setup, grading = sandbox.exec.await_args_list
+    env = setup.kwargs["env"]
+    assert grading.kwargs["env"] == env
+    assert "HOME" not in env
+    apptainer_provider._serialize_env_file(env)
+    assert env["UV_CACHE_DIR"].startswith("/tmp/gym-verifier-")
+    assert env["UV_OFFLINE"] == "true"
+    assert env["UV_PYTHON_DOWNLOADS"] == "never"
+    assert env["PATH"].index("/task/bin") < env["PATH"].index("verifier-python/bin")
+    assert env["UV_PYTHON_PREFERENCE"] == "only-managed"
+    receipt = json.loads((cfg.verifier_dir / "runtime-setup.json").read_text())
+    assert receipt["runtime"]["cache_manifest_sha256"] == cfg.verifier_runtime.cache_manifest_sha256
+    assert receipt["environment"]["HOME"] == "/root"
+    assert {key: value for key, value in receipt["environment"].items() if key != "HOME"} == env
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("home", ["/tmp/private-verifier/home", "/tmp/private ' $(false); home"])
+async def test_private_home_survives_apptainer_environment_boundary(tmp_path, home):
+    import subprocess
+
+    cfg = _make_instance_config(tmp_path)
+    async def execute(command, *, env, timeout_s, user):
+        apptainer_provider._serialize_env_file(env)
+        assert "HOME" not in env
+        return subprocess.run(["sh", "-c", command], env=os.environ | env,
+                              capture_output=True, text=True, timeout=timeout_s, check=True)
+    sandbox = SimpleNamespace(exec=execute)
+    result = await RunTerminalAgent(config=cfg)._exec_verifier(
+        sandbox, 'printf "%s\n%s" "$HOME" "$UV_OFFLINE"',
+        env={"HOME": home, "UV_OFFLINE": "true"}, timeout_s=5,
+    )
+    assert result.stdout == home + "\ntrue"
+
+
+@pytest.mark.asyncio
+async def test_verifier_setup_failure_preserves_error_and_never_grades(tmp_path):
+    cfg = _make_instance_config(tmp_path, verifier_runtime=_verifier_runtime(tmp_path))
+    sandbox = AsyncMock()
+    sandbox.exec.return_value = SimpleNamespace(return_code=1, error_type=None, stdout="", stderr="cache copy failed")
+    with pytest.raises(RuntimeError, match="setup failed"):
+        await RunTerminalAgent(config=cfg)._run_eval(sandbox, cfg)
+    assert sandbox.exec.await_count == 1
+    assert json.loads((cfg.verifier_dir / "runtime-setup.json").read_text())["stderr"] == "cache copy failed"
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, None])
+def test_verifier_network_isolation_requires_boolean(tmp_path, value):
+    runtime = _verifier_runtime(tmp_path)
+    assert runtime.isolate_network is False
+    with pytest.raises(ValidationError):
+        app.VerifierRuntime(**(runtime.model_dump() | {"isolate_network": value}))
+
+
+@pytest.mark.asyncio
+async def test_verifier_namespace_failure_never_runs_command(tmp_path):
+    import subprocess
+
+    runtime = _verifier_runtime(tmp_path).model_copy(update={"isolate_network": True})
+    cfg = _make_instance_config(tmp_path, verifier_runtime=runtime)
+    # Execute a failing namespace tool, not a mocked sandbox return value.
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "unshare").symlink_to(shutil.which("false"))
+    marker = tmp_path / "must-not-exist"
+
+    async def execute(command, *, env, timeout_s, user):
+        result = subprocess.run(["/bin/sh", "-c", command], env=os.environ | (env or {}),
+                                capture_output=True, text=True, timeout=timeout_s)
+        return SimpleNamespace(return_code=result.returncode, error_type=None,
+                               stdout=result.stdout, stderr=result.stderr)
+
+    result = await RunTerminalAgent(config=cfg)._exec_verifier(
+        SimpleNamespace(exec=execute), "touch " + str(marker),
+        env={"PATH": str(tools)}, timeout_s=5,
+    )
+    assert result.return_code != 0
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("isolated", [False, True])
+async def test_verifier_network_namespace_preserves_task_files(tmp_path, isolated):
+    from nemo_gym.sandbox import AsyncSandbox, SandboxSpec
+
+    sif = os.environ.get("ANYTERMINAL_TEST_SIF")
+    if not sif:
+        pytest.skip("allocated Apptainer sandbox requires ANYTERMINAL_TEST_SIF")
+    assert Path(sif).is_file()
+    helper = Path(os.environ["ANYTERMINAL_TEST_VERIFIER_HELPER"])
+    assert (helper / "python/verifier-python/bin/python3").is_file()
+    runtime = _verifier_runtime(tmp_path).model_copy(update={
+        "isolate_network": isolated, "helper_dir": helper,
+        "helper_manifest_sha256": hashlib.sha256((helper / "helper-manifest.json").read_bytes()).hexdigest(),
+    })
+    (runtime.cache_dir / "cache").mkdir()
+    cfg = _make_instance_config(
+        tmp_path, verifier_runtime=runtime, container=sif,
+        sandbox_provider={"apptainer": {"create": {"extra_start_args": ["--fakeroot"]}}},
+    )
+    cfg.agent_deps_dir.mkdir()
+    sandbox = AsyncSandbox(_build_provider(cfg), SandboxSpec(image=sif, ttl_s=60))
+    try:
+        await sandbox.start()
+        runner = RunTerminalAgent(config=cfg)
+        task_identity = await sandbox.exec(
+            "printf '%s\\n' \"$HOME\" \"$PATH\"; command -v python3 || true",
+            timeout_s=10, user="root",
+        )
+        assert task_identity.return_code == 0, task_identity.stderr
+        task_home, task_path, *task_python = task_identity.stdout.splitlines()
+        marker = await sandbox.exec(
+            "mkdir -p \"$HOME/.local/bin\"; "
+            "printf '# retained task environment\\n' > \"$HOME/.local/bin/env\"; "
+            "printf task-home-data > \"$HOME/verifier-home-marker\"",
+            timeout_s=10, user="root",
+        )
+        assert marker.return_code == 0, marker.stderr
+        verifier_env = await runner._prepare_verifier_runtime(sandbox, cfg)
+        assert verifier_env["HOME"] == task_home
+        assert task_path in verifier_env["PATH"]
+        environment_probe = await runner._exec_verifier(
+            sandbox, 'cat "$HOME/.local/bin/env" "$HOME/verifier-home-marker"; '
+            "printf '\\n'; command -v python3; uv python find --offline 3.13",
+            env=verifier_env, timeout_s=20,
+        )
+        assert environment_probe.return_code == 0, environment_probe.stderr
+        probe_lines = environment_probe.stdout.splitlines()
+        assert probe_lines[:2] == ["# retained task environment", "task-home-data"]
+        if task_python:
+            assert probe_lines[2] == task_python[0]
+        else:
+            assert probe_lines[2].startswith("/staging/env_files/python/verifier-python/bin/")
+        assert "/python/cpython-3.13." in probe_lines[3] or probe_lines[3].startswith(
+            "/staging/env_files/python/verifier-python/bin/"
+        )
+        system_tools = await runner._exec_verifier(
+            sandbox, "ldconfig --version && start-stop-daemon --version",
+            env=verifier_env, timeout_s=10,
+        )
+        assert system_tools.return_code == 0, system_tools.stderr
+        parent = await sandbox.exec(
+            "readlink /proc/self/ns/net; printf task-data > /tmp/verifier-network-test",
+            timeout_s=10, user="root",
+        )
+        assert parent.return_code == 0, parent.stderr
+        import shlex
+
+        roundtrip = (
+            "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(1); "
+            "c=socket.socket(); c.settimeout(2); c.connect(s.getsockname()); "
+            "p,_=s.accept(); c.sendall(b'loopback'); print(p.recv(8).decode())"
+        )
+        result = await RunTerminalAgent(config=cfg)._exec_verifier(
+            sandbox, "readlink /proc/self/ns/net; cat /tmp/verifier-network-test; "
+            "printf '\n'; /staging/env_files/python/verifier-python/bin/python3 -I -c "
+            + shlex.quote(roundtrip) + "; cat /proc/net/route",
+            env={"HOME": "/tmp/private-verifier"}, timeout_s=10,
+        )
+        assert result.return_code == 0, result.stderr
+        lines = result.stdout.splitlines()
+        assert (lines[0] != parent.stdout.strip()) is isolated
+        assert lines[1] == "task-data"
+        assert lines[2] == "loopback"
+        if isolated:
+            assert not [line for line in lines[3:] if line.strip() and not line.startswith("Iface")]
+    finally:
+        await sandbox.stop()
 
 
 # ── _read_task_meta ───────────────────────────────────────────────────────────────
@@ -260,6 +585,46 @@ def _make_setup_agent(tmp_path: Path, **config_overrides) -> AnyTerminalAgent:
 
 
 class TestSetupParams:
+    def test_distinct_admitted_images_cross_real_request_metadata(self, tmp_path):
+        agent = _make_setup_agent(tmp_path, container_formatter="{runtime_image}")
+        images = [tmp_path / "first.sif", tmp_path / "second.sif"]
+        containers = []
+        for index, image in enumerate(images):
+            body = _make_body(metadata={
+                "task_name": f"task-{index}", "task_dir": str(tmp_path),
+                "docker_image": "ubuntu:22.04", "runtime_image": str(image),
+            })
+            params = agent._setup_params(body)
+            containers.append(params.container)
+            assert params.problem_info["docker_image"] == "ubuntu:22.04"
+        assert containers == [str(image) for image in images]
+
+    def test_admitted_image_formatter_requires_row_metadata(self, tmp_path):
+        agent = _make_setup_agent(tmp_path, container_formatter="{runtime_image}")
+        body = _make_body(metadata={"task_name": "task", "task_dir": str(tmp_path)})
+        with pytest.raises(ValueError, match="absolute admitted image"):
+            agent._setup_params(body)
+
+    def test_verifier_runtime_crosses_real_request_metadata(self, tmp_path):
+        runtime = _verifier_runtime(tmp_path)
+        agent = _make_setup_agent(tmp_path)
+        body = _make_body(metadata={
+            "task_name": "fix-git", "task_dir": str(tmp_path),
+            "verifier_runtime": runtime.model_dump_json(),
+        })
+        params = agent._setup_params(body)
+        assert params.verifier_runtime == runtime
+        assert params.body.metadata["verifier_runtime"] == runtime.model_dump_json()
+
+    @pytest.mark.parametrize("carrier", ["not-json", "{}", "null"])
+    def test_verifier_runtime_rejects_invalid_request_metadata(self, tmp_path, carrier):
+        agent = _make_setup_agent(tmp_path)
+        body = _make_body(metadata={
+            "task_name": "fix-git", "task_dir": str(tmp_path), "verifier_runtime": carrier,
+        })
+        with pytest.raises(ValidationError):
+            agent._setup_params(body)
+
     def test_uses_per_task_timeout_by_default(self, tmp_path: Path) -> None:
         agent = _make_setup_agent(tmp_path)
         body = _make_body(metadata={"task_name": "fix-git", "task_dir": str(tmp_path), "agent_timeout_sec": "900"})
@@ -360,6 +725,23 @@ class TestUpdateMetrics:
         fpath.write_text('{"resolved": false}')
         update_metrics(fpath, {"resolved": True})
         assert json.loads(fpath.read_text())["resolved"] is True
+
+    def test_missing_file_records_the_update(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The instance directory can go away under the episode; its metrics still have to land."""
+        fpath = tmp_path / "gone" / "nemo_gym_metrics.json"
+        update_metrics(fpath, {"sandbox_failed": True, "mask_sample": True}, "fix-git")
+        d = json.loads(fpath.read_text())
+        assert d["sandbox_failed"] is True
+        assert d["mask_sample"] is True
+        out = capsys.readouterr().out
+        assert "fix-git" in out
+        assert str(fpath) in out
+
+    def test_unparseable_file_records_the_update(self, tmp_path: Path) -> None:
+        fpath = tmp_path / "m.json"
+        fpath.write_text("{truncated")
+        update_metrics(fpath, {"resolved": False, "sandbox_failed": True})
+        assert json.loads(fpath.read_text()) == {"resolved": False, "sandbox_failed": True}
 
 
 # ── _safe_config_json ─────────────────────────────────────────────────────────────
@@ -474,9 +856,10 @@ class TestInstanceConfigProperties:
 
 class TestBuildProvider:
     @pytest.fixture(autouse=True)
-    def _fake_apptainer_binary(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Constructing ApptainerProvider hard-errors if the real binary isn't on PATH.
+    def _provider_binaries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # These tests construct real provider configs without launching containers.
         monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: "/usr/bin/apptainer")
+        monkeypatch.setattr(docker_provider, "_require_docker", lambda: "/usr/bin/docker")
 
     def test_default_is_docker(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path)
@@ -496,7 +879,7 @@ class TestBuildProvider:
         provider = _build_provider(_make_instance_config(tmp_path, sandbox_provider={"apptainer": {}}))
         start_args = provider._create_config.extra_start_args
         assert "--writable-tmpfs" in start_args
-        assert "--no-mount" in start_args and "home" in start_args
+        assert "--no-mount" in start_args and "home,tmp" in start_args
         assert "tmp,bind-paths" not in provider._exec_config.extra_exec_args
 
     def test_docker_provider_selected(self, tmp_path: Path) -> None:
@@ -515,41 +898,43 @@ class TestBuildProvider:
         assert _build_provider(cfg) == {"opensandbox": {"foo": "bar"}}
 
 
-# ── _ray_resource_opts ────────────────────────────────────────────────────────────
-
-
-class TestRayResourceOpts:
+class TestEpisodeResources:
     def _params(self, problem_info: dict, agent_overhead_mb: int = 2048) -> AnyTerminalInstanceConfig:
         return AnyTerminalInstanceConfig.model_construct(
             problem_info=problem_info,
             agent_overhead_mb=agent_overhead_mb,
         )
 
-    def test_defaults_to_one_cpu(self) -> None:
-        assert AnyTerminalAgent._ray_resource_opts(self._params({}))["num_cpus"] == 1
+    def test_episode_adds_shared_headroom_to_declared_sandbox(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The global sandbox default neither caps nor rejects a row-owned sandbox.
+        monkeypatch.setenv("NEMO_GYM_SANDBOX_MEMORY_MB", "4096")
+        sandbox = _episode_sandbox_resources(self._params({"cpus": 2, "memory_mb": 4096, "pids": 512}))
+        episode = sandbox_episode_resources(sandbox)
 
-    def test_custom_cpus(self) -> None:
-        assert AnyTerminalAgent._ray_resource_opts(self._params({"cpus": "2.5"}))["num_cpus"] == 2.5
+        assert (sandbox.cpu, sandbox.memory_mib, sandbox.pids) == (2, 4096 + 2048, 512)
+        assert (episode.num_cpus, episode.pids) == (2, 512)
+        assert episode.memory_bytes == (sandbox.memory_mib + EPISODE_MEMORY_HEADROOM_MIB) * 1024 * 1024
 
-    def test_memory_includes_overhead(self) -> None:
-        opts = AnyTerminalAgent._ray_resource_opts(self._params({"memory_mb": "4096"}))
-        assert opts["memory"] == (4096 + 2048) * 1024 * 1024
+    def test_explicit_task_pids_win_global_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("NEMO_GYM_SANDBOX_PIDS", "2048")
+        sandbox = _episode_sandbox_resources(self._params({"cpus": 2, "memory_mb": 4096, "pids": 512}))
+        assert sandbox_episode_resources(sandbox).pids == 512
 
-    def test_zero_memory_excluded(self) -> None:
-        assert "memory" not in AnyTerminalAgent._ray_resource_opts(self._params({"memory_mb": "0"}))
+    @pytest.mark.parametrize("missing", ["cpus", "memory_mb"])
+    def test_requires_every_task_resource_declaration(self, missing: str) -> None:
+        problem_info = {"cpus": 2, "memory_mb": 4096, "pids": 512}
+        problem_info.pop(missing)
+        with pytest.raises(ValueError, match=missing):
+            _episode_sandbox_resources(self._params(problem_info))
 
-    def test_gpus_set(self) -> None:
-        assert AnyTerminalAgent._ray_resource_opts(self._params({"gpus": "1"}))["num_gpus"] == 1.0
+    def test_global_pids_owner_fills_missing_task_declaration(self, monkeypatch) -> None:
+        monkeypatch.setenv("NEMO_GYM_SANDBOX_PIDS", "512")
+        sandbox = _episode_sandbox_resources(self._params({"cpus": 2, "memory_mb": 4096}))
+        assert sandbox_episode_resources(sandbox).pids == 512
 
-    def test_zero_gpus_excluded(self) -> None:
-        assert "num_gpus" not in AnyTerminalAgent._ray_resource_opts(self._params({"gpus": "0"}))
-
-    def test_invalid_cpus_defaults_to_one(self) -> None:
-        opts = AnyTerminalAgent._ray_resource_opts(self._params({"cpus": "not-a-number"}))
-        assert opts["num_cpus"] == 1
-
-    def test_none_cpus_defaults_to_one(self) -> None:
-        assert AnyTerminalAgent._ray_resource_opts(self._params({"cpus": None}))["num_cpus"] == 1
+    def test_rejects_fractional_cpu(self) -> None:
+        with pytest.raises(ValueError, match="cpus.*positive integer"):
+            _episode_sandbox_resources(self._params({"cpus": 2.5, "memory_mb": 4096, "pids": 512}))
 
 
 # ── GymAgentHarnessProcessor.setup ───────────────────────────────────────────────
@@ -683,6 +1068,34 @@ def _sandbox_result(return_code: int = 0, error_type: str | None = None) -> Simp
     return SimpleNamespace(stdout="", stderr="", return_code=return_code, error_type=error_type)
 
 
+@pytest.mark.parametrize(
+    "return_code,events,prefix,expected",
+    [
+        (137, {"sandbox_oom_kill": 2}, "sandbox", "verifier killed by the sandbox memory limit (exit 137, oom_kill 2)"),
+        (-9, {"sandbox_oom_kill": 1}, "sandbox", "verifier killed by the sandbox memory limit (exit -9, oom_kill 1)"),
+        (137, {"sandbox_oom_kill": 0}, "sandbox", None),  # a SIGKILL that is not the memory limit's
+        (137, {}, "sandbox", None),  # no retained events
+        (1, {"sandbox_oom_kill": 3}, "sandbox", None),  # a failing test beside a killed task subprocess
+        (0, {"sandbox_oom_kill": 3}, "sandbox", None),  # the verifier survived the kill
+        (None, {"sandbox_oom_kill": 3}, "sandbox", None),  # the verifier never ran
+        (
+            137,
+            {"sandbox_oom_kill": 0, "grader_sandbox_oom_kill": 1},
+            "grader_sandbox",
+            "verifier killed by the sandbox memory limit (exit 137, oom_kill 1)",
+        ),
+        (137, {"sandbox_oom_kill": 1, "grader_sandbox_oom_kill": 0}, "grader_sandbox", None),
+    ],
+)
+def test_verifier_memory_kill_needs_a_sigkill_exit_and_an_oom_kill_in_its_sandbox(
+    return_code, events, prefix, expected
+) -> None:
+    assert verifier_memory_kill(return_code, events, prefix) == expected
+    if prefix == "sandbox":
+        assert verifier_memory_kill(return_code, events) == expected
+        assert harness_memory_kill(return_code, events) == (expected and expected.replace("verifier", "agent harness"))
+
+
 class TestRunAgentEnv:
     def test_model_url_included_when_set(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path, model_server_url="http://model:8000")
@@ -705,6 +1118,115 @@ class TestRunAgentEnv:
         assert json.loads(env["NGTB_AGENT_KWARGS"]) == {"model": "my-model"}
 
 
+class TestTerminalResponseLabels:
+    def test_context_stop_keeps_partial_grade_and_typed_metadata(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        update_metrics(cfg.metrics_fpath, {"resolved": True})
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(
+            status="incomplete", metadata={"stop_reason": "context_exhausted"},
+        )))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        response = app._terminal_response(cfg)
+        assert response.metadata["stop_reason"] == "context_exhausted"
+        metrics = json.loads(response.metadata["metrics"])
+        assert metrics["resolved"] is True
+        assert metrics["mask_sample"] is False
+        assert metrics["agent_failed"] is False
+
+    def _response(self, **fields) -> dict:
+        return {
+            "id": "inner", "created_at": 0, "model": "inner-model", "object": "response", "output": [],
+            "parallel_tool_calls": True, "tool_choice": "auto", "tools": [], **fields,
+        }
+
+    def _labels(self, cfg: AnyTerminalInstanceConfig) -> dict:
+        response = app._terminal_response(cfg)
+        persisted = json.loads(cfg.metrics_fpath.read_text())
+        assert json.loads(response.metadata["metrics"]) == persisted
+        return {key: persisted.get(key) for key in ("agent_failed", "agent_error", "agent_exit_nonzero", "mask_sample")}
+
+    def test_inner_agent_error_label_is_kept(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(
+            json.dumps(self._response(status="completed", metadata={"agent_error": "RuntimeError"}))
+        )
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        assert self._labels(cfg) == {
+            "agent_failed": True, "agent_error": "RuntimeError", "agent_exit_nonzero": False, "mask_sample": False,
+        }
+
+    def test_inner_failed_status_and_nonzero_exit_are_labelled(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        error = {"code": "server_error", "message": "API call failed after 3 retries"}
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(status="failed", error=error)))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 1, "error_type": None}))
+        assert self._labels(cfg) == {
+            "agent_failed": True, "agent_error": "server_error", "agent_exit_nonzero": True, "mask_sample": False,
+        }
+        response = app._terminal_response(cfg)
+        assert response.status != "failed"
+        assert response.error is None
+
+    @pytest.mark.parametrize("index", [0, 1], ids=["pi-no-call-failure", "hermes-route-denial"])
+    def test_saved_harness_failures_are_masked_with_successful_process_exit(self, tmp_path: Path, index: int) -> None:
+        raw = json.loads((PARENT_DIR / "tests/unit_tests/fixtures/sandbox-harness-failures.json").read_text())[index]["response"]
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(raw))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        response = app._terminal_response(cfg)
+        assert response.status == "failed"
+        assert response.error is not None
+        assert json.loads(cfg.metrics_fpath.read_text())["mask_sample"] is True
+
+
+    def test_missing_response_is_labelled_unless_masked(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        assert self._labels(cfg)["agent_error"] == "response_missing"
+        masked = _make_instance_config(tmp_path / "masked")
+        update_metrics(masked.metrics_fpath, {"agent_timed_out": True})
+        assert self._labels(masked) == {
+            "agent_failed": False, "agent_error": None, "agent_exit_nonzero": False, "mask_sample": True,
+        }
+
+    def test_clean_run_carries_no_label(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(status="completed")))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        assert self._labels(cfg) == {
+            "agent_failed": False, "agent_error": None, "agent_exit_nonzero": False, "mask_sample": False,
+        }
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("fault", [None, "container_timed_out", "sandbox_failed", "mask_sample"])
+def test_timeout_response_keeps_independent_infrastructure_masked(tmp_path, enabled, fault):
+    cfg = _make_instance_config(tmp_path, agent_timeout_is_failure=enabled)
+    metrics = {"resolved": True, "agent_timed_out": True}
+    if fault:
+        metrics[fault] = True
+    update_metrics(cfg.metrics_fpath, metrics)
+    response = app._terminal_response(cfg)
+    observed = app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"])
+    assert observed.agent_timed_out is True
+    assert observed.resolved is (not enabled)
+    assert observed.mask_sample is (not enabled or fault is not None)
+    assert json.loads(response.metadata["instance_config"])["agent_timeout_is_failure"] is enabled
+
+
+def test_timeout_policy_is_strict_and_default_off(tmp_path):
+    assert _make_instance_config(tmp_path).agent_timeout_is_failure is False
+    with pytest.raises(ValidationError, match="agent_timeout_is_failure"):
+        _make_instance_config(tmp_path, agent_timeout_is_failure="true")
+
+
+@pytest.mark.parametrize("harness_exit,oom_kills,infra", [(137, 1, True), (137, 0, False), (0, 1, False)])
+def test_harness_oom_requires_both_process_exit_and_kernel_event(harness_exit, oom_kills, infra):
+    problem = harness_memory_kill(harness_exit, {"sandbox_oom_kill": oom_kills})
+    metrics = app.TerminalBenchMetrics(resolved=False, sandbox_failed=problem is not None)
+    metrics.apply_timeout_policy(agent_timeout_is_failure=True)
+    assert metrics.mask_sample is infra
+
+
 class TestProcessSingleDatapoint:
     @pytest.fixture(autouse=True)
     def _no_real_provider(self):
@@ -715,19 +1237,62 @@ class TestProcessSingleDatapoint:
 
     async def test_resolved_when_reward_positive(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path)
-        (cfg.verifier_dir / "reward.txt").write_text("1.0")
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.verifier_dir / "reward.txt").write_text("1.0")
+            return _sandbox_result()
 
         sandbox = SimpleNamespace(
             start=AsyncMock(),
-            exec=AsyncMock(return_value=_sandbox_result()),
+            exec=AsyncMock(side_effect=verifier),
             stop=AsyncMock(),
         )
-        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+        with patch(
+            "responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox
+        ) as sandbox_type:
             with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
                 result = await RunTerminalAgent(config=cfg).process_single_datapoint()
 
         assert result is True
-        assert json.loads(cfg.metrics_fpath.read_text())["resolved"] is True
+        sandbox_spec = sandbox_type.call_args.args[1]
+        assert sandbox_spec.resources.cpu == 2
+        assert sandbox_spec.resources.memory_mib == 4096 + cfg.agent_overhead_mb
+        assert sandbox_spec.resources.pids == 512
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["resolved"] is True
+        assert 0 < metrics["sandbox_ready_at"] <= metrics["grading_started_at"] <= metrics["grading_completed_at"]
+        timing = json.loads((cfg.verifier_dir / "grading-timing.json").read_text())
+        assert timing == {
+            "started_at": metrics["grading_started_at"],
+            "completed_at": metrics["grading_completed_at"],
+        }
+        sandbox.stop.assert_awaited_once()
+
+    async def test_receipt_permission_failure_closes_with_zero_and_flag(self, tmp_path: Path) -> None:
+        if os.geteuid() == 0:
+            pytest.skip("requires an unprivileged allocated worker")
+        cfg = _make_instance_config(tmp_path)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.verifier_dir / "reward.txt").write_text("1.0")
+                cfg.persistent_dir.chmod(0o500)
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=verifier), stop=AsyncMock())
+        try:
+            with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+                with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                    result = await RunTerminalAgent(config=cfg).process_single_datapoint()
+        finally:
+            cfg.persistent_dir.chmod(0o700)
+
+        assert result is False
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["verifier_integrity_refused"] is True
+        assert "PermissionError" in metrics["verifier_integrity_problem"]
+        assert metrics["mask_sample"] is False
         sandbox.stop.assert_awaited_once()
 
     async def test_unresolved_when_no_reward_file(self, tmp_path: Path) -> None:
@@ -742,6 +1307,187 @@ class TestProcessSingleDatapoint:
                 result = await RunTerminalAgent(config=cfg).process_single_datapoint()
 
         assert result is False
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        # test.sh writes 0 or 1: a completed eval without reward.txt is labelled, not masked.
+        assert metrics["verifier_reward_unreadable"] is True
+        assert metrics["mask_sample"] is False
+
+    async def test_unparsable_reward_is_labelled_not_masked(self, tmp_path: Path, capsys) -> None:
+        cfg = _make_instance_config(tmp_path)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.verifier_dir / "reward.txt").write_text("PASSED")
+            return _sandbox_result()
+        sandbox = SimpleNamespace(
+            start=AsyncMock(),
+            exec=AsyncMock(side_effect=verifier),
+            stop=AsyncMock(),
+        )
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                result = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        assert result is False
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["verifier_reward_unreadable"] is True
+        assert metrics["mask_sample"] is False
+        assert "without a readable reward.txt: ValueError" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "agent_return_code,oom_kill,infrastructure",
+        [(0, 1, False), (137, 2, True)],
+        ids=["tool-killed-agent-finished", "agent-killed-by-limit"],
+    )
+    async def test_sandbox_memory_kills_are_counted_and_only_a_killed_harness_is_infrastructure(
+        self, tmp_path: Path, agent_return_code: int, oom_kill: int, infrastructure: bool
+    ) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+
+        class RetainedEventsProvider:
+            """A provider whose sandbox cgroup kept memory.events at close, as the Apptainer provider does."""
+
+            closed = False
+            seen_oom = 0
+
+            async def create(self, spec):
+                return SandboxHandle(sandbox_id="box", provider_name="retained", raw=None)
+
+            async def exec(self, handle, command, **kwargs):
+                if "run-the-agent" in command:
+                    self.seen_oom = oom_kill
+                if "bash /tests/test.sh" in command:
+                    (cfg.verifier_dir / "reward.txt").write_text("1.0")
+                return SandboxExecResult("", "", agent_return_code if "run-the-agent" in command else 0, None)
+
+            async def close(self, handle):
+                self.closed = True
+
+            async def aclose(self):
+                pass
+
+            def memory_events(self, handle):
+                return {"max": 9 if self.seen_oom else 0, "oom": self.seen_oom, "oom_kill": self.seen_oom}
+
+            def retained_memory_events(self, handle):
+                assert self.closed, "events are read after the sandbox is stopped"
+                return {"low": 0, "high": 0, "max": 9, "oom": oom_kill, "oom_kill": oom_kill}
+
+        with patch(
+            "responses_api_agents.anyterminal_agent.app.AsyncSandbox",
+            side_effect=lambda provider, spec: AsyncSandbox(RetainedEventsProvider(), spec),
+        ):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                resolved = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert (metrics["sandbox_oom"], metrics["sandbox_oom_kill"], metrics["sandbox_memory_max_events"]) == (
+            oom_kill,
+            oom_kill,
+            9,
+        )
+        assert resolved is True
+        assert metrics["sandbox_failed"] is infrastructure
+        assert metrics["mask_sample"] is infrastructure
+        assert ("sandbox memory limit (exit 137, oom_kill 2)" in metrics.get("error_detail", "")) is infrastructure
+
+    @pytest.mark.parametrize(
+        "verifier_return_code,reward,oom_kill,infrastructure",
+        [(137, "1", 1, True), (-9, "1", 3, True), (1, "0", 0, False), (0, "0", 1, False)],
+        ids=[
+            "verifier-killed-after-writing-reward",
+            "verifier-runtime-killed-after-writing-reward",
+            "ordinary-failing-test",
+            "task-subprocess-killed-verifier-finished",
+        ],
+    )
+    @pytest.mark.parametrize("oom_phase", ["agent", "verifier", "unavailable"])
+    async def test_only_a_verifier_the_memory_limit_killed_is_infrastructure(
+        self, tmp_path: Path, verifier_return_code: int, reward: str, oom_kill: int, infrastructure: bool, oom_phase: str
+    ) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+
+        class VerifierProvider:
+            """A provider whose verifier writes its reward and then exits with the given status."""
+
+            closed = False
+            seen_oom = 0
+
+            async def create(self, spec):
+                return SandboxHandle(sandbox_id="box", provider_name="retained", raw=None)
+
+            async def exec(self, handle, command, **kwargs):
+                if "run-the-agent" in command and oom_phase == "agent":
+                    self.seen_oom = oom_kill
+                if "bash /tests/test.sh" in command:
+                    if oom_phase == "verifier":
+                        self.seen_oom = oom_kill
+                    (cfg.verifier_dir / "reward.txt").write_text(reward)
+                    return SandboxExecResult("", "", verifier_return_code, None)
+                return SandboxExecResult("", "", 0, None)
+
+            async def close(self, handle):
+                self.closed = True
+
+            async def aclose(self):
+                pass
+
+            def memory_events(self, handle):
+                if oom_phase == "unavailable":
+                    return {}
+                return {"max": 4 * self.seen_oom, "oom": self.seen_oom, "oom_kill": self.seen_oom}
+
+            def retained_memory_events(self, handle):
+                assert self.closed, "events are read after the sandbox is stopped"
+                return {"low": 0, "high": 0, "max": 4 * oom_kill, "oom": oom_kill, "oom_kill": oom_kill}
+
+        with patch(
+            "responses_api_agents.anyterminal_agent.app.AsyncSandbox",
+            side_effect=lambda provider, spec: AsyncSandbox(VerifierProvider(), spec),
+        ):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                resolved = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        # Reward reading is unchanged; the mask is what keeps an incomplete grade out of training.
+        assert resolved is (reward == "1")
+        assert metrics["resolved"] is (reward == "1")
+        assert metrics["verifier_return_code"] == verifier_return_code
+        assert "verifier_error_type" not in metrics  # None: an ordinary exit, no runtime marker
+        assert metrics["sandbox_oom_kill"] == oom_kill
+        assert metrics["verifier_reward_unreadable"] is False
+        assert metrics["container_timed_out"] is False
+        assert metrics["sandbox_failed"] is infrastructure
+        assert metrics["mask_sample"] is infrastructure
+        if infrastructure and oom_phase == "verifier":
+            assert metrics["error_detail"] == (
+                f"verifier killed by the sandbox memory limit (exit {verifier_return_code}, oom_kill {oom_kill})"
+            )
+            assert metrics["memory_failure_phase"] == "verifier"
+        elif infrastructure:
+            assert metrics["error_detail"] == "verifier SIGKILL with sandbox OOM history; execution phase UNKNOWN"
+            assert metrics["memory_failure_phase"] == "unknown"
+        else:
+            assert "error_detail" not in metrics
+        if oom_phase != "unavailable":
+            assert metrics["verifier_phase_memory_events"]["sandbox_oom_kill"] == (
+                oom_kill if oom_phase == "verifier" else 0
+            )
+
+    @pytest.mark.parametrize(
+        "return_code,error_type,failed",
+        [(0, None, False), (137, None, False), (-1, "sandbox", False), (-1, "timeout", True)],
+    )
+    async def test_run_eval_returns_the_verifier_status(
+        self, tmp_path: Path, return_code: int, error_type: str | None, failed: bool
+    ) -> None:
+        cfg = _make_instance_config(tmp_path)
+        sandbox = SimpleNamespace(exec=AsyncMock(return_value=_sandbox_result(return_code, error_type)))
+        elapsed, timed_out_or_sandbox, got_return_code, got_error_type = await RunTerminalAgent(
+            config=cfg
+        )._run_eval(sandbox, cfg)
+        assert elapsed >= 0
+        assert (timed_out_or_sandbox, got_return_code, got_error_type) == (failed, return_code, error_type)
 
     async def test_agent_timeout_sets_flag_and_masks(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path)
@@ -757,11 +1503,11 @@ class TestProcessSingleDatapoint:
         metrics = json.loads(cfg.metrics_fpath.read_text())
         assert metrics["agent_timed_out"] is True
         assert metrics["mask_sample"] is True
+        assert metrics["verifier_reward_unreadable"] is False
 
     async def test_container_killed_mid_run_sets_flag_and_masks(self, tmp_path: Path) -> None:
         # exec() on a container the TTL already removed returns error_type="sandbox" without
-        # raising, so this must be caught the same way a "timeout" is, not just via the
-        # except-block sandbox_failed path (which never fires here).
+        # raising. Keep it masked as sandbox failure without inventing a timeout.
         cfg = _make_instance_config(tmp_path)
         sandbox = SimpleNamespace(
             start=AsyncMock(),
@@ -773,8 +1519,32 @@ class TestProcessSingleDatapoint:
                 await RunTerminalAgent(config=cfg).process_single_datapoint()
 
         metrics = json.loads(cfg.metrics_fpath.read_text())
-        assert metrics["agent_timed_out"] is True
-        assert metrics["sandbox_failed"] is False
+        assert metrics["agent_timed_out"] is False
+        assert metrics["container_timed_out"] is False
+        assert metrics["sandbox_failed"] is True
+        assert metrics["mask_sample"] is True
+
+    async def test_metrics_file_removed_mid_episode_is_still_recorded(self, tmp_path: Path) -> None:
+        # Production shape: the instance's results directory went away under the episode, so
+        # update_metrics raised FileNotFoundError out of the Ray task and the row came back as a
+        # 500 with no agent result. The sample has to arrive masked and unresolved instead.
+        cfg = _make_instance_config(tmp_path)
+
+        async def _stop_and_lose_the_directory() -> None:
+            cfg.metrics_fpath.unlink()
+
+        sandbox = SimpleNamespace(
+            start=AsyncMock(),
+            exec=AsyncMock(return_value=_sandbox_result(return_code=125, error_type="sandbox")),
+            stop=AsyncMock(side_effect=_stop_and_lose_the_directory),
+        )
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                result = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        assert result is False
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["sandbox_failed"] is True
         assert metrics["mask_sample"] is True
 
     async def test_sandbox_start_failure_is_isolated(self, tmp_path: Path) -> None:
@@ -843,12 +1613,13 @@ class TestProcessSingleDatapoint:
         assert any("curl -fsSL" in command and "relay.example/runtime.tar.gz" in command for command in commands)
         assert any("tar -xzf" in command for command in commands)
 
-    async def test_stops_sandbox_even_on_eval_timeout(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("verifier_error", ["timeout", "sandbox"])
+    async def test_stops_sandbox_even_on_eval_timeout(self, tmp_path: Path, verifier_error: str) -> None:
         cfg = _make_instance_config(tmp_path)
         # First exec (agent) succeeds, second exec (eval) times out.
         sandbox = SimpleNamespace(
             start=AsyncMock(),
-            exec=AsyncMock(side_effect=[_sandbox_result(), _sandbox_result(return_code=124, error_type="timeout")]),
+            exec=AsyncMock(side_effect=[_sandbox_result(), _sandbox_result(return_code=124, error_type=verifier_error)]),
             stop=AsyncMock(),
         )
         with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
@@ -856,7 +1627,9 @@ class TestProcessSingleDatapoint:
                 await RunTerminalAgent(config=cfg).process_single_datapoint()
 
         metrics = json.loads(cfg.metrics_fpath.read_text())
-        assert metrics["container_timed_out"] is True
+        assert metrics["container_timed_out"] is (verifier_error == "timeout")
+        assert metrics["sandbox_failed"] is (verifier_error == "sandbox")
+        assert metrics["mask_sample"] is True
         sandbox.stop.assert_awaited_once()
 
 
@@ -888,3 +1661,57 @@ class TestStageTests:
 
         assert not (staging_tests / "stale.sh").exists()
         assert (staging_tests / "fresh.sh").exists()
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_fakeroot_command_selection_is_task_scoped(tmp_path, monkeypatch, selected):
+    monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: "/usr/bin/apptainer")
+    cfg = _make_instance_config(tmp_path, sandbox_provider={"apptainer": {}},
+        apptainer_ignore_fakeroot_command_tasks={"selected"})
+    cfg.problem_info["task_name"] = "selected" if selected else "ordinary"
+    provider = _build_provider(cfg)
+    assert ("--ignore-fakeroot-command" in provider._create_config.extra_start_args) is selected
+
+
+@pytest.mark.parametrize("provider", ["apptainer", "docker"])
+def test_prepared_runtime_is_selected_without_install(tmp_path, provider):
+    runtime = tmp_path / "prepared"
+    (runtime / "bin").mkdir(parents=True)
+    python = runtime / "bin/python"
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    config = _config(model_server=None, sandbox_provider={provider: {}},
+                     agent_runtime_source=str(runtime), results_dir=tmp_path / "results")
+    with patch.object(GymAgentHarnessProcessor, "setup", side_effect=AssertionError("unexpected install")):
+        agent = AnyTerminalAgent(config=config, server_client=ServerClient.model_construct(global_config_dict={}))
+    assert agent._server.agent_deps_dir == runtime.resolve()
+    assert agent._server.agent_deps_archive is None
+    assert agent._server.agent_deps_url is None
+
+
+@pytest.mark.parametrize("kind", ["missing", "relative", "no_python", "not_executable"])
+def test_invalid_prepared_runtime_fails_before_install(tmp_path, kind):
+    runtime = tmp_path / "prepared"
+    runtime.mkdir()
+    if kind == "missing":
+        runtime = tmp_path / "absent"
+    elif kind == "relative":
+        runtime = Path("relative-runtime")
+    elif kind == "not_executable":
+        (runtime / "bin").mkdir()
+        (runtime / "bin/python").write_text("not executable")
+    config = _config(model_server=None, sandbox_provider={"apptainer": {}},
+                     agent_runtime_source=str(runtime), results_dir=tmp_path / "results")
+    with patch.object(GymAgentHarnessProcessor, "setup", side_effect=AssertionError("unexpected install")):
+        with pytest.raises(ValueError, match="prepared"):
+            AnyTerminalAgent(config=config, server_client=ServerClient.model_construct(global_config_dict={}))
+
+
+@pytest.mark.parametrize("args", [["--no-mount", "bind-paths"], ["--no-mount=bind-paths"]])
+def test_apptainer_preserves_existing_mount_exclusions(tmp_path, monkeypatch, args):
+    monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: "/usr/bin/apptainer")
+    cfg = _make_instance_config(tmp_path, sandbox_provider={"apptainer": {"create": {"extra_start_args": args}}})
+    provider = _build_provider(cfg)
+    actual = provider._create_config.extra_start_args
+    assert any("bind-paths,home,tmp" in value for value in actual)
+    assert args in (["--no-mount", "bind-paths"], ["--no-mount=bind-paths"])

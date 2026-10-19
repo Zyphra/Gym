@@ -96,6 +96,34 @@ def test_orjson_dispatch_response_preserves_existing_response():
     assert _orjson_dispatch_response(existing_response) is existing_response
 
 
+def test_orjson_dispatch_response_preserves_wire_aliases():
+    content = NeMoGymResponse(
+        id="resp_123",
+        created_at=1,
+        model="judge",
+        object="response",
+        output=[],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "verdict",
+                "schema": {"type": "object"},
+                "strict": True,
+            }
+        },
+    )
+
+    response = _orjson_dispatch_response(content)
+    payload = orjson.loads(response.body)
+
+    assert payload["text"]["format"]["schema"] == {"type": "object"}
+    assert "schema_" not in payload["text"]["format"]
+    assert NeMoGymResponse.model_validate(payload) == content
+
+
 def _capture_config(tmp_path, *, enabled: bool = True) -> ModelCallCaptureConfig:
     return ModelCallCaptureConfig(
         observability_enabled=enabled,
@@ -695,6 +723,21 @@ def test_model_call_capture_keys_are_reserved_global_config():
     assert {"observability_enabled", "model_call_capture_dir", "token_id_capture"} <= set(
         NEMO_GYM_RESERVED_TOP_LEVEL_KEYS
     )
+    assert "model_call_capture_enabled" in NEMO_GYM_RESERVED_TOP_LEVEL_KEYS
+
+
+def test_model_call_capture_store_can_be_disabled_under_observability():
+    from nemo_gym.base_responses_api_model import (
+        model_call_capture_dirs_from_config,
+        observability_enabled_from_config,
+    )
+
+    global_config = OmegaConf.create({"observability_enabled": True, "model_call_capture_enabled": False})
+    config = ModelCallCaptureConfig.model_validate(global_config)
+    assert config.observability_enabled and not config.capture_store_enabled
+    assert make_capture_store(config) is None
+    assert model_call_capture_dirs_from_config(global_config) == []
+    assert observability_enabled_from_config(global_config) is True
 
 
 def test_model_call_capture_config_requires_absolute_dir_when_enabled(tmp_path, monkeypatch):

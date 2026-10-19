@@ -32,6 +32,7 @@ from tenacity import (
 )
 
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from responses_api_agents.terminus_2_agent.context_budget import record_served_context
 
 
 _RoutedExperts = list[list[list[int]]] | str
@@ -69,6 +70,7 @@ class NemoGymLLM(BaseLLM):
         self._api_base = api_base.rstrip("/")
         self._collect_rollout_details = collect_rollout_details
         self._model_info = model_info or {}
+        self._served_context_tokens: dict[tuple[int, bytes], int] = {}
         self._timeout_sec = timeout_sec
 
         # Persistent HTTP client, reused across every turn of the episode. The Gym
@@ -197,6 +199,8 @@ class NemoGymLLM(BaseLLM):
                 reasoning_content = parts[0]
                 content = parts[1] if len(parts) > 1 else ""
 
+        usage = self._extract_usage_info(response_dict)
+        record_served_context(self, messages, content, usage)
         if isinstance(choice, dict) and choice.get("finish_reason") == "length":
             raise OutputLengthExceededError(
                 f"Model {self._model_name} hit max_tokens limit. "
@@ -204,7 +208,6 @@ class NemoGymLLM(BaseLLM):
                 truncated_response=content,
             )
 
-        usage = self._extract_usage_info(response_dict)
         prompt_token_ids = None
         completion_token_ids = None
         logprobs = None
@@ -242,6 +245,10 @@ class NemoGymLLM(BaseLLM):
                 max_input_tokens = self._model_info.get("max_tokens")
 
             if isinstance(max_input_tokens, int) and max_input_tokens > 0:
+                joint = self._model_info.get("max_context_tokens")
+                output = self.get_model_output_limit()
+                if isinstance(joint, int) and joint > 0 and output is not None:
+                    return min(max_input_tokens, max(0, joint - output))
                 return max_input_tokens
 
             self._logger.warning(

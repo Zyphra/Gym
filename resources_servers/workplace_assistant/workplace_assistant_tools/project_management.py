@@ -17,6 +17,8 @@ import re
 
 import pandas as pd
 
+from resources_servers.workplace_assistant.workplace_assistant_tools._csv import read_csv
+
 
 class ProjectManagementTool:
     def __init__(self):
@@ -25,7 +27,7 @@ class ProjectManagementTool:
     def reset_state(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         data_path = os.path.join(current_dir, "..", "csv_data", "processed", "project_tasks.csv")
-        self._project_tasks = pd.read_csv(data_path, dtype=str)
+        self._project_tasks = read_csv(data_path, dtype=str)
 
     def get_task_information_by_id(self, task_id=None, field=None):
         if not task_id:
