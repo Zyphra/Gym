@@ -155,7 +155,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             new_body = body.model_copy(update={"input": body.input + new_outputs})
             final_answer_turn = bool(self.config.final_answer_after_max_steps and step > self.config.max_steps)
             if final_answer_turn:
-                new_body.tools = []
+                # Keep the offered tools: they render into the prompt, and the
+                # final turn must extend the same context. Only forbid calls.
                 new_body.tool_choice = "none"
             if collect_trajectory:
                 turn_timestamp = time()
@@ -264,7 +265,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         url_path=f"/{output_function_call.name}",
                         json=parsed_arguments,
                         headers={
-                            FAILURE_ROLLOUT_HEADER: failure_log_metadata(current_rollout_id() or (rollout_id if rollout_id != "unscoped" else None)),
+                            FAILURE_ROLLOUT_HEADER: failure_log_metadata(
+                                current_rollout_id() or (rollout_id if rollout_id != "unscoped" else None)
+                            ),
                             FAILURE_TOOL_CALL_HEADER: failure_log_metadata(output_function_call.call_id),
                         },
                         cookies=resources_server_cookies,
