@@ -153,9 +153,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         while True:
             step += 1
             new_body = body.model_copy(update={"input": body.input + new_outputs})
-            final_answer_turn = bool(
-                self.config.final_answer_after_max_steps and step > self.config.max_steps
-            )
+            final_answer_turn = bool(self.config.final_answer_after_max_steps and step > self.config.max_steps)
             if final_answer_turn:
                 # Keep the offered tools: they render into the prompt, and the
                 # final turn must extend the same context. Only forbid calls.
@@ -251,7 +249,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 except (_UnpresentedToolError, _FinalAnswerToolError) as e:
                     tool_output = json.dumps({"error": str(e)})
                     if collect_trajectory:
-                        error_type = "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
+                        error_type = (
+                            "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
+                        )
                         tool_status = "failed"
                 except (json.JSONDecodeError, TypeError) as e:
                     tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})
@@ -265,7 +265,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         url_path=f"/{output_function_call.name}",
                         json=parsed_arguments,
                         headers={
-                            FAILURE_ROLLOUT_HEADER: failure_log_metadata(current_rollout_id() or (rollout_id if rollout_id != "unscoped" else None)),
+                            FAILURE_ROLLOUT_HEADER: failure_log_metadata(
+                                current_rollout_id() or (rollout_id if rollout_id != "unscoped" else None)
+                            ),
                             FAILURE_TOOL_CALL_HEADER: failure_log_metadata(output_function_call.call_id),
                         },
                         cookies=resources_server_cookies,

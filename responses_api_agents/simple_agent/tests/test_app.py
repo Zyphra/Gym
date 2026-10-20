@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from omegaconf import OmegaConf
 from pytest import MonkeyPatch
 
+from nemo_gym import server_utils
 from nemo_gym.config_types import BaseServerConfig
 from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
 from nemo_gym.openai_utils import (
@@ -38,7 +39,6 @@ from nemo_gym.openai_utils import (
 from nemo_gym.rollout_collection import _attach_trajectory_record
 from nemo_gym.rollout_observability import TrajectoryRecord
 from nemo_gym.server_utils import ServerClient
-from nemo_gym import server_utils
 from responses_api_agents.simple_agent.app import (
     ModelServerRef,
     ResourcesServerRef,
@@ -1133,7 +1133,9 @@ async def test_run_context_exhaustion_uses_real_http_and_provider_state(
             assert result["reward"] == successful_turns / 2
             assert result["response"]["status"] == "incomplete"
             assert result["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
-            assert [item["type"] for item in result["response"]["output"]].count("function_call_output") == successful_turns
+            assert [item["type"] for item in result["response"]["output"]].count(
+                "function_call_output"
+            ) == successful_turns
             expected_units = sum(range(1, successful_turns + 1))
             assert result["response"]["usage"]["input_tokens"] == 100 * expected_units
             assert result["response"]["usage"]["output_tokens"] == 10 * expected_units
