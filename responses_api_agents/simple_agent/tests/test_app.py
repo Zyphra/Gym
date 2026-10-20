@@ -1155,3 +1155,88 @@ async def test_run_context_exhaustion_uses_real_http_and_provider_state(
         await asyncio.wait_for(server_task, timeout=5)
         await gym_session.close()
         await upstream_runner.cleanup()
+
+
+def test_final_answer_turn_keeps_the_offered_tools_and_forbids_calls() -> None:
+    """The final turn must extend the same prompt: tools stay, only calls are forbidden."""
+    config = SimpleAgentConfig(
+        host="0.0.0.0",
+        port=8080,
+        entrypoint="",
+        name="",
+        model_server=ModelServerRef(type="responses_api_models", name="model"),
+        resources_server=ResourcesServerRef(type="resources_servers", name="resources"),
+        max_steps=1,
+        final_answer_after_max_steps=True,
+    )
+    server = SimpleAgent(config=config, server_client=MagicMock(spec=ServerClient))
+    client = TestClient(server.setup_webserver())
+    tools = [
+        {
+            "type": "function",
+            "name": "execute_python",
+            "description": "Run Python.",
+            "parameters": {"type": "object", "properties": {"code": {"type": "string"}}},
+            "strict": False,
+        }
+    ]
+
+    def response(output, tool_choice):
+        return {
+            "id": "resp",
+            "created_at": 1.0,
+            "model": "dummy_model",
+            "object": "response",
+            "output": output,
+            "parallel_tool_calls": False,
+            "tool_choice": tool_choice,
+            "tools": tools,
+        }
+
+    tool_call = response(
+        [
+            {
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "execute_python",
+                "arguments": '{"code": "print(42)"}',
+                "type": "function_call",
+                "status": "completed",
+            }
+        ],
+        "auto",
+    )
+    final = response(
+        [
+            {
+                "id": "msg_final",
+                "content": [{"annotations": [], "text": "\\boxed{42}", "type": "output_text"}],
+                "role": "assistant",
+                "status": "completed",
+                "type": "message",
+            }
+        ],
+        "none",
+    )
+    reply = AsyncMock()
+    reply.read.side_effect = [json.dumps(tool_call), json.dumps(final)]
+    reply.content.read = AsyncMock(return_value=b'{"stdout": "42"}')
+    reply.cookies = MagicMock()
+    reply.status = 200
+    reply.ok = True
+    server.server_client.post.return_value = reply
+
+    res = client.post(
+        "/v1/responses",
+        json={"input": [{"role": "user", "content": "Compute 6*7."}], "tools": tools},
+    )
+    assert res.status_code == 200, res.text
+    calls = [c.kwargs for c in server.server_client.post.call_args_list]
+    assert [c["server_name"] for c in calls] == ["model", "resources", "model"]
+    first, last = calls[0]["json"], calls[2]["json"]
+    assert [t.model_dump() if hasattr(t, "model_dump") else t for t in last.tools] == [
+        t.model_dump() if hasattr(t, "model_dump") else t for t in first.tools
+    ]
+    assert len(last.tools) == 1
+    assert last.tool_choice == "none"
+    assert res.json()["output"][-1]["content"][0]["text"] == "\\boxed{42}"

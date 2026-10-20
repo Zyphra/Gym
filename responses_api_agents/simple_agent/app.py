@@ -157,7 +157,8 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 self.config.final_answer_after_max_steps and step > self.config.max_steps
             )
             if final_answer_turn:
-                new_body.tools = []
+                # Keep the offered tools: they render into the prompt, and the
+                # final turn must extend the same context. Only forbid calls.
                 new_body.tool_choice = "none"
             if collect_trajectory:
                 turn_timestamp = time()
