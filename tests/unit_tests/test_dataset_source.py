@@ -178,7 +178,7 @@ class TestDatasetSource:
         dumped = original.model_dump_json(exclude_unset=exclude_unset)
         source_fields = json.loads(dumped)
         if original.source is not None:
-            assert source_fields["source"] == original.source.model_dump(mode="json")
+            assert source_fields["source"] == original.source.model_dump(mode="json", exclude_unset=exclude_unset)
             assert "gitlab_identifier" not in source_fields
             assert "huggingface_identifier" not in source_fields
         if original.huggingface_identifier is not None:
