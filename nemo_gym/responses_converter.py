@@ -167,6 +167,12 @@ class ResponsesConverter(BaseModel):
     ) -> NeMoGymChatCompletionCreateParamsNonStreaming:
         responses_create_params = responses_create_params.model_dump(exclude_none=True, exclude_unset=True)
 
+        # `include` names extra output data to attach to the response. An empty list asks for
+        # nothing, so it is the same request as an absent field (the Codex CLI sends it on every
+        # turn). Any requested value still has no Chat Completions representation and is rejected.
+        if responses_create_params.get("include") == []:
+            del responses_create_params["include"]
+
         unsupported_fields = sorted(
             {
                 "background",
