@@ -28,10 +28,17 @@ gets the exact served content back. A turn matches when it is an assistant
 message with the same ``tool_use`` ids and tool names in the same order, and its
 blocks are the served blocks in served order, some possibly left out. Every
 difference is written to the rollout's restore log, classified as
-``cd_strip``, ``schema_default_fill``, ``whitespace``, ``name_truncation`` or
-``other``. ``name_truncation`` is Claude Code cutting a tool name longer than 200
-characters (a model-made name no tool has) to its first 200; ids and order still
-have to match.
+``cd_strip``, ``schema_default_fill``, ``whitespace``, ``name_truncation``,
+``name_case`` or ``other``. ``name_truncation`` is Claude Code cutting a tool name
+longer than 200 characters (a model-made name no tool has) to its first 200; ids
+and order still have to match.
+
+Claude Code also refuses a tool name that differs from an offered tool only in case
+(``bash`` for ``Bash``). ``repair_tool_name_case`` gives the client a served turn with
+each such name renamed to the one offered tool it matches, while the record keeps the
+name the backend served; the echo of that turn is restored to it and logged as
+``name_case``. A name the request offers, a name no tool matches and a name that
+matches several tools are never renamed.
 
 Claude Code also drops a served turn that presents nothing (no tool call, no
 visible text; reasoning only) or that stopped at the output token limit, and appends
@@ -169,12 +176,49 @@ def _same_or_truncated_name(served: Any, echoed: Any) -> bool:
     )
 
 
+def _case_repaired_name(served: Any, echoed: Any) -> bool:
+    """``echoed`` is ``served`` with only its case changed (``repair_tool_name_case``)."""
+    return (
+        isinstance(served, str)
+        and isinstance(echoed, str)
+        and served != echoed
+        and served.casefold() == echoed.casefold()
+    )
+
+
+def repair_tool_name_case(
+    anthropic_response: Mapping[str, Any], tools: Any
+) -> tuple[Mapping[str, Any], list[dict[str, Any]]]:
+    """``anthropic_response`` with each ``tool_use`` name the request's ``tools`` do not offer, but
+    that differs from exactly one offered name only in case, renamed to that name; and one
+    ``{"id", "served", "sent"}`` entry per rename. Without a rename the response is returned as
+    is; the response passed in is never changed."""
+    offered = {tool["name"] for tool in tools or [] if isinstance(tool, Mapping) and isinstance(tool.get("name"), str)}
+    by_case: dict[str, list[str]] = {}
+    for name in offered:
+        by_case.setdefault(name.casefold(), []).append(name)
+    content = list(anthropic_response.get("content") or [])
+    renamed = []
+    for index, block in enumerate(content):
+        name = block.get("name") if isinstance(block, Mapping) and block.get("type") == "tool_use" else None
+        if not isinstance(name, str) or name in offered:
+            continue
+        matches = by_case.get(name.casefold(), [])
+        if len(matches) == 1:
+            content[index] = {**block, "name": matches[0]}
+            renamed.append({"id": block.get("id"), "served": name, "sent": matches[0]})
+    if not renamed:
+        return anthropic_response, []
+    return {**anthropic_response, "content": content}, renamed
+
+
 def _align(served: list, echoed: list) -> Optional[list[Optional[int]]]:
     """For each served block, the index of its echo, or None when the echo left it out.
 
     The echo matches when it keeps every served ``tool_use`` (same id, same order, and the
-    same name or Claude Code's 200-character cut of it) and, between them, the served
-    blocks in served order with some left out. Otherwise None.
+    same name, Claude Code's 200-character cut of it or the name with only its case
+    changed) and, between them, the served blocks in served order with some left out.
+    Otherwise None.
     """
     served_tools = [index for index, block in enumerate(served) if block.get("type") == "tool_use"]
     echoed_tools = [
@@ -185,7 +229,8 @@ def _align(served: list, echoed: list) -> Optional[list[Optional[int]]]:
     for served_index, echoed_index in zip(served_tools, echoed_tools):
         if served[served_index].get("id") != echoed[echoed_index].get("id"):
             return None
-        if not _same_or_truncated_name(served[served_index].get("name"), echoed[echoed_index].get("name")):
+        served_name, echoed_name = served[served_index].get("name"), echoed[echoed_index].get("name")
+        if not (_same_or_truncated_name(served_name, echoed_name) or _case_repaired_name(served_name, echoed_name)):
             return None
     mapping: list[Optional[int]] = []
     served_start = echoed_start = 0
@@ -285,14 +330,19 @@ def _differences(served: list, echoed: list, mapping: list, defaults: Mapping[st
                 )
             for key in sorted((set(base) | set(echo)) - {"input"}):
                 if base.get(key) != echo.get(key):
-                    truncated = key == "name" and _same_or_truncated_name(base.get(key), echo.get(key))
+                    if key == "name" and _same_or_truncated_name(base.get(key), echo.get(key)):
+                        name_kind = "name_truncation"
+                    elif key == "name" and _case_repaired_name(base.get(key), echo.get(key)):
+                        name_kind = "name_case"
+                    else:
+                        name_kind = "other"
                     found.append(
                         {
                             "block": index,
                             "type": "tool_use",
                             "field": key,
                             "change": "changed",
-                            "kind": "name_truncation" if truncated else "other",
+                            "kind": name_kind,
                             "served": base.get(key),
                             "echoed": echo.get(key),
                         }

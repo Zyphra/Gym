@@ -47,7 +47,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from nemo_gym.anthropic_converter import AnthropicConverter
-from nemo_gym.anthropic_tool_echo import record_served_turn, restore_served_turns, store_for
+from nemo_gym.anthropic_tool_echo import record_served_turn, repair_tool_name_case, restore_served_turns, store_for
 from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_chat_completion_sse
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT, ModelServerRef
 from nemo_gym.openai_utils import (
@@ -216,6 +216,10 @@ class BaseResponsesAPIModelConfig(BaseRunServerInstanceConfig):
     # conversion, so a non-Claude backend never sees it. Only exact copies of the CLI's fixed
     # identity strings are dropped; every other system block passes through unchanged.
     anthropic_drop_client_identity: bool = False
+    # Give a /v1/messages client each served tool_use name that differs from exactly one offered
+    # tool only in case renamed to that tool (the policy wrote ``bash``, the request offers
+    # ``Bash``). The served name is recorded, so the client's echo is restored to it.
+    anthropic_tool_name_case_repair: bool = False
 
 
 class BaseResponsesAPIModel(BaseServer):
@@ -383,7 +387,10 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         the backend is the one it served; each difference goes to the rollout's restore log.
         Turns that match no served turn, and user and ``tool_result`` content, pass through
         (``nemo_gym.anthropic_tool_echo``). With ``anthropic_drop_client_identity``, the
-        CLI's fixed identity system block is dropped first (``drop_client_identity``).
+        CLI's fixed identity system block is dropped first (``drop_client_identity``). With
+        ``anthropic_tool_name_case_repair``, the client gets a tool name that differs from one
+        offered tool only in case as that tool's name (``repair_tool_name_case``); the record
+        keeps the served name.
         """
         _reject_external_capture_streaming(body)
         if getattr(self.config, "anthropic_drop_client_identity", False):
@@ -400,6 +407,10 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         model_name = body.get("model") or response.model
         anthropic_response = _ANTHROPIC_CONVERTER.responses_to_anthropic_response(response, model=model_name)
         record_served_turn(anthropic_response, served_turns, rollout_id, request_length=request_length)
+        if getattr(self.config, "anthropic_tool_name_case_repair", False):
+            anthropic_response, renamed = repair_tool_name_case(anthropic_response, body.get("tools"))
+            if renamed:
+                logger.debug("renamed %d served tool name(s) to the offered case: %s", len(renamed), renamed)
         if body.get("stream"):
             return StreamingResponse(
                 _ANTHROPIC_CONVERTER.anthropic_response_to_sse(anthropic_response),

@@ -167,8 +167,12 @@ def private_store(tmp_path, monkeypatch):
     return tmp_path / "served"
 
 
-def _server(script: list, name: str = "policy_model", port: int = 8099) -> tuple[TestClient, _ScriptedModel]:
-    config = BaseResponsesAPIModelConfig(host="127.0.0.1", port=port, entrypoint="", name=name)
+def _server(
+    script: list, name: str = "policy_model", port: int = 8099, case_repair: bool = False
+) -> tuple[TestClient, _ScriptedModel]:
+    config = BaseResponsesAPIModelConfig(
+        host="127.0.0.1", port=port, entrypoint="", name=name, anthropic_tool_name_case_repair=case_repair
+    )
     server = _ScriptedModel(
         config=config, server_client=MagicMock(spec=ServerClient, global_config_dict={}), script=list(script)
     )
@@ -553,6 +557,59 @@ class TestToolNameTruncation:
         assert tool_echo._same_or_truncated_name("Bash", "Bash")
         assert not tool_echo._same_or_truncated_name("Bash", "Bas")
         assert not tool_echo._same_or_truncated_name("b" * 200, "b" * 199)
+
+
+class TestToolNameCase:
+    """A served tool name that differs from one offered tool only in case reaches the client as that tool."""
+
+    @staticmethod
+    def _client_names(response) -> list:
+        return [block["name"] for block in response.json()["content"] if block["type"] == "tool_use"]
+
+    def test_the_client_gets_the_offered_name_and_the_backend_gets_the_served_one(self, private_store) -> None:
+        client, server = _server([_turn(("tool", "call_1", "bash", {"command": "ls"}))], case_repair=True)
+        assert self._client_names(_post(client, [TASK], stream=False)) == ["Bash"]
+        _post(client, _history([_tool("call_1", "Bash", {"command": "ls"})]))
+        (call,) = [item for item in _backend_input(server) if item.get("type") == "function_call"]
+        assert call["name"] == "bash"
+        (entry,) = _restore_log(private_store)
+        assert entry["counts"] == {"name_case": 1}
+        assert entry["differences"][0]["served"] == "bash" and entry["differences"][0]["echoed"] == "Bash"
+
+    def test_the_streamed_turn_carries_the_offered_name(self) -> None:
+        client, _ = _server([_turn(("tool", "call_1", "bash", {"command": "ls"}))], case_repair=True)
+        streamed = _post(client, [TASK]).text
+        assert '"Bash"' in streamed and '"bash"' not in streamed
+
+    @pytest.mark.parametrize("name", ["Bash", "Done", "bash_tool"])
+    def test_an_offered_or_unmatched_name_is_sent_as_served(self, name) -> None:
+        client, _ = _server([_turn(("tool", "call_1", name, {"command": "ls"}))], case_repair=True)
+        assert self._client_names(_post(client, [TASK], stream=False)) == [name]
+
+    def test_off_by_default(self) -> None:
+        client, _ = _server([_turn(("tool", "call_1", "bash", {"command": "ls"}))])
+        assert self._client_names(_post(client, [TASK], stream=False)) == ["bash"]
+
+    def test_a_name_matching_several_offered_tools_is_not_renamed(self) -> None:
+        served = {"content": [_tool("call_1", "read", {})], "stop_reason": "tool_use"}
+        tools = [{"name": "Read"}, {"name": "READ"}, {"name": "Bash"}]
+        assert tool_echo.repair_tool_name_case(served, tools) == (served, [])
+
+    def test_only_the_mismatched_block_is_renamed_and_the_input_is_unchanged(self) -> None:
+        served = {"content": [_tool("call_1", "Read", {}), _tool("call_2", "bash", {"command": "ls"})]}
+        original = copy.deepcopy(served)
+        repaired, renamed = tool_echo.repair_tool_name_case(served, TOOLS)
+        assert [block["name"] for block in repaired["content"]] == ["Read", "Bash"]
+        assert renamed == [{"id": "call_2", "served": "bash", "sent": "Bash"}]
+        assert served == original
+
+    def test_an_echo_with_any_other_name_change_still_passes_through(self, private_store) -> None:
+        client, server = _server([_turn(("tool", "call_1", "bash", {"command": "ls"}))], case_repair=True)
+        _post(client, [TASK])
+        _post(client, _history([_tool("call_1", "Shell", {"command": "ls"})]))
+        (call,) = [item for item in _backend_input(server) if item.get("type") == "function_call"]
+        assert call["name"] == "Shell"
+        assert _restore_log(private_store) == []
 
 
 class TestEmptyTurnNudge:
