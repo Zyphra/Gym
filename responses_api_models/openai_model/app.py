@@ -23,6 +23,7 @@ from nemo_gym.base_responses_api_model import (
     Body,
     SimpleResponsesAPIModel,
 )
+from nemo_gym.model_call_metadata import measured_model_server
 from nemo_gym.openai_utils import (
     NeMoGymAsyncOpenAI,
     NeMoGymChatCompletion,
@@ -92,7 +93,7 @@ class SimpleModelServer(SimpleResponsesAPIModel):
                 body_dict["input"] = [
                     item for item in input_items if not (isinstance(item, dict) and item.get("type") == "reasoning")
                 ]
-        async with self._semaphore:
+        async with measured_model_server(self._semaphore):
             openai_response_dict = await self._client.create_response(**body_dict)
         return NeMoGymResponse.model_validate(openai_response_dict)
 
@@ -101,7 +102,7 @@ class SimpleModelServer(SimpleResponsesAPIModel):
     ) -> NeMoGymChatCompletion:
         body_dict = self.config.extra_body | body.model_dump(exclude_unset=True)
         body_dict["model"] = self.config.openai_model
-        async with self._semaphore:
+        async with measured_model_server(self._semaphore):
             openai_response_dict = await self._client.create_chat_completion(**body_dict)
         return NeMoGymChatCompletion.model_validate(openai_response_dict)
 
