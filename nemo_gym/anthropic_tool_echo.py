@@ -30,10 +30,19 @@ blocks are the served blocks in served order, some possibly left out. Every
 difference is written to the rollout's restore log, classified as
 ``cd_strip``, ``schema_default_fill``, ``whitespace`` or ``other``.
 
+Claude Code also drops a served turn that presents nothing (no tool call, no
+visible text; reasoning only) or that stopped at the output token limit, and appends
+a fixed nudge text block to the last user message instead. ``messages()`` records
+such turns too, keyed by the length of the request each answered. A user message at
+that position whose last block is the matching exact nudge gets the served turn
+re-inserted before it, and the nudge moves to its own user message right after: the
+history the backend served, followed by a new user turn. The restore log classifies
+these as ``empty_turn_nudge`` and ``output_limit_nudge``.
+
 Anything else passes through: turns that match no served turn (a compaction
-summary, a dropped or added turn, other ids, reordered or added blocks), and all
-user and ``tool_result`` content. The endpoint's append-only check still sees
-those.
+summary, any other dropped or added turn, other ids, reordered or added blocks), and
+all other user and ``tool_result`` content. The endpoint's append-only check still
+sees those.
 
 Served turns are per-rollout JSONL files (``<rollout>.jsonl``, removed a day after
 their last write) under one directory per server identity, shared by all of the
@@ -82,8 +91,28 @@ _ROLLOUT_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 _SEGMENT_SEARCH_LIMIT = 12
 
 
+# The text blocks Claude Code 2.1.x appends to the last user message after dropping a served
+# turn that presented nothing, or that stopped at the output token limit.
+EMPTY_TURN_NUDGE = "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+OUTPUT_LIMIT_NUDGE = (
+    "Output token limit hit. Resume directly \u2014 no apology, no recap of what you were doing. "
+    "Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
+)
+_NUDGE_KINDS = {EMPTY_TURN_NUDGE: "empty_turn_nudge", OUTPUT_LIMIT_NUDGE: "output_limit_nudge"}
+
+
 def turn_key(tool_use_ids: list[str]) -> str:
     return "turn:" + json.dumps(list(tool_use_ids))
+
+
+def empty_turn_key(request_length: int) -> str:
+    return f"empty:{int(request_length)}"
+
+
+def _nudge_kind(block: Any) -> Optional[str]:
+    if isinstance(block, Mapping) and block.get("type") == "text":
+        return _NUDGE_KINDS.get(block.get("text"))
+    return None
 
 
 def _tool_uses(content: list) -> list[Mapping[str, Any]]:
@@ -411,24 +440,42 @@ def store_for(server_name: str, host: Any, port: Any) -> ServedToolInputStore:
         return store
 
 
-def served_turn(anthropic_response: Mapping[str, Any]) -> Optional[dict[str, Any]]:
-    """The served turn keyed by its ``tool_use`` ids; turns without tool calls are not recorded."""
+def served_turns(anthropic_response: Mapping[str, Any], request_length: Optional[int] = None) -> list[dict[str, Any]]:
+    """The records for one served turn: keyed by its ``tool_use`` ids, and, for a turn that presents
+    nothing (no tool call, no visible text) or stopped at the output token limit, also by the length
+    of the request it answered."""
     content = list(anthropic_response.get("content") or [])
     ids = [block.get("id") for block in _tool_uses(content)]
-    if not ids or not all(isinstance(value, str) for value in ids):
-        return None
-    return {"id": turn_key(ids), "content": copy.deepcopy(content)}
+    records = []
+    if ids and all(isinstance(value, str) for value in ids):
+        records.append({"id": turn_key(ids), "content": copy.deepcopy(content)})
+    if request_length is not None:
+        presents_nothing = not ids and not any(
+            isinstance(block, Mapping) and block.get("type") == "text" and not _blank_text(block) for block in content
+        )
+        if presents_nothing or anthropic_response.get("stop_reason") == "max_tokens":
+            records.append({"id": empty_turn_key(request_length), "content": copy.deepcopy(content)})
+    return records
+
+
+def served_turn(anthropic_response: Mapping[str, Any], request_length: Optional[int] = None) -> Optional[dict[str, Any]]:
+    """The first record ``served_turns`` gives, if any."""
+    records = served_turns(anthropic_response, request_length)
+    return records[0] if records else None
 
 
 def record_served_turn(
-    anthropic_response: Mapping[str, Any], store: ServedToolInputStore, rollout_id: Optional[str]
+    anthropic_response: Mapping[str, Any],
+    store: ServedToolInputStore,
+    rollout_id: Optional[str],
+    request_length: Optional[int] = None,
 ) -> None:
     """Remember what this response served; a failure only costs the next request its restoration."""
-    turn = served_turn(anthropic_response)
-    if turn is None:
+    records = served_turns(anthropic_response, request_length)
+    if not records:
         return
     try:
-        store.record(rollout_id, [turn])
+        store.record(rollout_id, records)
     except (OSError, ValueError) as error:
         logger.warning("could not record a served turn for rollout %r: %s", rollout_id, error)
 
@@ -445,6 +492,67 @@ def restore_served_turns(
     messages = body.get("messages")
     if not isinstance(messages, list):
         return body, []
+    body, nudge_entries = _restore_empty_turns(body, store, rollout_id)
+    messages = body["messages"] if nudge_entries else messages
+    restored, entries = _restore_tool_turns(body, messages, store, rollout_id)
+    return restored, nudge_entries + entries
+
+
+def _restore_empty_turns(
+    body: Mapping[str, Any], store: ServedToolInputStore, rollout_id: Optional[str]
+) -> tuple[Mapping[str, Any], list[dict[str, Any]]]:
+    """Re-insert each served turn Claude Code dropped for one of its nudges (see the module docstring)."""
+    messages = body["messages"]
+    nudged = [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, Mapping)
+        and message.get("role") == "user"
+        and isinstance(message.get("content"), list)
+        and len(message["content"]) > 1
+        and _nudge_kind(message["content"][-1])
+    ]
+    if not nudged:
+        return body, []
+    try:
+        served = store.lookup(rollout_id, {empty_turn_key(index + 1) for index in nudged})
+    except (OSError, ValueError) as error:
+        logger.warning("could not read served turns for rollout %r: %s", rollout_id, error)
+        return body, []
+    rebuilt, entries = [], []
+    for index, message in enumerate(messages):
+        record = served.get(empty_turn_key(index + 1)) if index in nudged else None
+        if record is None:
+            rebuilt.append(message)
+            continue
+        *kept, nudge = message["content"]
+        kind = _nudge_kind(nudge)
+        rebuilt += [
+            {**message, "content": kept},
+            {"role": "assistant", "content": copy.deepcopy(record["content"])},
+            {"role": "user", "content": [nudge]},
+        ]
+        entries.append(
+            {
+                "key": f"{empty_turn_key(index + 1)}#{kind}",
+                "at": time.time(),
+                "tool_use_ids": [],
+                "counts": {kind: 1},
+                "differences": [{"kind": kind, "message_index": index, "served": record["content"], "echoed": None}],
+            }
+        )
+    if not entries:
+        return body, []
+    try:
+        store.log_restores(rollout_id, entries)
+    except (OSError, ValueError) as error:
+        logger.warning("could not log restored turns for rollout %r: %s", rollout_id, error)
+    return {**body, "messages": rebuilt}, entries
+
+
+def _restore_tool_turns(
+    body: Mapping[str, Any], messages: list, store: ServedToolInputStore, rollout_id: Optional[str]
+) -> tuple[Mapping[str, Any], list[dict[str, Any]]]:
     turns = []
     for index, message in enumerate(messages):
         if (

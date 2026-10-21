@@ -392,12 +392,14 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
                 logger.debug("dropped %d Claude Code identity system block(s)", dropped)
         rollout_id = current_rollout_id()
         served_turns = store_for(self.config.name, self.config.host, self.config.port)
+        # Empty served turns are keyed by the client's own request length (before any restore).
+        request_length = len(body.get("messages") or [])
         body, _ = restore_served_turns(body, served_turns, rollout_id)
         params = _ANTHROPIC_CONVERTER.anthropic_request_to_responses(body)
         response = await self._invoke_responses(request, params)
         model_name = body.get("model") or response.model
         anthropic_response = _ANTHROPIC_CONVERTER.responses_to_anthropic_response(response, model=model_name)
-        record_served_turn(anthropic_response, served_turns, rollout_id)
+        record_served_turn(anthropic_response, served_turns, rollout_id, request_length=request_length)
         if body.get("stream"):
             return StreamingResponse(
                 _ANTHROPIC_CONVERTER.anthropic_response_to_sse(anthropic_response),

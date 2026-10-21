@@ -525,6 +525,127 @@ class TestNothingElseIsMasked:
         assert not list(private_store.parent.glob("escape*"))
 
 
+class TestEmptyTurnNudge:
+    """Claude Code drops a served turn that presents nothing and appends a nudge to the last user message."""
+
+    @staticmethod
+    def _nudged(results: dict) -> dict:
+        return {**results, "content": [*results["content"], {"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}]}
+
+    @staticmethod
+    def _shape(server: _ScriptedModel) -> list:
+        shape = []
+        for item in _backend_input(server):
+            kind, role = item.get("type"), item.get("role")
+            if kind == "message":
+                content = item.get("content")
+                text = content if isinstance(content, str) else "".join(part.get("text", "") for part in content or [])
+                shape.append((role, text))
+            else:
+                shape.append((kind, item.get("call_id")))
+        return shape
+
+    @pytest.mark.parametrize("empty", [_text(""), _turn(("reasoning", "thinking only")), _turn(("text", "\n\n"))])
+    def test_the_dropped_empty_turn_is_restored_before_its_nudge(self, empty, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), copy.deepcopy(empty), _text("ok")])
+        _post(client, [TASK])
+        served = _post(client, _history([first]), stream=False).json()["content"]  # the empty turn
+        # The CLI never echoes that turn; it appends its nudge to the last user message instead.
+        nudged = _history([first])
+        nudged[-1] = self._nudged(nudged[-1])
+        _post(client, nudged)
+        # The backend gets what an exact echo would give: the served turn, then the nudge as a new user turn.
+        exact_client, exact = _server([_turn(("tool", "call_1", "Bash", SERVED)), copy.deepcopy(empty)], name="exact")
+        _post(exact_client, [TASK])
+        _post(exact_client, _history([first]))
+        _post(exact_client, _history([first]) + [
+            {"role": "assistant", "content": served},
+            {"role": "user", "content": [{"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}]},
+        ])
+        assert _comparable(server)["input"] == _comparable(exact)["input"]
+        assert self._shape(server)[-1] == ("user", tool_echo.EMPTY_TURN_NUDGE)
+        (entry,) = _restore_log(private_store)
+        assert entry["counts"] == {"empty_turn_nudge": 1} and entry["key"] == "empty:3#empty_turn_nudge"
+
+    def test_later_requests_keep_the_restored_turn_and_restore_tool_turns_after_it(self, private_store) -> None:
+        first, second = _tool("call_1", "Bash", SERVED), _tool("call_2", "Bash", SERVED)
+        client, server = _server(
+            [_turn(("tool", "call_1", "Bash", SERVED)), _text(""), _turn(("tool", "call_2", "Bash", SERVED))]
+        )
+        _post(client, [TASK])
+        _post(client, _history([first]))
+        nudged = _history([first])
+        nudged[-1] = self._nudged(nudged[-1])
+        _post(client, nudged)
+        # The next request: the CLI's history keeps the merged message and echoes call_2 with the cd strip.
+        later = nudged + [{"role": "assistant", "content": [_tool("call_2", "Bash", STRIPPED)]}, _results([second])]
+        _post(client, later)
+        shape = self._shape(server)
+        assert shape[-5:] == [
+            ("function_call_output", "call_1"),
+            ("assistant", ""),
+            ("user", tool_echo.EMPTY_TURN_NUDGE),
+            ("function_call", "call_2"),
+            ("function_call_output", "call_2"),
+        ]
+        assert _arguments(server, "call_2") == SERVED
+        kinds = _kinds(_restore_log(private_store))
+        assert kinds["empty_turn_nudge"] == 1 and kinds["cd_strip"] == 1
+
+    def test_a_nudge_without_a_served_empty_turn_passes_through(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), _text("visible answer")])
+        _post(client, [TASK])
+        _post(client, _history([first]))  # served visible text: nothing recorded
+        nudged = _history([first])
+        nudged[-1] = self._nudged(nudged[-1])
+        _post(client, nudged)
+        assert self._shape(server)[-1] == ("user", tool_echo.EMPTY_TURN_NUDGE)
+        assert ("assistant", "visible answer") not in self._shape(server)
+        assert _restore_log(private_store) == []
+
+    def test_only_the_exact_nudge_after_other_content_counts(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        for last in ([{"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE + " "}], None):
+            client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), _text("")], name=f"s{last is None}")
+            _post(client, [TASK])
+            _post(client, _history([first]))
+            nudged = _history([first])
+            if last is None:  # the nudge alone, with no tool result before it
+                nudged[-1] = {"role": "user", "content": [{"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}]}
+            else:
+                nudged[-1] = {**nudged[-1], "content": [*nudged[-1]["content"], *last]}
+            _post(client, nudged)
+            assert ("assistant", "") not in self._shape(server)
+        assert _restore_log(private_store) == []
+
+    def test_a_length_capped_turn_dropped_for_the_output_limit_nudge_is_restored(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED))])
+        capped = {"content": [{"type": "text", "text": "partial answer cut at the"}], "stop_reason": "max_tokens"}
+        store = tool_echo.store_for("policy_model", "127.0.0.1", 8099)
+        _post(client, [TASK])
+        tool_echo.record_served_turn(capped, store, "roll-1", request_length=3)
+        nudged = _history([first])
+        nudged[-1] = {**nudged[-1], "content": [*nudged[-1]["content"], {"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE}]}
+        _post(client, nudged)
+        assert self._shape(server)[-2:] == [("assistant", "partial answer cut at the"), ("user", tool_echo.OUTPUT_LIMIT_NUDGE)]
+        (entry,) = _restore_log(private_store)
+        assert entry["counts"] == {"output_limit_nudge": 1}
+        # A turn that was neither empty nor length-capped is never keyed by request length.
+        assert tool_echo.served_turns({"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"}, 3) == []
+
+    def test_served_turn_keys(self) -> None:
+        empty = {"content": [{"type": "text", "text": ""}]}
+        assert tool_echo.served_turn(empty) is None
+        assert tool_echo.served_turn(empty, 7)["id"] == "empty:7"
+        assert tool_echo.served_turn({"content": [{"type": "thinking", "thinking": "x"}]}, 7)["id"] == "empty:7"
+        assert tool_echo.served_turn({"content": [{"type": "text", "text": "hi"}]}, 7) is None
+        called = {"content": [{"type": "tool_use", "id": "call_1", "name": "Bash", "input": {}}]}
+        assert tool_echo.served_turn(called, 7)["id"] == tool_echo.turn_key(["call_1"])
+
+
 class TestDifferenceKinds:
     """Classification of what the client changed; every one of these turns is restored."""
 
