@@ -47,6 +47,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from nemo_gym.anthropic_converter import AnthropicConverter
+from nemo_gym.anthropic_tool_echo import record_served_turn, restore_served_turns, store_for
 from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_chat_completion_sse
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT, ModelServerRef
 from nemo_gym.openai_utils import (
@@ -61,7 +62,7 @@ from nemo_gym.responses_streaming import (
     synthesize_responses_sse,
     validate_streaming_responses_params,
 )
-from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_from_run_body
 from nemo_gym.rollout_observability import AgentObservationBundle, ObservationGap, join_model_call_observations
 from nemo_gym.server_utils import (
     BaseRunServerInstanceConfig,
@@ -347,12 +348,23 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         result back to an Anthropic Messages response. When the client requested ``stream: true``
         (the Claude Code CLI always does), the complete response is re-emitted as a synthesized
         Anthropic SSE event stream. Servers may override this for native Messages handling.
+
+        Each served turn with tool calls is recorded for its rollout. An echoed assistant
+        turn with the same ``tool_use`` ids, names and block order gets the served content
+        back before conversion, whatever the client changed in it, so the history reaching
+        the backend is the one it served; each difference goes to the rollout's restore log.
+        Turns that match no served turn, and user and ``tool_result`` content, pass through
+        (``nemo_gym.anthropic_tool_echo``).
         """
         _reject_external_capture_streaming(body)
+        rollout_id = current_rollout_id()
+        served_turns = store_for(self.config.name, self.config.host, self.config.port)
+        body, _ = restore_served_turns(body, served_turns, rollout_id)
         params = _ANTHROPIC_CONVERTER.anthropic_request_to_responses(body)
         response = await self._invoke_responses(request, params)
         model_name = body.get("model") or response.model
         anthropic_response = _ANTHROPIC_CONVERTER.responses_to_anthropic_response(response, model=model_name)
+        record_served_turn(anthropic_response, served_turns, rollout_id)
         if body.get("stream"):
             return StreamingResponse(
                 _ANTHROPIC_CONVERTER.anthropic_response_to_sse(anthropic_response),
