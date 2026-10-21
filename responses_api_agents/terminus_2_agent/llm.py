@@ -83,6 +83,7 @@ class NemoGymLLM(BaseLLM):
         self._ambiguous_routed_expert_keys: set[_RolloutDetailsKey] = set()
 
         self.context_length_exceeded = False
+        self.model_transport_error: str | None = None
         self._extra_chat_params = self._build_extra_chat_params(responses_create_params or {})
 
     @retry(
@@ -242,16 +243,26 @@ class NemoGymLLM(BaseLLM):
         timeout = timeout_sec if timeout_sec is not None else self._timeout_sec
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=timeout)
-        response = await self._http_client.post(endpoint, json=payload, timeout=timeout)
+        try:
+            response = await self._http_client.post(endpoint, json=payload, timeout=timeout)
+        except httpx.RequestError as error:
+            self.model_transport_error = self.model_transport_error or f"{type(error).__name__}: {error}"[:2000]
+            raise
 
         if response.status_code >= 400:
             error_text = response.text.lower()
             if any(phrase in error_text for phrase in _CONTEXT_LENGTH_ERROR_PHRASES):
                 self.context_length_exceeded = True
                 raise ContextLengthExceededError(f"Model {self._model_name} context length exceeded: {response.text}")
+            if response.status_code in {401, 403, 404, 408, 429} or 500 <= response.status_code < 600:
+                self.model_transport_error = (
+                    self.model_transport_error or f"Model endpoint HTTP {response.status_code}"
+                )
             response.raise_for_status()
 
-        return response.json()
+        result = response.json()
+        self.model_transport_error = None
+        return result
 
     async def aclose(self) -> None:
         """Close the episode's persistent HTTP client."""
