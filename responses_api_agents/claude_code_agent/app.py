@@ -25,7 +25,7 @@ from asyncio import Semaphore
 from contextlib import suppress
 from pathlib import Path
 from time import monotonic, time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
 from fastapi import Request
@@ -283,6 +283,10 @@ class ClaudeCodeAgentConfig(BaseResponsesAPIAgentConfig):
     max_turns: Optional[int] = 30  # None -> unlimited turns
     timeout: int = 300
     system_prompt: Optional[str] = None
+    # "append" passes system_prompt as --append-system-prompt, after Claude Code's default prompt.
+    # "replace" passes it as --system-prompt, which replaces the default prompt; the CLI still
+    # sends its fixed identity block (see the model server's anthropic_drop_client_identity).
+    system_prompt_mode: Literal["append", "replace"] = "append"
     allowed_tools: Optional[str] = None
     disallowed_tools: Optional[str] = None
     # Built-in tool whitelist passed as ``--tools`` (e.g. "Bash,Read,Edit"; "" disables all tools).
@@ -299,6 +303,16 @@ class ClaudeCodeAgentConfig(BaseResponsesAPIAgentConfig):
     bare: bool = True
     mcp_config: Optional[str] = None
     settings: Optional[str] = None
+    # Top-level settings.json keys layered over the base settings and the ``settings`` file
+    # (e.g. {"includeCoAuthoredBy": false} turns off the git attribution reminder).
+    settings_overrides: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("settings_overrides")
+    @classmethod
+    def _settings_overrides_leave_env(cls, overrides: dict[str, Any]) -> dict[str, Any]:
+        if "env" in overrides:
+            raise ValueError("settings_overrides must not set env; use env")
+        return overrides
 
     @field_validator("env")
     @classmethod
@@ -372,7 +386,8 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
         The base settings disable telemetry/attribution. When ``config.settings`` points at a
         JSON file, its contents are layered on top: top-level keys override, and the ``env`` block
         is shallow-merged so the telemetry defaults are preserved unless explicitly overridden.
-        ``config.env`` is merged into ``env`` last.
+        ``config.settings_overrides`` top-level keys go on next, and ``config.env`` is merged into
+        ``env`` last.
         """
         settings: dict[str, Any] = {
             "env": {
@@ -385,6 +400,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             user_settings = json.loads(Path(self.config.settings).expanduser().read_text())
             user_env = user_settings.get("env") or {}
             settings = {**settings, **user_settings, "env": {**settings["env"], **user_env}}
+        settings = {**settings, **self.config.settings_overrides}
         settings["env"] = {**settings["env"], **self.config.env}
         return settings
 
@@ -449,7 +465,8 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
         if effective_mcp_config:
             cmd += ["--mcp-config", effective_mcp_config]
         if system_prompt:
-            cmd += ["--append-system-prompt", system_prompt]
+            flag = "--system-prompt" if self.config.system_prompt_mode == "replace" else "--append-system-prompt"
+            cmd += [flag, system_prompt]
         if self.config.allowed_tools:
             cmd += ["--allowedTools", self.config.allowed_tools]
         if self.config.disallowed_tools:

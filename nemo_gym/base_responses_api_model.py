@@ -109,6 +109,31 @@ def _reject_external_capture_streaming(body: dict[str, Any]) -> None:
 # Stateless; shared by every model server's default /v1/messages handler.
 _ANTHROPIC_CONVERTER = AnthropicConverter()
 
+# The identity blocks Claude Code 2.1.x always sends as their own system block, whatever
+# --system-prompt or --append-system-prompt says (the CLI picks one per mode).
+CLAUDE_CODE_IDENTITY_BLOCKS = frozenset(
+    {
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+        "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    }
+)
+
+
+def drop_client_identity(body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Return ``body`` without system blocks that exactly match a Claude Code identity block."""
+    system = body.get("system")
+    if isinstance(system, str):
+        return ({**body, "system": ""}, 1) if system in CLAUDE_CODE_IDENTITY_BLOCKS else (body, 0)
+    if not isinstance(system, list):
+        return body, 0
+    kept = [
+        block
+        for block in system
+        if not (isinstance(block, dict) and block.get("type") == "text" and block.get("text") in CLAUDE_CODE_IDENTITY_BLOCKS)
+    ]
+    return ({**body, "system": kept}, len(system) - len(kept)) if len(kept) != len(system) else (body, 0)
+
 
 def _request_messages(body: Any) -> list[dict]:
     """Return the conversation carried by any supported dialect.
@@ -187,7 +212,10 @@ def _orjson_dispatch_response(content: Any) -> Any:
 
 
 class BaseResponsesAPIModelConfig(BaseRunServerInstanceConfig):
-    pass
+    # Drop the Claude Code CLI's own identity block from /v1/messages system prompts before
+    # conversion, so a non-Claude backend never sees it. Only exact copies of the CLI's fixed
+    # identity strings are dropped; every other system block passes through unchanged.
+    anthropic_drop_client_identity: bool = False
 
 
 class BaseResponsesAPIModel(BaseServer):
@@ -354,9 +382,14 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         back before conversion, whatever the client changed in it, so the history reaching
         the backend is the one it served; each difference goes to the rollout's restore log.
         Turns that match no served turn, and user and ``tool_result`` content, pass through
-        (``nemo_gym.anthropic_tool_echo``).
+        (``nemo_gym.anthropic_tool_echo``). With ``anthropic_drop_client_identity``, the
+        CLI's fixed identity system block is dropped first (``drop_client_identity``).
         """
         _reject_external_capture_streaming(body)
+        if getattr(self.config, "anthropic_drop_client_identity", False):
+            body, dropped = drop_client_identity(body)
+            if dropped:
+                logger.debug("dropped %d Claude Code identity system block(s)", dropped)
         rollout_id = current_rollout_id()
         served_turns = store_for(self.config.name, self.config.host, self.config.port)
         body, _ = restore_served_turns(body, served_turns, rollout_id)

@@ -180,6 +180,16 @@ class TestBuildCommand:
         assert cmd[cmd.index("--max-turns") + 1] == "7"
         assert cmd[cmd.index("--append-system-prompt") + 1] == "be terse"
 
+    def test_system_prompt_mode(self) -> None:
+        cmd = _make_agent()._build_command("m", "x", system_prompt="You are ZAYA.")
+        assert cmd[cmd.index("--append-system-prompt") + 1] == "You are ZAYA."
+        assert "--system-prompt" not in cmd
+        cmd = _make_agent(system_prompt_mode="replace")._build_command("m", "x", system_prompt="You are ZAYA.")
+        assert cmd[cmd.index("--system-prompt") + 1] == "You are ZAYA."
+        assert "--append-system-prompt" not in cmd
+        assert cmd.index("--system-prompt") < cmd.index("--")
+        assert "--system-prompt" not in _make_agent(system_prompt_mode="replace")._build_command("m", "x")
+
     def test_tools_whitelist(self) -> None:
         assert "--tools" not in _make_agent()._build_command("m", "x")
         cmd = _make_agent(tools="Bash,Read,Edit")._build_command("m", "x")
@@ -225,6 +235,25 @@ class TestBuildSettings:
         assert env["DISABLE_AUTOUPDATER"] == "1"
         assert env["FOO"] == "file"
         assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "0"
+
+
+class TestSettingsOverrides:
+    def test_overrides_layer_over_base_and_file(self, tmp_path: Path) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({"includeCoAuthoredBy": True, "permissions": {"allow": ["Bash"]}}))
+        agent = _make_agent(
+            settings=str(settings_file),
+            settings_overrides={"includeCoAuthoredBy": False, "attribution": {"commit": "", "pr": ""}},
+        )
+        settings = agent._build_settings()
+        assert settings["includeCoAuthoredBy"] is False
+        assert settings["attribution"] == {"commit": "", "pr": ""}
+        assert settings["permissions"] == {"allow": ["Bash"]}
+        assert settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "0"
+
+    def test_overrides_reject_env(self) -> None:
+        with pytest.raises(ValueError, match="settings_overrides must not set env"):
+            _make_agent(settings_overrides={"env": {"FOO": "1"}})
 
 
 class TestSetupConfigDir:
