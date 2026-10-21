@@ -525,6 +525,36 @@ class TestNothingElseIsMasked:
         assert not list(private_store.parent.glob("escape*"))
 
 
+class TestToolNameTruncation:
+    """Claude Code echoes a tool name longer than 200 characters as its first 200."""
+
+    LONG = "python3 -c \"" + "x = 1; " * 60 + "\""
+
+    def test_a_truncated_model_made_name_is_restored_and_logged(self, private_store) -> None:
+        served = _tool("call_1", self.LONG, {"command": "ls"})
+        echoed = _tool("call_1", self.LONG[:200], {"command": "ls"})
+        client, server = _server([_turn(("tool", "call_1", self.LONG, {"command": "ls"}))])
+        _post(client, [TASK])
+        _post(client, _history([echoed]))
+        (call,) = [item for item in _backend_input(server) if item.get("type") == "function_call"]
+        assert call["name"] == self.LONG
+        assert _kinds(_restore_log(private_store)) == {"name_truncation": 1}
+
+    @pytest.mark.parametrize("echoed_name", ["Bash", LONG[:199], LONG[1:201]])
+    def test_any_other_name_change_passes_through(self, echoed_name, private_store) -> None:
+        client, server = _server([_turn(("tool", "call_1", self.LONG, {"command": "ls"}))], name=f"n{len(echoed_name)}")
+        _post(client, [TASK])
+        _post(client, _history([_tool("call_1", echoed_name, {"command": "ls"})]))
+        (call,) = [item for item in _backend_input(server) if item.get("type") == "function_call"]
+        assert call["name"] == echoed_name
+        assert _restore_log(private_store) == []
+
+    def test_a_short_name_is_never_treated_as_truncated(self) -> None:
+        assert tool_echo._same_or_truncated_name("Bash", "Bash")
+        assert not tool_echo._same_or_truncated_name("Bash", "Bas")
+        assert not tool_echo._same_or_truncated_name("b" * 200, "b" * 199)
+
+
 class TestEmptyTurnNudge:
     """Claude Code drops a served turn that presents nothing and appends a nudge to the last user message."""
 

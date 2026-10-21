@@ -28,7 +28,10 @@ gets the exact served content back. A turn matches when it is an assistant
 message with the same ``tool_use`` ids and tool names in the same order, and its
 blocks are the served blocks in served order, some possibly left out. Every
 difference is written to the rollout's restore log, classified as
-``cd_strip``, ``schema_default_fill``, ``whitespace`` or ``other``.
+``cd_strip``, ``schema_default_fill``, ``whitespace``, ``name_truncation`` or
+``other``. ``name_truncation`` is Claude Code cutting a tool name longer than 200
+characters (a model-made name no tool has) to its first 200; ids and order still
+have to match.
 
 Claude Code also drops a served turn that presents nothing (no tool call, no
 visible text; reasoning only) or that stopped at the output token limit, and appends
@@ -88,6 +91,8 @@ _CLIENT_BLOCK_FIELDS = frozenset({"signature", "cache_control"})
 # shell metacharacters. Used only to name the difference in the log.
 _CLI_CWD = re.compile(r"""^(?:/|[A-Za-z]:[\\/])[^\s"'`$;&|<>*?(){}\[\]!#]{0,1023}$""")
 _ROLLOUT_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+# Claude Code 2.1.284 echoes a tool_use name longer than this as its first this-many characters.
+_CLI_TOOL_NAME_LIMIT = 200
 _SEGMENT_SEARCH_LIMIT = 12
 
 
@@ -153,12 +158,23 @@ def _align_segment(served: list, echoed: list, offset: int) -> Optional[list[Opt
     return [offset + where[index] if index in where else None for index in range(len(served))]
 
 
+def _same_or_truncated_name(served: Any, echoed: Any) -> bool:
+    if served == echoed:
+        return True
+    return (
+        isinstance(served, str)
+        and isinstance(echoed, str)
+        and len(served) > _CLI_TOOL_NAME_LIMIT
+        and echoed == served[:_CLI_TOOL_NAME_LIMIT]
+    )
+
+
 def _align(served: list, echoed: list) -> Optional[list[Optional[int]]]:
     """For each served block, the index of its echo, or None when the echo left it out.
 
-    The echo matches when it keeps every served ``tool_use`` (same id and name, same
-    order) and, between them, the served blocks in served order with some left out.
-    Otherwise None.
+    The echo matches when it keeps every served ``tool_use`` (same id, same order, and the
+    same name or Claude Code's 200-character cut of it) and, between them, the served
+    blocks in served order with some left out. Otherwise None.
     """
     served_tools = [index for index, block in enumerate(served) if block.get("type") == "tool_use"]
     echoed_tools = [
@@ -167,9 +183,10 @@ def _align(served: list, echoed: list) -> Optional[list[Optional[int]]]:
     if len(served_tools) != len(echoed_tools):
         return None
     for served_index, echoed_index in zip(served_tools, echoed_tools):
-        for field in ("id", "name"):
-            if served[served_index].get(field) != echoed[echoed_index].get(field):
-                return None
+        if served[served_index].get("id") != echoed[echoed_index].get("id"):
+            return None
+        if not _same_or_truncated_name(served[served_index].get("name"), echoed[echoed_index].get("name")):
+            return None
     mapping: list[Optional[int]] = []
     served_start = echoed_start = 0
     for served_end, echoed_end in [*zip(served_tools, echoed_tools), (len(served), len(echoed))]:
@@ -268,13 +285,14 @@ def _differences(served: list, echoed: list, mapping: list, defaults: Mapping[st
                 )
             for key in sorted((set(base) | set(echo)) - {"input"}):
                 if base.get(key) != echo.get(key):
+                    truncated = key == "name" and _same_or_truncated_name(base.get(key), echo.get(key))
                     found.append(
                         {
                             "block": index,
                             "type": "tool_use",
                             "field": key,
                             "change": "changed",
-                            "kind": "other",
+                            "kind": "name_truncation" if truncated else "other",
                             "served": base.get(key),
                             "echoed": echo.get(key),
                         }
