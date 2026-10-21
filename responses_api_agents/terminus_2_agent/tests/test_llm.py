@@ -318,3 +318,53 @@ def test_output_limit_none_when_missing():
 )
 def test_chat_completions_endpoint(api_base, expected):
     assert _make_llm(api_base=api_base)._chat_completions_endpoint() == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["timeout", 503])
+async def test_transport_cause_survives_busy_retries_until_success(first):
+    attempts = 0
+
+    def endpoint(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            if first == "timeout":
+                raise httpx.ReadTimeout("original model request expired", request=request)
+            return httpx.Response(first, text="upstream unavailable")
+        if attempts < 4:
+            return httpx.Response(409, text="episode still busy")
+        return httpx.Response(200, json={"choices": []})
+
+    llm = _make_llm()
+    llm._http_client = httpx.AsyncClient(transport=httpx.MockTransport(endpoint))
+    try:
+        with pytest.raises(httpx.HTTPError):
+            await llm._post_chat_completions({"messages": []})
+        original = llm.model_transport_error
+        assert original == (
+            "ReadTimeout: original model request expired" if first == "timeout" else "Model endpoint HTTP 503"
+        )
+        for _ in range(2):
+            with pytest.raises(httpx.HTTPStatusError) as error:
+                await llm._post_chat_completions({"messages": []})
+            assert error.value.response.status_code == 409
+            assert llm.model_transport_error == original
+        assert await llm._post_chat_completions({"messages": []}) == {"choices": []}
+        assert llm.model_transport_error is None
+    finally:
+        await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_standalone_busy_response_does_not_invent_a_transport_cause():
+    llm = _make_llm()
+    llm._http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(409, text="episode busy"))
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await llm._post_chat_completions({"messages": []})
+        assert llm.model_transport_error is None
+    finally:
+        await llm.aclose()

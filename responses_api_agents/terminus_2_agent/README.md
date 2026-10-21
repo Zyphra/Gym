@@ -30,3 +30,5 @@ sets `workspace_root: "."` because each task already runs in an isolated contain
 
 The agent converts the Terminus-2 trajectory to Responses API messages and tool
 calls. Sampling parameters are forwarded to the configured model server.
+
+The LLM adapter retains the first bounded `model_transport_error` across unsuccessful retries, including a later busy response, and clears it only after a valid JSON completion response. The property records transport custody; it does not change the retry count, timeout, model request or verifier result.
