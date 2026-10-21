@@ -368,7 +368,9 @@ class EnrootProvider:
         async with self._semaphore:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
-                stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+                # Without explicit input the command reads EOF (like a non-interactive `docker exec`),
+                # never the worker's own stdin, which an interactive prompt would block on forever.
+                stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
