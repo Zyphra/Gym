@@ -114,6 +114,10 @@ def _project_absolute_read_path(path: Path) -> Path:
     destination = Path(destination)
     if value.is_relative_to(destination):
         return value
+    # A different snapshot is an external input even when its store lives
+    # under a projected clone. Keep this lexical after origins retire.
+    if any(value.is_relative_to(Path(source) / ".git" / "source-snapshots") for source in sources):
+        return value
     for source in sorted(set(sources), key=lambda root: (-len(Path(root).parts), root)):
         if value.is_relative_to(source):
             return destination / value.relative_to(source)
