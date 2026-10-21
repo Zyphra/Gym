@@ -1,0 +1,104 @@
+{
+  "provenance": "codex-cli 0.144.4 (@openai/codex-linux-x64 vendor binary, sha256 2b3edc9cdfd1717fba3dbc92817205a8a2c7511d459e456d4817eeff6f78ed7a), `codex exec --json --ephemeral` against a loopback-only scripted Responses server inside `unshare -rn`, request/stream retries 0, 2026-10-15. Each case served one SSE turn (response.created, response.output_item.done with an assistant message, response.completed) whose response.usage is `usage`; `codex_accepts` is whether the turn completed (turn.completed, exit 0) or failed (turn.failed, exit 1).",
+  "cases": [
+    {
+      "name": "both_null",
+      "usage": {
+        "input_tokens": 1,
+        "input_tokens_details": {
+          "cached_tokens": null
+        },
+        "output_tokens": 1,
+        "output_tokens_details": {
+          "reasoning_tokens": null
+        },
+        "total_tokens": 2
+      },
+      "codex_accepts": false,
+      "codex_terminal_event": "turn.failed",
+      "codex_error": "stream disconnected before completion: failed to parse ResponseCompleted: invalid type: null, expected i64"
+    },
+    {
+      "name": "cached_int_reasoning_null",
+      "usage": {
+        "input_tokens": 1,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens": 1,
+        "output_tokens_details": {
+          "reasoning_tokens": null
+        },
+        "total_tokens": 2
+      },
+      "codex_accepts": false,
+      "codex_terminal_event": "turn.failed",
+      "codex_error": "stream disconnected before completion: failed to parse ResponseCompleted: invalid type: null, expected i64"
+    },
+    {
+      "name": "cached_null_reasoning_int",
+      "usage": {
+        "input_tokens": 1,
+        "input_tokens_details": {
+          "cached_tokens": null
+        },
+        "output_tokens": 1,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 2
+      },
+      "codex_accepts": false,
+      "codex_terminal_event": "turn.failed",
+      "codex_error": "stream disconnected before completion: failed to parse ResponseCompleted: invalid type: null, expected i64"
+    },
+    {
+      "name": "details_null",
+      "usage": {
+        "input_tokens": 1,
+        "input_tokens_details": null,
+        "output_tokens": 1,
+        "output_tokens_details": null,
+        "total_tokens": 2
+      },
+      "codex_accepts": true,
+      "codex_terminal_event": "turn.completed",
+      "codex_error": null
+    },
+    {
+      "name": "details_absent",
+      "usage": {
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "total_tokens": 2
+      },
+      "codex_accepts": true,
+      "codex_terminal_event": "turn.completed",
+      "codex_error": null
+    },
+    {
+      "name": "usage_null",
+      "usage": null,
+      "codex_accepts": true,
+      "codex_terminal_event": "turn.completed",
+      "codex_error": null
+    },
+    {
+      "name": "zeros",
+      "usage": {
+        "input_tokens": 1,
+        "input_tokens_details": {
+          "cached_tokens": 0
+        },
+        "output_tokens": 1,
+        "output_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "total_tokens": 2
+      },
+      "codex_accepts": true,
+      "codex_terminal_event": "turn.completed",
+      "codex_error": null
+    }
+  ]
+}

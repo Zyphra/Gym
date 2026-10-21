@@ -806,13 +806,20 @@ class ResponsesConverter(BaseModel):
                 "reasoning_tokens",
                 "reasoning_output_tokens",
             )
+            # The Responses API types both details as integers, and strict clients reject a null
+            # there: the Codex CLI fails every turn with "failed to parse ResponseCompleted: invalid
+            # type: null, expected i64". Backends routinely omit them (vLLM sends no
+            # completion_tokens_details; the wrapper's episode endpoint sends prompt_tokens_details
+            # only when vLLM reports cached tokens), so a detail the backend omits is reported as 0.
             usage = NeMoGymResponseUsage(
                 input_tokens=chat_completion.usage.prompt_tokens,
                 input_tokens_details=NeMoGymResponseInputTokensDetails(
-                    cached_tokens=cached_tokens,
+                    cached_tokens=0 if cached_tokens is None else cached_tokens,
                 ),
                 output_tokens=chat_completion.usage.completion_tokens,
-                output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=reasoning_tokens),
+                output_tokens_details=NeMoGymResponseOutputTokensDetails(
+                    reasoning_tokens=0 if reasoning_tokens is None else reasoning_tokens,
+                ),
                 # Provider totals can use accounting that differs from prompt + completion.
                 total_tokens=chat_completion.usage.total_tokens,
             )

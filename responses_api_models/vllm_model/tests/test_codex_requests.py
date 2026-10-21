@@ -42,7 +42,11 @@ CODEX_REQUESTS = json.loads(
 )
 
 
-def _server(monkeypatch: MonkeyPatch) -> tuple[VLLMModel, AsyncMock]:
+# The usage block the wrapper's episode endpoint returns for a sampled turn: no token details.
+ENDPOINT_USAGE = {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14}
+
+
+def _server(monkeypatch: MonkeyPatch, usage: dict | None = None) -> tuple[VLLMModel, AsyncMock]:
     monkeypatch.setattr(nemo_gym.server_utils, "get_global_config_dict", MagicMock(return_value={}))
     server = VLLMModel(
         config=VLLMModelConfig(
@@ -71,8 +75,11 @@ def _server(monkeypatch: MonkeyPatch) -> tuple[VLLMModel, AsyncMock]:
             )
         ],
     )
+    backend_completion = completion.model_dump()
+    if usage is not None:
+        backend_completion["usage"] = dict(usage)
     backend = MagicMock(spec=NeMoGymAsyncOpenAI)
-    backend.create_chat_completion = AsyncMock(return_value=completion.model_dump())
+    backend.create_chat_completion = AsyncMock(return_value=backend_completion)
     server._clients = [backend]
     return server, backend.create_chat_completion
 
@@ -95,3 +102,47 @@ def test_codex_requests_stream_to_completion_with_append_only_chat_history(monke
     assert sent[2]["messages"][:5] == sent[1]["messages"]
     assert all("include" not in chat for chat in sent)
     assert all(chat["model"] == "policy" for chat in sent)
+
+
+def _completed_usage(sse: str) -> dict:
+    events = [json.loads(line[len("data: ") :]) for line in sse.splitlines() if line.startswith("data: ")]
+    assert events[-1]["type"] == "response.completed"
+    return events[-1]["response"]["usage"]
+
+
+def test_codex_requests_get_integer_usage_details_from_the_endpoint_usage_block(monkeypatch: MonkeyPatch) -> None:
+    # codex-cli 0.144.4 fails a turn whose response.completed carries a null cached_tokens or
+    # reasoning_tokens (tests/unit_tests/fixtures/codex-0.144.4-response-completed-usage.json).
+    server, _ = _server(monkeypatch, usage=ENDPOINT_USAGE)
+    client = TestClient(server.setup_webserver())
+
+    for body in CODEX_REQUESTS:
+        response = client.post("/v1/responses", json=body)
+
+        assert response.status_code == 200
+        assert "event: response.failed" not in response.text
+        assert _completed_usage(response.text) == {
+            "input_tokens": 11,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 3,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 14,
+        }
+
+
+def test_chat_completions_clients_get_the_backend_usage_unchanged(monkeypatch: MonkeyPatch) -> None:
+    server, _ = _server(monkeypatch, usage=ENDPOINT_USAGE)
+    client = TestClient(server.setup_webserver())
+
+    response = client.post(
+        "/v1/chat/completions", json={"model": "policy", "messages": [{"role": "user", "content": "hi"}]}
+    )
+
+    # The chat route never goes through the Responses converter: the backend's counts come back as
+    # they were, with the chat model's own null placeholders for the details it did not send.
+    assert response.status_code == 200
+    assert response.json()["usage"] == {
+        **ENDPOINT_USAGE,
+        "prompt_tokens_details": None,
+        "completion_tokens_details": None,
+    }
