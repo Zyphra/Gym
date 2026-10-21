@@ -109,6 +109,8 @@ claude_code_agent:
       system_prompt: null
       allowed_tools: null
       disallowed_tools: null
+      tools: null
+      env: {}
       claude_code_version: null
       thinking: null
       max_thinking_tokens: null
@@ -121,11 +123,14 @@ claude_code_agent:
 - `model`: model name. Full names like `Qwen/Qwen3-4B-Instruct-2507` are kept as-is for local endpoints; the provider prefix is stripped only when `anthropic_base_url` is not set
 - `anthropic_api_key`: Anthropic API key, or any non-empty string for local endpoints
 - `anthropic_base_url`: if set, used as `ANTHROPIC_BASE_URL`. Leave null for the real Anthropic API
+- `sandbox_model_base_url`: when set (by a sandbox relay that already scopes its upstream), used as `ANTHROPIC_BASE_URL` as given, less a trailing `/v1`; no rollout prefix is added
 - `max_turns`: passed to `--max-turns`. Set to `null` to omit the flag entirely (unlimited turns)
 - `timeout`: per-request wall-clock seconds
 - `system_prompt`: appended to Claude Code's built-in system prompt via `--append-system-prompt`. The data's system message (if any) is also appended after this.
 - `allowed_tools`: passed to `--allowedTools` (e.g. `"Bash,Read"`)
 - `disallowed_tools`: passed to `--disallowedTools`
+- `tools`: passed to `--tools`, the built-in tool whitelist (e.g. `"Bash,Read,Edit"`; `""` disables all tools). Unlike `allowed_tools`, which only auto-approves under `--dangerously-skip-permissions`, it removes the other tools. With `bare: true` the CLI already offers only Bash, Read and Edit, so the whitelist can only narrow that set
+- `env`: extra environment for the CLI, set on the process and merged last into the per-run `settings.json` `env` block. The keys the agent sets itself (`ANTHROPIC_*` transport and model slots, `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CONFIG_DIR`, `IS_SANDBOX`) are rejected
 - `claude_code_version`: npm version to pin on auto-install (null means latest)
 - `thinking`: passed to `--thinking` (`disabled`, `adaptive`, or `enabled`)
 - `max_thinking_tokens`: passed to `--max-thinking-tokens` to cap thinking token usage

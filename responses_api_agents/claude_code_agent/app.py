@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional
 from uuid import uuid4
 
 from fastapi import Request
-from pydantic import ConfigDict, Field, PrivateAttr
+from pydantic import ConfigDict, Field, PrivateAttr, field_validator
 
 from nemo_gym.base_resources_server import NEMO_GYM_MCP_METADATA_KEY, BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body, SimpleResponsesAPIAgent
@@ -55,6 +55,22 @@ from responses_api_agents.claude_code_agent.setup_claude_code import ensure_clau
 
 
 LOG = logging.getLogger(__name__)
+
+# Set by the agent itself for every run: the transport, the model slots and the config dir.
+_AGENT_OWNED_ENV = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_CONFIG_DIR",
+        "IS_SANDBOX",
+    }
+)
 
 
 def _extract_text(content: list[Any]) -> str:
@@ -269,6 +285,11 @@ class ClaudeCodeAgentConfig(BaseResponsesAPIAgentConfig):
     system_prompt: Optional[str] = None
     allowed_tools: Optional[str] = None
     disallowed_tools: Optional[str] = None
+    # Built-in tool whitelist passed as ``--tools`` (e.g. "Bash,Read,Edit"; "" disables all tools).
+    # Under --dangerously-skip-permissions ``allowed_tools`` only auto-approves; this restricts.
+    tools: Optional[str] = None
+    # Extra CLI environment, set on the process and merged into settings.json ``env`` last.
+    env: dict[str, str] = Field(default_factory=dict)
     claude_code_version: Optional[str] = None
     thinking: Optional[str] = None
     max_thinking_tokens: Optional[int] = None
@@ -278,6 +299,15 @@ class ClaudeCodeAgentConfig(BaseResponsesAPIAgentConfig):
     bare: bool = True
     mcp_config: Optional[str] = None
     settings: Optional[str] = None
+
+    @field_validator("env")
+    @classmethod
+    def _env_leaves_agent_keys(cls, env: dict[str, str]) -> dict[str, str]:
+        # settings.json env overrides the process env, so these would silently redirect the transport.
+        owned = sorted(set(env) & _AGENT_OWNED_ENV)
+        if owned:
+            raise ValueError(f"env must not set agent-owned keys: {owned}")
+        return env
 
 
 class ClaudeCodeAgentRunRequest(BaseRunRequest):
@@ -322,7 +352,11 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
 
         Apply the prefix only for a configured Gym model server.
         A real Anthropic endpoint has no prefix-stripping middleware.
+        A sandbox relay already scopes its upstream, so its URL is used as given
+        (less a trailing ``/v1``: the CLI appends ``/v1/messages`` itself).
         """
+        if self.config.sandbox_model_base_url is not None:
+            return self.config.sandbox_model_base_url.rstrip("/").removesuffix("/v1")
         base_url = self._resolve_base_url()
         if base_url and self.config.model_server:
             base_url = apply_rollout_prefix(
@@ -338,6 +372,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
         The base settings disable telemetry/attribution. When ``config.settings`` points at a
         JSON file, its contents are layered on top: top-level keys override, and the ``env`` block
         is shallow-merged so the telemetry defaults are preserved unless explicitly overridden.
+        ``config.env`` is merged into ``env`` last.
         """
         settings: dict[str, Any] = {
             "env": {
@@ -350,6 +385,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             user_settings = json.loads(Path(self.config.settings).expanduser().read_text())
             user_env = user_settings.get("env") or {}
             settings = {**settings, **user_settings, "env": {**settings["env"], **user_env}}
+        settings["env"] = {**settings["env"], **self.config.env}
         return settings
 
     def _setup_config_dir(self, skills_path: Optional[str] = None) -> Path:
@@ -418,6 +454,8 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             cmd += ["--allowedTools", self.config.allowed_tools]
         if self.config.disallowed_tools:
             cmd += ["--disallowedTools", self.config.disallowed_tools]
+        if self.config.tools is not None:
+            cmd += ["--tools", self.config.tools]
         if self.config.thinking:
             cmd += ["--thinking", self.config.thinking]
         if self.config.max_thinking_tokens is not None:
@@ -454,6 +492,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             claude_config_dir = self._setup_config_dir(skills_path=skills_path)
             env = {
                 **os.environ,
+                **self.config.env,
                 "ANTHROPIC_API_KEY": api_key,  # pragma: allowlist secret
                 "ANTHROPIC_MODEL": model,
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
