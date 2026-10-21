@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+from contextlib import nullcontext
+
 from pydantic import ValidationError
-from pytest import raises, warns
+from pytest import mark, raises, warns
 
 from nemo_gym.config_types import (
+    BaseRunServerTypeConfig,
     DatasetConfig,
     GitlabDatasetSource,
     HuggingFaceDatasetSource,
@@ -134,3 +138,94 @@ class TestDatasetSource:
         with raises(ValidationError):
             # Missing repo_id for the huggingface branch.
             DatasetConfig.model_validate(_dataset(source={"type": "huggingface", "artifact_fpath": "train.jsonl"}))
+
+    @mark.parametrize("exclude_unset", [False, True])
+    @mark.parametrize(
+        "declaration",
+        [
+            {},
+            {
+                "source": {
+                    "type": "gitlab",
+                    "dataset_name": "my_dataset",
+                    "version": "0.0.1",
+                    "artifact_fpath": "train.jsonl",
+                }
+            },
+            {"source": {"type": "huggingface", "repo_id": "org/dataset"}},
+            {
+                "gitlab_identifier": {
+                    "dataset_name": "my_dataset",
+                    "version": "0.0.1",
+                    "artifact_fpath": "train.jsonl",
+                }
+            },
+            {"huggingface_identifier": {"repo_id": "org/dataset", "artifact_fpath": "train.jsonl"}},
+            {
+                "gitlab_identifier": {
+                    "dataset_name": "my_dataset",
+                    "version": "0.0.1",
+                    "artifact_fpath": "train.jsonl",
+                },
+                "huggingface_identifier": {"repo_id": "org/fallback"},
+            },
+        ],
+    )
+    def test_native_json_roundtrip_preserves_consumed_values(self, declaration, exclude_unset) -> None:
+        legacy = "gitlab_identifier" in declaration or "huggingface_identifier" in declaration
+        with warns(DeprecationWarning) if legacy else nullcontext():
+            original = DatasetConfig.model_validate(_dataset(**declaration))
+        dumped = original.model_dump_json(exclude_unset=exclude_unset)
+        source_fields = json.loads(dumped)
+        if original.source is not None:
+            assert source_fields["source"] == original.source.model_dump(mode="json")
+            assert "gitlab_identifier" not in source_fields
+            assert "huggingface_identifier" not in source_fields
+        if original.huggingface_identifier is not None:
+            assert original.model_dump(include={"huggingface_identifier"}) == {
+                "huggingface_identifier": original.huggingface_identifier.model_dump()
+            }
+        with warns(DeprecationWarning) if original.source is None and legacy else nullcontext():
+            restored = DatasetConfig.model_validate_json(dumped)
+        # Equality compares all stored native fields, including backfilled
+        # legacy identifiers still read by dataset download consumers.
+        assert restored == original
+        assert restored.model_dump_json(exclude_unset=exclude_unset) == dumped
+
+    def test_roundtrip_preserves_missing_and_explicit_null_source(self) -> None:
+        missing = DatasetConfig.model_validate(_dataset())
+        assert "source" not in missing.model_dump(exclude_unset=True)
+        for field in ("source", "gitlab_identifier", "huggingface_identifier"):
+            explicit = DatasetConfig.model_validate(_dataset(**{field: None}))
+            dumped = explicit.model_dump_json(exclude_unset=True)
+            assert json.loads(dumped)[field] is None
+            restored = DatasetConfig.model_validate_json(dumped)
+            assert restored.model_dump_json(exclude_unset=True) == dumped
+
+    @mark.parametrize("backend", ["gitlab", "huggingface"])
+    def test_conflicting_declared_source_stays_refused(self, backend) -> None:
+        if backend == "gitlab":
+            source = {"type": "gitlab", "dataset_name": "one", "version": "0.0.1", "artifact_fpath": "one.jsonl"}
+            legacy = {"gitlab_identifier": {"dataset_name": "two", "version": "0.0.1", "artifact_fpath": "two.jsonl"}}
+        else:
+            source = {"type": "huggingface", "repo_id": "org/one"}
+            legacy = {"huggingface_identifier": {"repo_id": "org/two"}}
+        with raises(ValidationError, match="set only one"):
+            DatasetConfig.model_validate(_dataset(source=source, **legacy))
+
+    def test_native_server_catalog_roundtrip(self) -> None:
+        with warns(DeprecationWarning):
+            original = BaseRunServerTypeConfig.model_validate(
+                {
+                    "entrypoint": "app.py",
+                    "datasets": [
+                        _dataset(
+                            type="train",
+                            license="Apache 2.0",
+                            huggingface_identifier={"repo_id": "org/dataset", "artifact_fpath": "train.jsonl"},
+                        )
+                    ],
+                }
+            )
+        restored = BaseRunServerTypeConfig.model_validate_json(original.model_dump_json())
+        assert restored == original

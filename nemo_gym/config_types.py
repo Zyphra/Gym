@@ -26,6 +26,7 @@ from pydantic import (
     Field,
     TypeAdapter,
     ValidationError,
+    model_serializer,
     model_validator,
 )
 from pydantic_core import PydanticUndefined
@@ -465,6 +466,21 @@ class DatasetConfig(BaseModel):
             Literal["GNU General Public License v3.0"],
         ]
     ] = None
+
+    @model_serializer(mode="wrap")
+    def serialize_dataset_source(self, handler):
+        """Dump one source form while retaining legacy attributes for consumers.
+
+        Normalization backfills aliases in memory. Emit the unified source
+        when present so the dump can pass the same mutually exclusive input
+        validation. A legacy primary/fallback pair has no unified source and
+        retains both identifiers. Explicit field selection remains respected.
+        """
+        value = handler(self)
+        if value.get("source") is not None:
+            value.pop("gitlab_identifier", None)
+            value.pop("huggingface_identifier", None)
+        return value
 
     @model_validator(mode="after")
     def check_train_validation_sets(self) -> "DatasetConfig":
