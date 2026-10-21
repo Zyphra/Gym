@@ -18,6 +18,7 @@ These were previously duplicated verbatim across the enroot, apptainer, and
 opensandbox providers. They live here so there is a single implementation.
 """
 
+import asyncio
 import posixpath
 from collections.abc import Mapping
 from typing import Any
@@ -50,3 +51,36 @@ def path_under_mount(mount_point: str, path: str) -> str | None:
     if mp == "/":
         return normalized.lstrip("/")
     return normalized[len(mp) + 1 :]
+
+
+class CapturedTimeout(TimeoutError):
+    def __init__(self, message: str, stdout: str, stderr: str, facts: dict[str, int | bool]) -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+        self.facts = facts
+
+
+class PipeCapture:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.retained = bytearray()
+        self.seen = 0
+        self.complete = False
+
+    async def drain(self, reader: asyncio.StreamReader) -> None:
+        while chunk := await reader.read(64 * 1024):
+            self.seen += len(chunk)
+            if len(self.retained) < self.limit:
+                self.retained.extend(chunk[: self.limit - len(self.retained)])
+        self.complete = True
+
+
+def capture_facts(stdout: PipeCapture, stderr: PipeCapture) -> dict[str, int | bool]:
+    return {
+        "stdout_bytes": stdout.seen,
+        "stderr_bytes": stderr.seen,
+        "stdout_truncated": stdout.seen > len(stdout.retained) or not stdout.complete,
+        "stderr_truncated": stderr.seen > len(stderr.retained) or not stderr.complete,
+        "capture_complete": stdout.complete and stderr.complete,
+    }

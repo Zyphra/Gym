@@ -23,7 +23,6 @@ liveness, ``#``-registry URIs, pinned ``ENROOT_*`` paths).
 """
 
 import asyncio
-from nemo_gym.sandbox.providers.base import notify_exec_timeout
 import contextlib
 import hashlib
 import logging
@@ -48,7 +47,11 @@ from nemo_gym.sandbox.providers.base import (
     SandboxResources,
     SandboxSpec,
     SandboxStatus,
+    notify_exec_timeout,
 )
+from nemo_gym.sandbox.providers.utils import CapturedTimeout as _CapturedTimeout
+from nemo_gym.sandbox.providers.utils import PipeCapture as _PipeCapture
+from nemo_gym.sandbox.providers.utils import capture_facts as _capture_facts
 from nemo_gym.sandbox.providers.utils import coerce_config as _coerce_config
 from nemo_gym.sandbox.providers.utils import path_under_mount as _path_under_mount
 from nemo_gym.setup_timeout import setup_timeout_seconds
@@ -374,26 +377,73 @@ class EnrootProvider:
                 start_new_session=True,
                 env={**self._enroot_env, **(environment or {})},
             )
+            limit = self._exec_config.max_output_bytes if capture_facts is not None else None
+            stdout_capture = _PipeCapture(limit) if limit is not None else None
+            stderr_capture = _PipeCapture(limit) if limit is not None else None
+            readers = (
+                [
+                    asyncio.create_task(stdout_capture.drain(proc.stdout)),
+                    asyncio.create_task(stderr_capture.drain(proc.stderr)),
+                ]
+                if limit is not None
+                else []
+            )
+
+            async def stop_readers() -> None:
+                # Retain the bounded bytes observed before the deadline. Closing
+                # our pipe transports also prevents an escaped writer from
+                # withholding EOF after the owned process group is killed.
+                for fd, reader in zip((1, 2), readers):
+                    if not reader.done():
+                        pipe = proc._transport.get_pipe_transport(fd)
+                        if pipe is not None:
+                            pipe.close()
+                        reader.cancel()
+                if readers:
+                    await asyncio.gather(*readers, return_exceptions=True)
+
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(input=stdin),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError as e:
-                notify_exec_timeout()
+                if limit is None:
+                    stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(input=stdin), timeout=timeout_s)
+                else:
+
+                    async def finish_bounded() -> None:
+                        if stdin is not None:
+                            proc.stdin.write(stdin)
+                            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                                await proc.stdin.drain()
+                            proc.stdin.close()
+                        await proc.wait()
+                        await asyncio.shield(asyncio.gather(*readers))
+
+                    await asyncio.wait_for(finish_bounded(), timeout=timeout_s)
+                    stdout_b, stderr_b = bytes(stdout_capture.retained), bytes(stderr_capture.retained)
+                    capture_facts.update(_capture_facts(stdout_capture, stderr_capture))
+            except (asyncio.TimeoutError, asyncio.CancelledError) as error:
+                if not isinstance(error, asyncio.CancelledError):
+                    notify_exec_timeout()
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                await stop_readers()
                 with contextlib.suppress(Exception):
                     await proc.wait()
-                raise TimeoutError(f"enroot command timed out after {timeout_s:g}s: {argv}") from e
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                message = f"enroot command timed out after {timeout_s:g}s: {argv}"
+                if limit is not None:
+                    facts = _capture_facts(stdout_capture, stderr_capture)
+                    capture_facts.update(facts)
+                    raise _CapturedTimeout(
+                        message,
+                        stdout_capture.retained.decode(errors="replace"),
+                        stderr_capture.retained.decode(errors="replace"),
+                        facts,
+                    ) from error
+                raise TimeoutError(message) from error
+            finally:
+                await stop_readers()
 
             return_code = proc.returncode if proc.returncode is not None else SANDBOX_RUNTIME_RETURN_CODE
-            if capture_facts is not None:
-                limit = self._exec_config.max_output_bytes
-                capture_facts.update(stdout_bytes=len(stdout_b), stderr_bytes=len(stderr_b),
-                                     stdout_truncated=len(stdout_b) > limit,
-                                     stderr_truncated=len(stderr_b) > limit, capture_complete=True)
-                stdout_b, stderr_b = stdout_b[:limit], stderr_b[:limit]
             return return_code, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
 
     async def _start_detached(self, argv: list[str]) -> tuple[Any, IO[bytes], IO[bytes]]:
@@ -768,14 +818,17 @@ class EnrootProvider:
 
         capture_facts: dict[str, int | bool] = {}
         try:
-            code, out, err = await self._run(argv, timeout_s=effective_timeout, stdin=stdin,
-                                             capture_facts=capture_facts, environment=merged_env)
+            code, out, err = await self._run(
+                argv, timeout_s=effective_timeout, stdin=stdin, capture_facts=capture_facts, environment=merged_env
+            )
         except TimeoutError as e:
+            captured = isinstance(e, _CapturedTimeout)
             return SandboxExecResult(
-                stdout=None,
-                stderr=str(e),
+                stdout=e.stdout if captured else None,
+                stderr=(e.stderr or str(e)) if captured else str(e),
                 return_code=SANDBOX_RUNTIME_RETURN_CODE,
                 error_type="timeout",
+                **(e.facts if captured else {}),
             )
 
         if code != 0 and _is_runtime_failure(err):
@@ -785,8 +838,7 @@ class EnrootProvider:
                 return_code=SANDBOX_RUNTIME_RETURN_CODE,
                 error_type="sandbox",
             )
-        return SandboxExecResult(stdout=out, stderr=err, return_code=code, error_type=None,
-                                 **capture_facts)
+        return SandboxExecResult(stdout=out, stderr=err, return_code=code, error_type=None, **capture_facts)
 
     async def upload_file(self, handle: SandboxHandle, source_path: Path, target_path: str) -> None:
         """Upload one host file into the sandbox.
