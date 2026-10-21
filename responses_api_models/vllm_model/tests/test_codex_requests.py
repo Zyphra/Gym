@@ -146,3 +146,26 @@ def test_chat_completions_clients_get_the_backend_usage_unchanged(monkeypatch: M
         "prompt_tokens_details": None,
         "completion_tokens_details": None,
     }
+
+
+REPLAYED_TEXT = json.loads(
+    (PARENT_DIR / "tests/unit_tests/fixtures/codex-0.144.4-replayed-assistant-text-requests.json").read_text()
+)
+
+
+def test_codex_second_turns_reach_the_backend_with_the_text_the_policy_served(monkeypatch: MonkeyPatch) -> None:
+    # The episode endpoint compares this replayed turn with the one it served; without the text it
+    # rejects the continuation as not append-only (tests/unit_tests/test_responses_streaming_replayed_assistant_text.py).
+    server, create_chat_completion = _server(monkeypatch, usage=ENDPOINT_USAGE)
+    client = TestClient(server.setup_webserver())
+
+    for case in REPLAYED_TEXT["cases"]:
+        response = client.post("/v1/responses", json=case["turn2_request"])
+
+        assert response.status_code == 200
+        assert "event: response.failed" not in response.text
+        sent = create_chat_completion.await_args.kwargs["messages"]
+        assistant = [message for message in sent if message["role"] == "assistant"]
+        assert len(assistant) == 1
+        assert assistant[0]["content"] == case["served_text"]
+        assert [call["function"]["name"] for call in assistant[0]["tool_calls"]] == case["served_calls"]
