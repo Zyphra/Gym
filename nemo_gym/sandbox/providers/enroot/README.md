@@ -110,3 +110,12 @@ enroot:
 ```
 
 
+
+## Command output and timeouts
+
+Exec retains a bounded prefix of each output stream, with byte counts, truncation
+flags and capture completeness. The same capture owner serves Apptainer and
+Enroot. A native timeout keeps the observed partial stdout/stderr, returns the
+existing timeout classification and runtime return code, and kills/reaps the
+owned process group. Truncated or incomplete output is not a completed test or
+verdict. Deadline and resource budgets are unchanged.

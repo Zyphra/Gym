@@ -42,6 +42,9 @@ from nemo_gym.sandbox.providers.base import (
     SandboxSpec,
     SandboxStatus,
 )
+from nemo_gym.sandbox.providers.utils import CapturedTimeout as _CapturedTimeout
+from nemo_gym.sandbox.providers.utils import PipeCapture as _PipeCapture
+from nemo_gym.sandbox.providers.utils import capture_facts as _capture_facts
 from nemo_gym.sandbox.providers.utils import coerce_config as _coerce_config
 from nemo_gym.sandbox.providers.utils import path_under_mount as _path_under_mount
 from nemo_gym.sandbox.utils import remove_private_directory
@@ -160,39 +163,6 @@ class ApptainerExecConfig:
             raise ValueError("exec.max_output_bytes must be > 0")
 
 
-class _CapturedTimeout(TimeoutError):
-    def __init__(self, message: str, stdout: str, stderr: str, facts: dict[str, int | bool]) -> None:
-        super().__init__(message)
-        self.stdout = stdout
-        self.stderr = stderr
-        self.facts = facts
-
-
-class _PipeCapture:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self.retained = bytearray()
-        self.seen = 0
-        self.complete = False
-
-    async def drain(self, reader: asyncio.StreamReader) -> None:
-        while chunk := await reader.read(64 * 1024):
-            self.seen += len(chunk)
-            if len(self.retained) < self.limit:
-                self.retained.extend(chunk[: self.limit - len(self.retained)])
-        self.complete = True
-
-
-def _capture_facts(stdout: _PipeCapture, stderr: _PipeCapture) -> dict[str, int | bool]:
-    return {
-        "stdout_bytes": stdout.seen,
-        "stderr_bytes": stderr.seen,
-        "stdout_truncated": stdout.seen > len(stdout.retained) or not stdout.complete,
-        "stderr_truncated": stderr.seen > len(stderr.retained) or not stderr.complete,
-        "capture_complete": stdout.complete and stderr.complete,
-    }
-
-
 @dataclass(frozen=True)
 class ApptainerProbeConfig:
     """Post-create probe settings: a test command confirming the sandbox is usable."""
@@ -307,9 +277,7 @@ def _require_disk_backing(path: Path) -> None:
     # Overlay mounts can themselves have a tmpfs upper directory; they do not
     # prove disk backing. The caller must choose an explicitly mounted local disk.
     if filesystem not in {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs"}:
-        raise ApptainerCreateError(
-            f"disk_backed_overlay requires a local disk filesystem; {path} uses {filesystem}"
-        )
+        raise ApptainerCreateError(f"disk_backed_overlay requires a local disk filesystem; {path} uses {filesystem}")
 
 
 def _to_sandbox_status(state: str | None) -> SandboxStatus:
@@ -564,6 +532,7 @@ class ApptainerProvider:
                 if limit is None:
                     stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(input=stdin), timeout=timeout_s)
                 else:
+
                     async def finish_bounded() -> None:
                         if stdin is not None:
                             proc.stdin.write(stdin)
@@ -582,7 +551,9 @@ class ApptainerProvider:
                 # handler), THEN SIGKILL if it hasn't exited.
                 if cgroup is not None:
                     with contextlib.suppress(Exception):
-                        await cgroup.terminate(self._exec_config.timeout_grace_s, reap_owned_children=True, waiter_pid=proc.pid)
+                        await cgroup.terminate(
+                            self._exec_config.timeout_grace_s, reap_owned_children=True, waiter_pid=proc.pid
+                        )
                 else:
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -621,7 +592,9 @@ class ApptainerProvider:
                 if limit is not None:
                     raise _CapturedTimeout(
                         f"apptainer command timed out after {timeout_s:g}s: {argv}",
-                        stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace"), facts,
+                        stdout_b.decode(errors="replace"),
+                        stderr_b.decode(errors="replace"),
+                        facts,
                     ) from e
                 raise TimeoutError(f"apptainer command timed out after {timeout_s:g}s: {argv}") from e
             return_code = proc.returncode if proc.returncode is not None else SANDBOX_RUNTIME_RETURN_CODE
@@ -677,9 +650,7 @@ class ApptainerProvider:
         return_code = proc.returncode if proc.returncode is not None else SANDBOX_RUNTIME_RETURN_CODE
         return return_code, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
 
-    async def _stop_instance(
-        self, name: str, *, sandbox_cgroup: _SandboxCgroup | None = None
-    ) -> tuple[int, str, str]:
+    async def _stop_instance(self, name: str, *, sandbox_cgroup: _SandboxCgroup | None = None) -> tuple[int, str, str]:
         """Run ``apptainer instance stop`` and reap the instance if it is our child."""
         pidfd = None
         container_pidfd = None
@@ -834,7 +805,14 @@ class ApptainerProvider:
             # directory the task can see.
             start_args += ["--no-mount", "home,tmp"]
             overlay_path = staging_dir / "writable-overlay.img"
-            overlay_argv = [self._binary, "overlay", "create", "--sparse", "--size", str(spec.resources.disk_gib * 1024)]
+            overlay_argv = [
+                self._binary,
+                "overlay",
+                "create",
+                "--sparse",
+                "--size",
+                str(spec.resources.disk_gib * 1024),
+            ]
             if "--fakeroot" in start_args:
                 overlay_argv.append("--fakeroot")
             overlay_argv.append(str(overlay_path))
@@ -1033,7 +1011,9 @@ class ApptainerProvider:
                         if completed and exec_cgroup.populated():
                             exec_cgroup.retain_counters()
                         else:
-                            await asyncio.shield(inst.cgroup.remove_exec_leaf(exec_cgroup, 0, reap_owned_children=True))
+                            await asyncio.shield(
+                                inst.cgroup.remove_exec_leaf(exec_cgroup, 0, reap_owned_children=True)
+                            )
         except TimeoutError as e:
             facts = e.facts if isinstance(e, _CapturedTimeout) else {}
             return SandboxExecResult(
