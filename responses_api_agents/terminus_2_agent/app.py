@@ -103,9 +103,7 @@ def _extract_instruction(body_input: Any) -> tuple[str, Optional[str]]:
 def _require_directory(path: Path, message: str) -> None:
     """Validate directories through the kernel, avoiding fakeroot stat metadata."""
     try:
-        descriptor = os.open(
-            path, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_CLOEXEC
-        )
+        descriptor = os.open(path, getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError as error:
         if error.errno not in (errno.ENOENT, errno.ENOTDIR):
             raise
@@ -139,15 +137,23 @@ def _tmux_control_operation(command: str) -> str | None:
         words = shlex.split(command, comments=False, posix=True)
     except ValueError:
         return None
-    return words[1] if (len(words) >= 2 and words[0] == "tmux"
-                        and words[1] in {"capture-pane", "send-keys", "has-session", "list-panes"}) else None
+    return (
+        words[1]
+        if (
+            len(words) >= 2
+            and words[0] == "tmux"
+            and words[1] in {"capture-pane", "send-keys", "has-session", "list-panes"}
+        )
+        else None
+    )
 
 
 class LocalEnvironment:
     """Execute Harbor environment commands in one local workspace."""
 
-    def __init__(self, cwd: Path, command_timeout_sec: float,
-                 tmux_control_timeout_sec: float = TMUX_CONTROL_TIMEOUT_SECONDS) -> None:
+    def __init__(
+        self, cwd: Path, command_timeout_sec: float, tmux_control_timeout_sec: float = TMUX_CONTROL_TIMEOUT_SECONDS
+    ) -> None:
         self.cwd = cwd.resolve()
         self.command_timeout_sec = command_timeout_sec
         self.tmux_control_timeout_sec = tmux_control_timeout_sec
@@ -224,6 +230,7 @@ class LocalEnvironment:
                 stderr=control_stderr if control_stderr is not None else asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
+
             async def communicate():
                 stdout, stderr = await proc.communicate()
                 if control_stdout is not None:
@@ -255,15 +262,18 @@ class LocalEnvironment:
                     if event is not None:
                         self._memory_budget_events.append(event)
                         LOG.warning("Terminus tool resource feedback: %s", json.dumps(event, sort_keys=True))
-                        return await self.exec(command=original_command, cwd=cwd, env=env,
-                                               timeout_sec=timeout_sec, _control_retry=False)
+                        return await self.exec(
+                            command=original_command, cwd=cwd, env=env, timeout_sec=timeout_sec, _control_retry=False
+                        )
                 message = stderr.decode(errors="replace")
                 message += f"\nCommand timed out after {timeout:g} seconds"
                 return ExecResult(stdout=stdout.decode(errors="replace"), stderr=message.strip(), return_code=124)
 
             text = stdout.decode(errors="replace")
             if control_op == "capture-pane" and self._memory_budget_events:
-                text = "\n".join(json.dumps(event, sort_keys=True) for event in self._memory_budget_events) + "\n" + text
+                text = (
+                    "\n".join(json.dumps(event, sort_keys=True) for event in self._memory_budget_events) + "\n" + text
+                )
                 self._memory_budget_events.clear()
             return ExecResult(
                 stdout=text,
@@ -704,7 +714,8 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             service_tier="default",
             status="failed" if flags.get("model_transport_error") else "completed",
             error=ResponseError(code="server_error", message=flags["model_transport_error"])
-            if flags.get("model_transport_error") else None,
+            if flags.get("model_transport_error")
+            else None,
             text={"format": {"type": "text"}, "verbosity": "medium"},
             top_logprobs=0,
             truncation="disabled",
