@@ -332,6 +332,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             return_token_id_information=self.config.return_token_id_information,
             uses_reasoning_parser=self.config.uses_reasoning_parser,
             preserve_explicit_assistant_boundaries=self.config.preserve_explicit_assistant_boundaries,
+            preserve_reasoning_in_assistant_content=self.config.preserve_reasoning_in_assistant_content,
         )
 
     def model_post_init(self, context):
