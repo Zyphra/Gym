@@ -77,6 +77,78 @@ def _config(**overrides) -> AnySweAgentConfig:
     return AnySweAgentConfig(**base)
 
 
+@pytest.mark.parametrize("limit", [None, 4])
+async def test_run_concurrency_null_is_unbounded_and_integer_is_bounded(tmp_path, monkeypatch, limit):
+    import asyncio
+
+    from omegaconf import OmegaConf
+
+    from nemo_gym.server_utils import BaseServerConfig, ServerClient
+
+    config = _config(
+        concurrency=limit,
+        model_server=None,
+        agent_runtime_source="baked",
+        sandbox_model_base_url="http://127.0.0.1:19002/v1",
+    )
+    head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
+    client = ServerClient(head_server_config=head, global_config_dict=OmegaConf.create({"results_dir": str(tmp_path)}))
+    agent = AnySweAgent(config=config, server_client=client)
+    assert (agent._sem is None) == (limit is None)
+    release = asyncio.Event()
+    reached = asyncio.Event()
+    active = peak = entered = 0
+    expected = 24 if limit is None else limit
+
+    class ControlledEnd(Exception):
+        pass
+
+    async def responses(self, body, rollout_id=None):
+        nonlocal active, peak, entered
+        active += 1
+        entered += 1
+        peak = max(peak, active)
+        if active == expected:
+            reached.set()
+        try:
+            await release.wait()
+            raise ControlledEnd
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(AnySweAgent, "_responses", responses)
+    body = AnySweRunRequest.model_validate({"responses_create_params": {"input": []}})
+    requests = [asyncio.create_task(agent.run(body)) for _ in range(24)]
+    try:
+        await asyncio.wait_for(reached.wait(), timeout=2)
+        assert active == expected
+        assert entered == expected
+    finally:
+        release.set()
+        results = await asyncio.gather(*requests, return_exceptions=True)
+    assert all(isinstance(result, ControlledEnd) for result in results)
+    assert peak == expected
+    assert entered == 24
+    assert active == 0
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_run_concurrency_refuses_nonpositive_limits(limit):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _config(concurrency=limit)
+
+
+@pytest.mark.parametrize("harness", ["pi", "hermes"])
+def test_pi_and_hermes_yaml_select_unbounded_concurrency(harness):
+    import yaml
+
+    path = Path(__file__).parents[1] / "configs" / f"anyswe_{harness}.yaml"
+    raw = yaml.safe_load(path.read_text())
+    assert raw[f"anyswe_{harness}"]["responses_api_agents"]["anyswe_agent"]["concurrency"] is None
+
+
 @pytest.fixture
 def episode_submissions(monkeypatch):
     """Exercise shared dispatch and its real payload without starting a Ray cluster."""
