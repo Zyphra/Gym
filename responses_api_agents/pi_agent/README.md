@@ -3,8 +3,8 @@
 Runs the [pi](https://github.com/earendil-works/pi) CLI (`pi --print --mode json --no-session`). 
 pi runs its own tools internally. Resources server for verifier.
 
-Minimal, meant to be modified if needed, and currently eval-only. Token IDs and logprobs are not wired up and
-it does not use a Gym model server yet.
+The optional Gym model-server binding routes main and compaction calls through
+the admitted episode endpoint. Token capture belongs to that model server.
 
 ## Quick start
 
@@ -46,6 +46,18 @@ models_config:
 Alternatively, set `model_server` to a Gym model server and set `model` to its served model id. The
 agent creates the Pi provider entry automatically. Without `model_server`, the existing provider
 configuration is unchanged.
+
+The generated provider explicitly keeps thinking in `reasoning_content`, rather
+than folding it into answer text or relying on URL detection. Pi-ai 0.80.2
+already replays a sampled thinking block under its captured wire signature;
+the explicit compatibility settings preserve this behavior for episode URLs
+and supply an empty reasoning field for assistant turns without one. They do
+not change the model's thinking format or generation effort.
+
+The native provider regression uses an installed runtime and loopback HTTP:
+`TASK_STOCK_PI_RUNTIME=<runtime> pytest responses_api_agents/pi_agent/tests/test_app.py -k native_thinking`.
+This checks two-turn reasoning echo, including a shortened history, without a
+model call. Model rollout and multi-segment training qualification are separate.
 
 ## Config fields
 

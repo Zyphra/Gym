@@ -546,7 +546,12 @@ class PiAgent(SimpleResponsesAPIAgent):
             "baseUrl": self._resolve_model_base_url(rollout_id),
             "api": "openai-completions",
             "apiKey": "EMPTY",  # pragma: allowlist secret
-            "compat": {"supportsDeveloperRole": False, "supportsReasoningEffort": False},
+            "compat": {
+                "supportsDeveloperRole": False,
+                "supportsReasoningEffort": False,
+                "requiresThinkingAsText": False,
+                "requiresReasoningContentOnAssistantMessages": True,
+            },
             "models": [
                 {
                     "id": self.config.model,
