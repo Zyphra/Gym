@@ -211,6 +211,34 @@ locking.
 Rollout ids contain task, rollout, and retry-attempt indices, but not an evaluation-run id. Use a
 separate capture directory for concurrent collection jobs whose indices can overlap.
 
+## Bounded body capture on selected model servers
+
+Use `model_call_capture_selection` for finite training diagnostics. Its native typed fields
+are all explicit: `model_server_names` (exact names, no globs), `max_records_per_model`,
+`max_record_bytes`, `max_total_bytes`, `pending_records_per_process`, and a timezone-qualified
+`capture_until`. Enable observability and full capture; metadata-only capture is a separate mode.
+Resolve names from the rendered model graph. A shared judge/simulator name cannot establish
+judge-only attribution, and capture does not infer lane or effort from a name.
+
+The destination must be an existing or newly created direct owner-private directory (0700).
+Capture and quota files are owner-only regular files (0600); symlinks and hardlinks are refused.
+One shared quota reserves record count and bytes before append across worker processes, so a
+crash can waste quota but cannot silently increase it. Model workers must use the same selection
+and directory. Limits select the earliest admitted records, not a random or representative cohort.
+
+Each process buffers at most the configured number of pending records, each with bounded
+combined request/response bytes. Excess records are skipped, never truncated into replay inputs.
+A single background writer owns parsing, quota locking and fsync. Terminal response bytes do not
+wait for that writer. Captures are therefore eventually visible and may be missing on abrupt exit;
+missing records stay Unknown. Existing durable evaluation capture is unchanged without a selection.
+
+Transport headers are not retained. Known structured secret fields (authorization, API keys,
+access/refresh tokens and passwords) are redacted; opaque raw payloads are omitted. Redacted
+requests are marked ineligible for exact replay. Free-form prompt content is not a PII scrubber;
+private access and the explicit retention owner still matter. `capture_until` closes new admission
+and writes; it does not delete retained files. The diagnostic owner must remove the bounded
+run directory at its declared retention deadline. This store adds no deletion daemon or monitor.
+
 ## If you build a custom agent
 
 Capture requires a caller-supplied rollout correlation id. Gym's built-in compatible agents handle
