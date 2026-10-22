@@ -707,6 +707,72 @@ class TestEmptyTurnNudge:
             assert ("assistant", "") not in self._shape(server)
         assert _restore_log(private_store) == []
 
+    @staticmethod
+    def _capped(*parts) -> NeMoGymResponse:
+        """A served turn cut at the output token limit."""
+        turn = _turn(*parts).model_dump()
+        return NeMoGymResponse(**{**turn, "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}})
+
+    def test_stacked_nudges_restore_every_dropped_turn_in_order(self, private_store) -> None:
+        # Claude Code 2.1.284 drops a reasoning-only turn cut at the output limit and appends its nudge to the
+        # last user message; three such turns in a row stack three nudges on that one message.
+        first = _tool("call_1", "Bash", SERVED)
+        capped = [self._capped(("reasoning", f"cut {index}")) for index in range(3)]
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), *capped, _text("ok")])
+        _post(client, [TASK])
+        _post(client, _history([first]))
+        inputs = []
+        for stacked in range(1, 4):
+            # As the CLI sends them: each earlier nudge ends with a newline, the last carries cache_control.
+            nudges = [{"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE + "\n"}] * (stacked - 1)
+            nudges.append({"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE, "cache_control": {"type": "ephemeral"}})
+            nudged = _history([first])
+            nudged[-1] = {**nudged[-1], "content": [*nudged[-1]["content"], *nudges]}
+            _post(client, nudged)
+            inputs.append(_comparable(server)["input"])
+        # Every request extends the history the backend got before (append-only) ...
+        for earlier, later in zip(inputs, inputs[1:]):
+            assert later[: len(earlier)] == earlier
+        # ... and the last one carries each dropped turn before its own nudge.
+        reasoning = [item["summary"][0]["text"] for item in _backend_input(server) if item.get("type") == "reasoning"]
+        assert reasoning == ["cut 0", "cut 1", "cut 2"]
+        assert self._shape(server)[-7:] == [
+            ("function_call_output", "call_1"),
+            *[("reasoning", None), ("user", tool_echo.OUTPUT_LIMIT_NUDGE)] * 3,
+        ]
+        keys = sorted(entry["key"] for entry in _restore_log(private_store))
+        assert keys == [
+            "empty:3#output_limit_nudge",
+            "empty:3+1#output_limit_nudge",
+            "empty:3+2#output_limit_nudge",
+        ]
+
+    def test_stacked_nudges_with_an_unrecorded_turn_pass_through(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), self._capped(("reasoning", "cut 0"))])
+        _post(client, [TASK])
+        _post(client, _history([first]))
+        nudge = {"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE}
+        nudged = _history([first])
+        # Two stacked nudges, but this server served only the first cut turn: nothing is half-restored.
+        nudged[-1] = {**nudged[-1], "content": [*nudged[-1]["content"], nudge, nudge]}
+        _post(client, nudged)
+        assert not any(item.get("type") == "reasoning" for item in _backend_input(server))
+        assert _restore_log(private_store) == []
+
+    def test_turns_are_keyed_by_request_length_and_stacked_nudges(self) -> None:
+        nudge = {"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}
+        assert tool_echo.empty_turn_key(3) == tool_echo.empty_turn_key(3, 0) == "empty:3"
+        assert tool_echo.empty_turn_key(3, 2) == "empty:3+2"
+        assert tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, nudge, nudge]}) == 2
+        assert tool_echo.trailing_nudges({"role": "user", "content": [nudge, {"type": "text", "text": "x"}]}) == 0
+        assert tool_echo.trailing_nudges({"role": "assistant", "content": [nudge]}) == 0
+        stacked = {"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE + "\n"}
+        assert tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, stacked, nudge]}) == 2
+        # Only an earlier, stacked nudge may end with the newline.
+        assert tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, stacked]}) == 0
+        assert tool_echo.served_turns({"content": [], "stop_reason": "max_tokens"}, 3, 2)[0]["id"] == "empty:3+2"
+
     def test_a_length_capped_turn_dropped_for_the_output_limit_nudge_is_restored(self, private_store) -> None:
         first = _tool("call_1", "Bash", SERVED)
         client, server = _server([_turn(("tool", "call_1", "Bash", SERVED))])
@@ -828,6 +894,19 @@ class TestStoreFiles:
         store._last_prune = 0.0
         store.record("new", [tool_echo.served_turn({"content": [_tool("call_2", "Bash", SERVED)]})])
         assert sorted(path.name for path in (tmp_path / "store").iterdir()) == ["new.jsonl", "old.restores.jsonl"]
+
+    def test_restore_logs_are_pruned_after_their_own_retention(self, tmp_path) -> None:
+        assert tool_echo.RESTORE_LOG_RETENTION_SECONDS == 7 * 24 * 3600
+        store = tool_echo.ServedToolInputStore(tmp_path / "store", retention_s=60, restore_log_retention_s=600)
+        store.record("old", [tool_echo.served_turn({"content": [_tool("call_1", "Bash", SERVED)]})])
+        body = {"messages": _history([_tool("call_1", "Bash", STRIPPED)])}
+        assert tool_echo.restore_served_turns(body, store, "old")[1]
+        stale = time() - 3600
+        for path in (tmp_path / "store").iterdir():
+            os.utime(path, (stale, stale))
+        store._last_prune = 0.0
+        store.record("new", [tool_echo.served_turn({"content": [_tool("call_2", "Bash", SERVED)]})])
+        assert sorted(path.name for path in (tmp_path / "store").iterdir()) == ["new.jsonl"]
 
     def test_a_store_directory_others_can_read_is_refused(self, tmp_path) -> None:
         root = tmp_path / "shared"

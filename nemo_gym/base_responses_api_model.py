@@ -47,7 +47,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from nemo_gym.anthropic_converter import AnthropicConverter
-from nemo_gym.anthropic_tool_echo import record_served_turn, repair_tool_name_case, restore_served_turns, store_for
+from nemo_gym.anthropic_tool_echo import (
+    record_served_turn,
+    repair_tool_name_case,
+    restore_served_turns,
+    store_for,
+    trailing_nudges,
+)
 from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_chat_completion_sse
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT, ModelServerRef
 from nemo_gym.openai_utils import (
@@ -399,14 +405,18 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
                 logger.debug("dropped %d Claude Code identity system block(s)", dropped)
         rollout_id = current_rollout_id()
         served_turns = store_for(self.config.name, self.config.host, self.config.port)
-        # Empty served turns are keyed by the client's own request length (before any restore).
+        # Empty served turns are keyed by the client's own request (before any restore): its length
+        # and the nudges Claude Code has stacked at its end.
         request_length = len(body.get("messages") or [])
+        request_nudges = trailing_nudges((body.get("messages") or [None])[-1])
         body, _ = restore_served_turns(body, served_turns, rollout_id)
         params = _ANTHROPIC_CONVERTER.anthropic_request_to_responses(body)
         response = await self._invoke_responses(request, params)
         model_name = body.get("model") or response.model
         anthropic_response = _ANTHROPIC_CONVERTER.responses_to_anthropic_response(response, model=model_name)
-        record_served_turn(anthropic_response, served_turns, rollout_id, request_length=request_length)
+        record_served_turn(
+            anthropic_response, served_turns, rollout_id, request_length=request_length, request_nudges=request_nudges
+        )
         if getattr(self.config, "anthropic_tool_name_case_repair", False):
             anthropic_response, renamed = repair_tool_name_case(anthropic_response, body.get("tools"))
             if renamed:
