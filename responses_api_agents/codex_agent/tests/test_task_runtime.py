@@ -44,7 +44,7 @@ from pathlib import Path
 
 if sys.argv[1:] == ["--version"]:
     print({version_line!r})
-    sys.exit(0)
+    sys.exit({version_exit})
 config = tomllib.loads((Path(os.environ["CODEX_HOME"]) / "config.toml").read_text())
 record = {{"argv": sys.argv, "base_url": config["model_providers"]["gym"]["base_url"], "config": config}}
 Path(os.environ["FAKE_CODEX_RECORD"]).write_text(json.dumps(record))
@@ -80,8 +80,11 @@ def sandbox(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
-def _install_codex(directory: Path, version_line: str = f"codex-cli {PINNED}") -> Path:
-    return _executable(directory / "codex", _FAKE_CODEX.format(python=sys.executable, version_line=version_line))
+def _install_codex(directory: Path, version_line: str = f"codex-cli {PINNED}", version_exit: int = 0) -> Path:
+    return _executable(
+        directory / "codex",
+        _FAKE_CODEX.format(python=sys.executable, version_line=version_line, version_exit=version_exit),
+    )
 
 
 def _agent(**config) -> CodexAgent:
@@ -175,6 +178,15 @@ def test_offline_startup_fails_fast_on_a_version_mismatch(sandbox: Path, version
     _install_codex(sandbox / "bin", version_line)
 
     with pytest.raises(RuntimeError, match=f"but codex_version pins '{PINNED}'"):
+        _agent(codex_install="offline")
+    assert not Path(os.environ["FAKE_NPM_RECORD"]).exists()
+
+
+@pytest.mark.parametrize("version_exit", [1, 23])
+def test_offline_startup_fails_fast_when_the_version_probe_exits_non_zero(sandbox: Path, version_exit: int):
+    _install_codex(sandbox / "bin", version_exit=version_exit)  # prints the pinned version, then fails
+
+    with pytest.raises(RuntimeError, match=f"reports codex version None but codex_version pins '{PINNED}'"):
         _agent(codex_install="offline")
     assert not Path(os.environ["FAKE_NPM_RECORD"]).exists()
 

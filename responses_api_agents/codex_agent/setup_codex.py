@@ -64,7 +64,8 @@ def _install_node_locally() -> Path:
 def _codex_cli_version(executable: str) -> str | None:
     """The version ``<executable> --version`` reports (``codex-cli 0.144.4`` -> ``0.144.4``), or None.
 
-    The probe runs with a throwaway CODEX_HOME, so it never writes into a real Codex home.
+    A run that exits non-zero reports nothing, whatever it printed. The probe runs with a
+    throwaway CODEX_HOME, so it never writes into a real Codex home.
     """
     with tempfile.TemporaryDirectory(prefix="codex_version_") as codex_home:
         try:
@@ -77,6 +78,8 @@ def _codex_cli_version(executable: str) -> str | None:
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
+    if result.returncode != 0:
+        return None
     for line in result.stdout.splitlines():
         match = _VERSION_LINE.match(line.strip())
         if match:
