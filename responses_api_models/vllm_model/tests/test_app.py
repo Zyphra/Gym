@@ -178,6 +178,7 @@ OPENAI_2_44_OPTIONAL_CHAT_FIELDS = {
     "prompt_cache_retention",
     "safety_identifier",
     "verbosity",
+    "chat_template_kwargs",
 }
 
 PARAMETERIZE_DATA = [
@@ -572,7 +573,8 @@ PARAMETERIZE_DATA = [
             messages=[
                 NeMoGymChatCompletionAssistantMessageParam(
                     role="assistant",
-                    content="<think>I have identified the city as San Francisco based on user input.</think>",
+                    content=None,
+                    reasoning_content="I have identified the city as San Francisco based on user input.",
                 )
             ],
         ),
@@ -634,7 +636,8 @@ PARAMETERIZE_DATA = [
             messages=[
                 NeMoGymChatCompletionAssistantMessageParam(
                     role="assistant",
-                    content="<think>I'll first think about the user's question.</think><think>Then I will answer.</think>",
+                    content=None,
+                    reasoning_content="I'll first think about the user's question.\nThen I will answer.",
                 )
             ],
         ),
@@ -782,7 +785,7 @@ class TestApp:
 
         return VLLMModel(config=config, server_client=MagicMock(spec=ServerClient, global_config_dict={}))
 
-    async def test_sanity(self, monkeypatch: MonkeyPatch) -> None:
+    def test_sanity(self, monkeypatch: MonkeyPatch) -> None:
         assert not self._setup_server(monkeypatch).config.propagate_context_overflow_errors
 
     @mark.parametrize("propagate", [False, True])
@@ -1152,7 +1155,8 @@ class TestApp:
         expected_sent_messages = [
             {"content": [{"text": "Hello", "type": "text"}], "role": "user"},
             {
-                "content": "<think>Considering ways to greet the user...</think>Hi, how can I help?",
+                "content": "Hi, how can I help?",
+                "reasoning_content": "Considering ways to greet the user...",
                 "role": "assistant",
             },
             {
@@ -1412,7 +1416,8 @@ class TestApp:
                 "role": "user",
             },
             {
-                "content": "<think>Checking order details...</think>Sure, one sec.Gathering order status and delivery info..",
+                "content": "Sure, one sec.Gathering order status and delivery info..",
+                "reasoning_content": "Checking order details...",
                 "role": "assistant",
                 "tool_calls": [
                     {
@@ -1931,7 +1936,6 @@ class TestApp:
                 "role": "assistant",
                 "content": "Sure, one sec.",
                 "reasoning_content": "First reasoning item",
-                "reasoning": "First reasoning item",
             },
             {"content": [{"text": "cool", "type": "text"}], "role": "user"},
             {
@@ -2023,7 +2027,6 @@ class TestApp:
                 "role": "assistant",
                 "content": "Sure, one sec.",
                 "reasoning_content": "First reasoning item",
-                "reasoning": "First reasoning item",
             },
             {"content": [{"text": "cool", "type": "text"}], "role": "user"},
             {
@@ -2047,7 +2050,6 @@ class TestApp:
                     },
                 ],
                 "reasoning_content": "Gathering order status and delivery info...",
-                "reasoning": "Gathering order status and delivery info...",
             },
             {"content": [{"text": "user", "type": "text"}], "role": "user"},
         ]
@@ -2136,7 +2138,6 @@ class TestApp:
                 "role": "assistant",
                 "content": "Sure, one sec.",
                 "reasoning_content": "First reasoning item",
-                "reasoning": "First reasoning item",
             },
             {"content": [{"text": "cool", "type": "text"}], "role": "user"},
             {
@@ -2160,14 +2161,12 @@ class TestApp:
                     },
                 ],
                 "reasoning_content": "Gathering order status and delivery info...",
-                "reasoning": "Gathering order status and delivery info...",
             },
             {"content": [{"text": "user", "type": "text"}], "role": "user"},
             {
                 "role": "assistant",
-                "content": "",
+                "content": None,
                 "reasoning_content": "None content test",
-                "reasoning": "None content test",
             },
             {"content": [{"text": "user", "type": "text"}], "role": "user"},
         ]
@@ -2382,7 +2381,6 @@ class TestApp:
                 "role": "assistant",
                 "content": "Sure, one sec.",
                 "reasoning_content": "First reasoning item",
-                "reasoning": "First reasoning item",
             },
             {"content": [{"text": "cool", "type": "text"}], "role": "user"},
             {
@@ -2474,7 +2472,6 @@ class TestApp:
                 "role": "assistant",
                 "content": "Sure, one sec.",
                 "reasoning_content": "First reasoning item",
-                "reasoning": "First reasoning item",
             },
             {"content": [{"text": "cool", "type": "text"}], "role": "user"},
             {
@@ -2498,7 +2495,6 @@ class TestApp:
                     },
                 ],
                 "reasoning_content": "Gathering order status and delivery info...",
-                "reasoning": "Gathering order status and delivery info...",
             },
             {"content": [{"text": "user", "type": "text"}], "role": "user"},
         ]
@@ -2587,7 +2583,6 @@ class TestApp:
                 "role": "assistant",
                 "content": "Sure, one sec.",
                 "reasoning_content": "First reasoning item",
-                "reasoning": "First reasoning item",
             },
             {"content": [{"text": "cool", "type": "text"}], "role": "user"},
             {
@@ -2611,14 +2606,12 @@ class TestApp:
                     },
                 ],
                 "reasoning_content": "Gathering order status and delivery info...",
-                "reasoning": "Gathering order status and delivery info...",
             },
             {"content": [{"text": "user", "type": "text"}], "role": "user"},
             {
                 "role": "assistant",
-                "content": "",
+                "content": None,
                 "reasoning_content": "None content test",
-                "reasoning": "None content test",
             },
             {"content": [{"text": "user", "type": "text"}], "role": "user"},
         ]
@@ -2995,7 +2988,8 @@ class TestVLLMConverter:
             ),
             NeMoGymChatCompletionAssistantMessageParam(
                 role="assistant",
-                content="<think>I'm thinking</think>I'm chatting!",
+                content="I'm chatting!",
+                reasoning_content="I'm thinking",
                 tool_calls=[
                     NeMoGymChatCompletionMessageToolCallParam(
                         id="tool call 1",
@@ -3098,7 +3092,8 @@ class TestVLLMConverter:
             ),
             NeMoGymChatCompletionAssistantMessageForTrainingParam(
                 role="assistant",
-                content="<think>I'm thinking</think>I'm chatting!",
+                content="I'm chatting!",
+                reasoning_content="I'm thinking",
                 tool_calls=[
                     NeMoGymChatCompletionMessageToolCallParam(
                         id="tool call 1",
@@ -3236,7 +3231,8 @@ class TestVLLMConverter:
             ),
             NeMoGymChatCompletionAssistantMessageParam(
                 role="assistant",
-                content="<think> \n \n I'm thinking \n \n </think> \n \n I'm chatting! \n \n ",
+                content=" \n \n I'm chatting! \n \n ",
+                reasoning_content=" \n \n I'm thinking \n \n ",
                 tool_calls=[
                     NeMoGymChatCompletionMessageToolCallParam(
                         id="tool call 1",
@@ -5218,7 +5214,14 @@ class TestEndpointFile:
         assert not server._session_id_to_client
         # Within endpoint_check_interval_s the filesystem is left alone, so a
         # fresh publish is only seen once the window is over.
-        (tmp_path / "endpoint.txt").write_text("http://newer-host:8712/v1\n")
+        endpoint = tmp_path / "endpoint.txt"
+        prior_mtime = endpoint.stat().st_mtime_ns
+        endpoint.write_text("http://newer-host:8712/v1\n")
+        # Some shared filesystems coalesce two rapid writes to the same mtime.
+        # The publisher's new version must be observable by the mtime contract.
+        import os
+
+        os.utime(endpoint, ns=(prior_mtime, prior_mtime + 1_000_000_000))
         server._maybe_rebind_endpoint()
         assert server.config.base_url == ["http://new-host:8712/v1"]
         server._endpoint_last_check_at = None  # window over: the next call re-checks
@@ -5242,7 +5245,11 @@ class TestEndpointFile:
         with raises(RuntimeError, match="no longer published"):
             server._maybe_rebind_endpoint()
 
+        prior_mtime = endpoint_file.stat().st_mtime_ns
         endpoint_file.write_text("http://placeholder:8712/v1\n")  # republish on the SAME host
+        import os
+
+        os.utime(endpoint_file, ns=(prior_mtime, prior_mtime + 1_000_000_000))
         now = 1301.5  # within the check window: the publish is not seen yet, the raise stays loud
         with raises(RuntimeError, match="no longer published"):
             server._maybe_rebind_endpoint()
