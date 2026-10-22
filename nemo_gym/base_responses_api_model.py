@@ -136,7 +136,11 @@ def drop_client_identity(body: dict[str, Any]) -> tuple[dict[str, Any], int]:
     kept = [
         block
         for block in system
-        if not (isinstance(block, dict) and block.get("type") == "text" and block.get("text") in CLAUDE_CODE_IDENTITY_BLOCKS)
+        if not (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and block.get("text") in CLAUDE_CODE_IDENTITY_BLOCKS
+        )
     ]
     return ({**body, "system": kept}, len(system) - len(kept)) if len(kept) != len(system) else (body, 0)
 

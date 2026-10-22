@@ -532,10 +532,9 @@ class TestNothingElseIsMasked:
 class TestToolNameTruncation:
     """Claude Code echoes a tool name longer than 200 characters as its first 200."""
 
-    LONG = "python3 -c \"" + "x = 1; " * 60 + "\""
+    LONG = 'python3 -c "' + "x = 1; " * 60 + '"'
 
     def test_a_truncated_model_made_name_is_restored_and_logged(self, private_store) -> None:
-        served = _tool("call_1", self.LONG, {"command": "ls"})
         echoed = _tool("call_1", self.LONG[:200], {"command": "ls"})
         client, server = _server([_turn(("tool", "call_1", self.LONG, {"command": "ls"}))])
         _post(client, [TASK])
@@ -546,7 +545,9 @@ class TestToolNameTruncation:
 
     @pytest.mark.parametrize("echoed_name", ["Bash", LONG[:199], LONG[1:201]])
     def test_any_other_name_change_passes_through(self, echoed_name, private_store) -> None:
-        client, server = _server([_turn(("tool", "call_1", self.LONG, {"command": "ls"}))], name=f"n{len(echoed_name)}")
+        client, server = _server(
+            [_turn(("tool", "call_1", self.LONG, {"command": "ls"}))], name=f"n{len(echoed_name)}"
+        )
         _post(client, [TASK])
         _post(client, _history([_tool("call_1", echoed_name, {"command": "ls"})]))
         (call,) = [item for item in _backend_input(server) if item.get("type") == "function_call"]
@@ -646,10 +647,14 @@ class TestEmptyTurnNudge:
         exact_client, exact = _server([_turn(("tool", "call_1", "Bash", SERVED)), copy.deepcopy(empty)], name="exact")
         _post(exact_client, [TASK])
         _post(exact_client, _history([first]))
-        _post(exact_client, _history([first]) + [
-            {"role": "assistant", "content": served},
-            {"role": "user", "content": [{"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}]},
-        ])
+        _post(
+            exact_client,
+            _history([first])
+            + [
+                {"role": "assistant", "content": served},
+                {"role": "user", "content": [{"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}]},
+            ],
+        )
         assert _comparable(server)["input"] == _comparable(exact)["input"]
         assert self._shape(server)[-1] == ("user", tool_echo.EMPTY_TURN_NUDGE)
         (entry,) = _restore_log(private_store)
@@ -711,7 +716,9 @@ class TestEmptyTurnNudge:
     def _capped(*parts) -> NeMoGymResponse:
         """A served turn cut at the output token limit."""
         turn = _turn(*parts).model_dump()
-        return NeMoGymResponse(**{**turn, "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}})
+        return NeMoGymResponse(
+            **{**turn, "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
+        )
 
     def test_stacked_nudges_restore_every_dropped_turn_in_order(self, private_store) -> None:
         # Claude Code 2.1.284 drops a reasoning-only turn cut at the output limit and appends its nudge to the
@@ -725,7 +732,9 @@ class TestEmptyTurnNudge:
         for stacked in range(1, 4):
             # As the CLI sends them: each earlier nudge ends with a newline, the last carries cache_control.
             nudges = [{"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE + "\n"}] * (stacked - 1)
-            nudges.append({"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE, "cache_control": {"type": "ephemeral"}})
+            nudges.append(
+                {"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE, "cache_control": {"type": "ephemeral"}}
+            )
             nudged = _history([first])
             nudged[-1] = {**nudged[-1], "content": [*nudged[-1]["content"], *nudges]}
             _post(client, nudged)
@@ -764,11 +773,16 @@ class TestEmptyTurnNudge:
         nudge = {"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}
         assert tool_echo.empty_turn_key(3) == tool_echo.empty_turn_key(3, 0) == "empty:3"
         assert tool_echo.empty_turn_key(3, 2) == "empty:3+2"
-        assert tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, nudge, nudge]}) == 2
+        assert (
+            tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, nudge, nudge]}) == 2
+        )
         assert tool_echo.trailing_nudges({"role": "user", "content": [nudge, {"type": "text", "text": "x"}]}) == 0
         assert tool_echo.trailing_nudges({"role": "assistant", "content": [nudge]}) == 0
         stacked = {"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE + "\n"}
-        assert tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, stacked, nudge]}) == 2
+        assert (
+            tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, stacked, nudge]})
+            == 2
+        )
         # Only an earlier, stacked nudge may end with the newline.
         assert tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, stacked]}) == 0
         assert tool_echo.served_turns({"content": [], "stop_reason": "max_tokens"}, 3, 2)[0]["id"] == "empty:3+2"
@@ -781,13 +795,21 @@ class TestEmptyTurnNudge:
         _post(client, [TASK])
         tool_echo.record_served_turn(capped, store, "roll-1", request_length=3)
         nudged = _history([first])
-        nudged[-1] = {**nudged[-1], "content": [*nudged[-1]["content"], {"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE}]}
+        nudged[-1] = {
+            **nudged[-1],
+            "content": [*nudged[-1]["content"], {"type": "text", "text": tool_echo.OUTPUT_LIMIT_NUDGE}],
+        }
         _post(client, nudged)
-        assert self._shape(server)[-2:] == [("assistant", "partial answer cut at the"), ("user", tool_echo.OUTPUT_LIMIT_NUDGE)]
+        assert self._shape(server)[-2:] == [
+            ("assistant", "partial answer cut at the"),
+            ("user", tool_echo.OUTPUT_LIMIT_NUDGE),
+        ]
         (entry,) = _restore_log(private_store)
         assert entry["counts"] == {"output_limit_nudge": 1}
         # A turn that was neither empty nor length-capped is never keyed by request length.
-        assert tool_echo.served_turns({"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"}, 3) == []
+        assert (
+            tool_echo.served_turns({"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"}, 3) == []
+        )
 
     def test_served_turn_keys(self) -> None:
         empty = {"content": [{"type": "text", "text": ""}]}

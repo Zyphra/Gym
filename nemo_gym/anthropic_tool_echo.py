@@ -110,7 +110,9 @@ _SEGMENT_SEARCH_LIMIT = 12
 
 # The text blocks Claude Code 2.1.x appends to the last user message after dropping a served
 # turn that presented nothing, or that stopped at the output token limit.
-EMPTY_TURN_NUDGE = "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+EMPTY_TURN_NUDGE = (
+    "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+)
 OUTPUT_LIMIT_NUDGE = (
     "Output token limit hit. Resume directly \u2014 no apology, no recap of what you were doing. "
     "Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces."
@@ -144,7 +146,9 @@ def _stacked_nudge_kind(block: Any) -> Optional[str]:
 def trailing_nudges(message: Any) -> int:
     """The nudge blocks stacked at the end of a user message (0 for any other message): the last one exact,
     each earlier one exact or with the newline Claude Code adds when it stacks the next."""
-    if not (isinstance(message, Mapping) and message.get("role") == "user" and isinstance(message.get("content"), list)):
+    if not (
+        isinstance(message, Mapping) and message.get("role") == "user" and isinstance(message.get("content"), list)
+    ):
         return 0
     count = 0
     for block in reversed(message["content"]):
@@ -513,9 +517,7 @@ class ServedToolInputStore:
             return
         self._last_prune = now
         for path in self.root.glob("*.jsonl"):
-            retention = (
-                self.restore_log_retention_s if path.name.endswith(".restores.jsonl") else self.retention_s
-            )
+            retention = self.restore_log_retention_s if path.name.endswith(".restores.jsonl") else self.retention_s
             with contextlib.suppress(OSError):
                 if now - path.stat().st_mtime > retention:
                     path.unlink()
@@ -626,7 +628,8 @@ def _restore_empty_turns(
         return body, []
     try:
         served = store.lookup(
-            rollout_id, {empty_turn_key(index + 1, stacked) for index, count in nudged.items() for stacked in range(count)}
+            rollout_id,
+            {empty_turn_key(index + 1, stacked) for index, count in nudged.items() for stacked in range(count)},
         )
     except (OSError, ValueError) as error:
         logger.warning("could not read served turns for rollout %r: %s", rollout_id, error)
