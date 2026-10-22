@@ -40,7 +40,6 @@ from nemo_gym import CACHE_DIR, RESULTS_DIR, WORKING_DIR, _resolve_under_cwd_or_
 from nemo_gym._config_aliases import LEGACY_AGENT_ALIASES, legacy_config_path_alias
 from nemo_gym.config_directives import (
     COPY_KEY_NAME,
-    DELETE_KEY_KEY_NAME,
     INHERIT_FROM_KEY_NAME,
     resolve_config_directives,
 )
@@ -111,6 +110,7 @@ OBSERVABILITY_ENABLED_KEY_NAME = "observability_enabled"
 MODEL_CALL_CAPTURE_DIR_KEY_NAME = "model_call_capture_dir"
 MODEL_CALL_CAPTURE_ENABLED_KEY_NAME = "model_call_capture_enabled"
 MODEL_CALL_CAPTURE_METADATA_ONLY_KEY_NAME = "model_call_capture_metadata_only"
+MODEL_CALL_CAPTURE_SELECTION_KEY_NAME = "model_call_capture_selection"
 # Run-wide training-token capture settings.
 # See ``nemo_gym/token_id_capture/config.py``.
 TOKEN_ID_CAPTURE_BLOCK = "token_id_capture"
@@ -153,6 +153,7 @@ NEMO_GYM_RESERVED_TOP_LEVEL_KEYS = [
     MODEL_CALL_CAPTURE_DIR_KEY_NAME,
     MODEL_CALL_CAPTURE_ENABLED_KEY_NAME,
     MODEL_CALL_CAPTURE_METADATA_ONLY_KEY_NAME,
+    MODEL_CALL_CAPTURE_SELECTION_KEY_NAME,
     TOKEN_ID_CAPTURE_BLOCK,
     COMPONENT_NAME_KEY_NAME,
     SKIP_VERIFICATION_KEY_NAME,

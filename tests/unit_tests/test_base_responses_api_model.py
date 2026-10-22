@@ -960,6 +960,7 @@ def test_base_agent_resolve_model_base_url(monkeypatch):
 
     monkeypatch.setattr(base_agent, "get_first_server_config_dict", lambda _config, _name: {"host": "h", "port": 1})
     agent = SimpleNamespace(
+        config=base_agent.BaseResponsesAPIAgentConfig(host="", port=0, entrypoint="", name="agent"),
         server_client=SimpleNamespace(
             global_config_dict={},
             _build_server_base_url=lambda _config: "http://h:1",

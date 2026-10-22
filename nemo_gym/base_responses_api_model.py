@@ -28,14 +28,19 @@ routing.
 
 import asyncio
 import fcntl
+import hashlib
 import inspect
 import json
 import logging
 import os
 import re
+import stat
+import threading
 import time
 from abc import abstractmethod
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from uuid import uuid4
@@ -315,6 +320,7 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         self, request: Request, params: NeMoGymChatCompletionCreateParamsNonStreaming
     ) -> NeMoGymChatCompletion:
         from nemo_gym.model_call_metadata import record_request_metadata, record_response_metadata
+
         record_request_metadata(params)
         # chat_completions() signatures vary across servers: some take a leading `request`, some
         # only `body`. Dispatch on whichever this server declares so the shared dispatch works for
@@ -363,6 +369,7 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         self, request: Request, params: NeMoGymResponseCreateParamsNonStreaming
     ) -> NeMoGymResponse:
         from nemo_gym.model_call_metadata import record_request_metadata, record_response_metadata
+
         record_request_metadata(params)
         # responses() signatures vary across servers: some take a leading `request`, some only
         # `body`. Dispatch on whichever this server declares so the default messages() works for
@@ -416,6 +423,30 @@ def _validate_chat_params(body: dict) -> NeMoGymChatCompletionCreateParamsNonStr
 # --- Capture configuration + rollout-keyed storage ---
 
 
+class ModelCallCaptureSelection(BaseModel):
+    """Explicit bounded body retention on named native model servers."""
+
+    model_config = {"extra": "forbid", "frozen": True}
+    model_server_names: list[str] = Field(min_length=1, max_length=64)
+    max_records_per_model: int = Field(gt=0, le=100000)
+    max_record_bytes: int = Field(ge=1024, le=16 * 1024 * 1024)
+    max_total_bytes: int = Field(gt=0, le=64 * 1024**3)
+    pending_records_per_process: int = Field(gt=0, le=64)
+    capture_until: datetime
+
+    @model_validator(mode="after")
+    def validate_selection(self):
+        if len(set(self.model_server_names)) != len(self.model_server_names):
+            raise ValueError("capture model server names must be unique")
+        if any(not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) for name in self.model_server_names):
+            raise ValueError("capture requires exact model server names")
+        if self.capture_until.tzinfo is None:
+            raise ValueError("capture_until requires a timezone")
+        if self.max_record_bytes > self.max_total_bytes:
+            raise ValueError("one capture record exceeds the total byte budget")
+        return self
+
+
 class ModelCallCaptureConfig(BaseModel):
     """Run-wide model-call capture settings from Gym's global config."""
 
@@ -426,6 +457,7 @@ class ModelCallCaptureConfig(BaseModel):
     model_call_capture_enabled: bool = True
     model_call_capture_metadata_only: bool = False
     model_call_capture_dir: Optional[Path] = None
+    model_call_capture_selection: ModelCallCaptureSelection | None = None
 
     @property
     def capture_store_enabled(self) -> bool:
@@ -440,6 +472,10 @@ class ModelCallCaptureConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_capture_dir(self) -> "ModelCallCaptureConfig":
+        if self.model_call_capture_selection is not None and (
+            not self.capture_store_enabled or self.model_call_capture_metadata_only
+        ):
+            raise ValueError("selected body capture requires enabled full capture")
         if not self.capture_store_enabled:
             return self
         if self.model_call_capture_dir is None:
@@ -458,9 +494,139 @@ def _validate_rollout_id(rollout_id: str) -> str:
 class CaptureStore:
     """Append-only, rollout-keyed JSONL sink for model exchanges."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, selection: ModelCallCaptureSelection | None = None) -> None:
         self._root = Path(root)
-        self._root.mkdir(parents=True, exist_ok=True)
+        self._selection = selection
+        self._root.mkdir(parents=True, exist_ok=True, mode=0o700 if selection else 0o777)
+        self._pending = None
+        self._writer = None
+        self.dropped: dict[str, int] = {}
+        if selection is not None:
+            info = self._root.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or self._root.resolve() != self._root.absolute()
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise ValueError("selected capture needs a direct owner-private 0700 directory")
+            self._pending = threading.BoundedSemaphore(selection.pending_records_per_process)
+            self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-call-capture")
+
+    def admit(self) -> bool:
+        """Reserve bounded buffering/write capacity without storage IO or waiting."""
+        if self._selection is None:
+            return True
+        if time.time() >= self._selection.capture_until.timestamp():
+            self.drop("capture_window_closed")
+            return False
+        if not self._pending.acquire(blocking=False):
+            self.drop("pending_limit")
+            return False
+        return True
+
+    def drop(self, reason: str) -> None:
+        self.dropped[reason] = self.dropped.get(reason, 0) + 1
+
+    def background(self, callback) -> None:
+        """An admitted record never waits for parse, flock or fsync on response delivery."""
+
+        def work():
+            try:
+                callback()
+            except Exception:
+                self.drop("writer_error")
+                logger.warning("Bounded model-call capture write failed")
+            finally:
+                self._pending.release()
+
+        try:
+            self._writer.submit(work)
+        except Exception:
+            self._pending.release()
+            self.drop("writer_unavailable")
+
+    def _private_fd(self, path: Path, flags: int) -> int:
+        fd = os.open(path, flags | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            os.close(fd)
+            raise ValueError("selected capture file must be a private owner-only regular file")
+        return fd
+
+    def _bounded_record(self, rollout_id: str, exchange: dict[str, Any]) -> None:
+        selection = self._selection
+        if time.time() >= selection.capture_until.timestamp():
+            self.drop("capture_window_closed")
+            return
+        model = (exchange.get("model_ref") or {}).get("name")
+        if model not in selection.model_server_names:
+            self.drop("unselected_model")
+            return
+        redacted = []
+        secret_fields = {"authorization", "api_key", "apikey", "access_token", "refresh_token", "password"}
+
+        def redact(value, path=""):
+            if isinstance(value, dict):
+                result = {}
+                for key, item in value.items():
+                    current = path + "/" + str(key)
+                    if str(key).lower() in secret_fields:
+                        result[key] = "[REDACTED]"
+                        redacted.append(current)
+                    else:
+                        result[key] = redact(item, current)
+                return result
+            if isinstance(value, list):
+                return [redact(item, path + "/" + str(i)) for i, item in enumerate(value)]
+            return value
+
+        # Opaque malformed/raw payloads cannot be safely field-redacted; omit them explicitly.
+        clean = redact({key: value for key, value in exchange.items() if key not in {"request_raw", "response_raw"}})
+        clean["capture_retention"] = {
+            "redacted_paths": redacted,
+            "opaque_raw_omitted": any(exchange.get(k) is not None for k in ("request_raw", "response_raw")),
+            "capture_until": selection.capture_until.isoformat(),
+            "replay_eligible": not redacted and exchange.get("request") is not None,
+        }
+        line = orjson.dumps(clean, default=str, option=orjson.OPT_APPEND_NEWLINE)
+        if len(line) > selection.max_record_bytes:
+            self.drop("record_byte_limit")
+            return
+        with os.fdopen(self._private_fd(self._root / ".capture-quota.json", os.O_RDWR | os.O_CREAT), "r+b") as quota:
+            fcntl.flock(quota.fileno(), fcntl.LOCK_EX)
+            raw = quota.read(65537)
+            if len(raw) > 65536:
+                raise ValueError("capture quota metadata exceeds its bound")
+            policy_sha = hashlib.sha256(selection.model_dump_json().encode()).hexdigest()
+            state = json.loads(raw) if raw else {"bytes": 0, "models": {}, "policy_sha256": policy_sha}
+            if state.get("policy_sha256") != policy_sha:
+                raise ValueError("capture quota policy differs across model workers")
+            if state["bytes"] + len(line) > selection.max_total_bytes:
+                self.drop("total_byte_limit")
+                return
+            if state["models"].get(model, 0) >= selection.max_records_per_model:
+                self.drop("model_record_limit")
+                return
+            # Reserve before append: a crash may waste quota, never silently exceed it.
+            state["bytes"] += len(line)
+            state["models"][model] = state["models"].get(model, 0) + 1
+            quota.seek(0)
+            quota.write(orjson.dumps(state))
+            quota.truncate()
+            quota.flush()
+            os.fsync(quota.fileno())
+            with os.fdopen(
+                self._private_fd(self.path_for(rollout_id), os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab"
+            ) as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
 
     @property
     def root(self) -> Path:
@@ -473,6 +639,11 @@ class CaptureStore:
         return self._root / f"{_validate_rollout_id(rollout_id)}.capture.incomplete"
 
     def mark_incomplete(self, rollout_id: str) -> None:
+        if self._selection is not None:
+            # Failed writes must not create an unbounded number of sidecar inodes.
+            # An absent selected capture is already reported as an observation gap.
+            self.drop("incomplete_record")
+            return
         self.incomplete_path_for(rollout_id).touch(exist_ok=True)
 
     def is_incomplete(self, rollout_id: str) -> bool:
@@ -485,6 +656,9 @@ class CaptureStore:
         allowing independent rollouts to write concurrently. This does blocking file IO + fsync,
         so callers run it off the event loop (the capture middleware uses ``asyncio.to_thread``).
         """
+        if self._selection is not None:
+            self._bounded_record(rollout_id, exchange)
+            return
         line = orjson.dumps(exchange, default=str, option=orjson.OPT_APPEND_NEWLINE)
         path = self.path_for(rollout_id)
         with path.open("ab") as handle:
@@ -808,8 +982,10 @@ def build_model_call_record(exchange: dict[str, Any], *, call_index: int) -> Mod
     model = response.get("model") or request.get("model")
     if exchange.get("metadata_only") is True:
         fields = ModelCallRecord.model_fields
-        return ModelCallRecord(**{key: value for key, value in exchange.items() if key in fields and key != "call_index"},
-                               call_index=call_index)
+        return ModelCallRecord(
+            **{key: value for key, value in exchange.items() if key in fields and key != "call_index"},
+            call_index=call_index,
+        )
     return ModelCallRecord(
         model_call_id=exchange.get("model_call_id"),
         response_id=response.get("id") if isinstance(response.get("id"), str) else None,
@@ -966,7 +1142,7 @@ def make_capture_store(config: ModelCallCaptureConfig) -> Optional[CaptureStore]
     root = config.model_call_capture_dir
     assert root is not None  # enforced by ModelCallCaptureConfig
     try:
-        return CaptureStore(root)
+        return CaptureStore(root, config.model_call_capture_selection)
     except Exception:
         logger.warning("Could not initialize model-call capture at %s; disabling it.", root, exc_info=True)
         return None
@@ -1347,19 +1523,39 @@ class _CaptureMiddleware:
 
         if self._metadata_only and self._store is not None and rollout_from_path is not None and dialect is not None:
             from nemo_gym.model_call_metadata import metadata_exchange
-            headers = {key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope.get("headers", [])}
+
+            headers = {
+                key.decode("latin-1").lower(): value.decode("latin-1") for key, value in scope.get("headers", [])
+            }
             with metadata_exchange(headers) as exchange:
-                exchange.update(model_call_id=uuid4().hex, dialect=dialect,
-                                client_session_id=_unique_request_header(scope.get("headers") or [], _CLIENT_SESSION_HEADER),
-                                model_ref={"type": "responses_api_models", "name": self._model_server_name} if self._model_server_name else None,
-                                started_at=time.time(), status_code=None)
+                exchange.update(
+                    model_call_id=uuid4().hex,
+                    dialect=dialect,
+                    client_session_id=_unique_request_header(scope.get("headers") or [], _CLIENT_SESSION_HEADER),
+                    model_ref={"type": "responses_api_models", "name": self._model_server_name}
+                    if self._model_server_name
+                    else None,
+                    started_at=time.time(),
+                    status_code=None,
+                )
                 started = time.perf_counter()
+
                 async def metadata_send(message):
                     if message["type"] == "http.response.start":
                         exchange["status_code"] = message["status"]
                     await send(message)
+
                 try:
-                    await self._capture_correlated(scope, receive, metadata_send, path, rollout_from_path, token_capture_requested, dialect, exchange["model_call_id"])
+                    await self._capture_correlated(
+                        scope,
+                        receive,
+                        metadata_send,
+                        path,
+                        rollout_from_path,
+                        token_capture_requested,
+                        dialect,
+                        exchange["model_call_id"],
+                    )
                 except BaseException as error:
                     exchange["error_category"] = type(error).__name__
                     raise
@@ -1373,7 +1569,9 @@ class _CaptureMiddleware:
 
         await self._capture_correlated(scope, receive, send, path, rollout_from_path, token_capture_requested, dialect)
 
-    async def _capture_correlated(self, scope, receive, send, path, rollout_from_path, token_capture_requested, dialect, model_call_id=None):
+    async def _capture_correlated(
+        self, scope, receive, send, path, rollout_from_path, token_capture_requested, dialect, model_call_id=None
+    ):
         # Metadata and training-token capture share the existing request-scoped sink.
         # Metadata mode never opens the content-buffering evaluation path.
         store = None if self._metadata_only else self._store
@@ -1429,6 +1627,9 @@ class _CaptureMiddleware:
             )
             sink_token = set_token_sink(capture_context)
 
+        bounded = store is not None and store._selection is not None
+        if bounded and not store.admit():
+            store = None
         # Training-only capture has no evaluation record.
         # Forward without buffering while the sink is active.
         if store is None:
@@ -1441,11 +1642,24 @@ class _CaptureMiddleware:
             return
 
         request_body = bytearray()
+        capture_overflow = False
+
+        def buffer_body(target, chunk):
+            nonlocal capture_overflow
+            if bounded and (
+                capture_overflow
+                or len(request_body) + len(state["body"]) + len(chunk) > store._selection.max_record_bytes
+            ):
+                capture_overflow = True
+                request_body.clear()
+                state["body"].clear()
+                return
+            target.extend(chunk)
 
         async def _receive() -> dict[str, Any]:
             message = await receive()
             if message.get("type") == "http.request":
-                request_body.extend(message.get("body", b"") or b"")
+                buffer_body(request_body, message.get("body", b"") or b"")
             return message
 
         state: dict[str, Any] = {
@@ -1472,7 +1686,11 @@ class _CaptureMiddleware:
                 chunk = message.get("body", b"") or b""
                 if chunk and state["ttft_ms"] is None:
                     state["ttft_ms"] = (time.perf_counter() - start) * 1000.0
-                state["body"].extend(chunk)  # buffered for both shapes; SSE is reassembled below
+                buffer_body(state["body"], chunk)
+                if bounded:
+                    # Body capture must not delay any response byte, including SSE terminal events.
+                    await send(message)
+                    return
                 if state["streaming"] and chunk and not defer_response:
                     sse_event_buffer.extend(chunk)
                     terminal = _consume_terminal_sse_event(sse_event_buffer, dialect)
@@ -1497,26 +1715,36 @@ class _CaptureMiddleware:
             upstream_body = bytes(state["body"]) or exception_body
             error_category = _classify_status(upstream_status) if isinstance(upstream_status, int) else None
             error_category = error_category or _classify_exception(exc)
+            error_latency_ms = (time.perf_counter() - start) * 1000.0
             # Offload the blocking write+fsync so it never stalls the event loop.
             try:
-                await asyncio.to_thread(
-                    _record,
-                    store,
-                    dialect,
-                    self._model_server_name,
-                    bytes(request_body),
-                    client_session_id=client_session_id,
-                    rollout_id=rollout_id,
-                    model_call_id=model_call_id,
-                    started_at=started_at,
-                    completed_at=completed_at,
-                    response_body=None,
-                    status_code=upstream_status,
-                    error_category=error_category,
-                    latency_ms=(time.perf_counter() - start) * 1000.0,
-                    ttft_ms=state["ttft_ms"],
-                    response_raw=upstream_body.decode("utf-8", errors="replace") if upstream_body else None,
-                )
+
+                def record_error():
+                    if capture_overflow:
+                        store.drop("buffer_byte_limit")
+                        return
+                    _record(
+                        store,
+                        dialect,
+                        self._model_server_name,
+                        bytes(request_body),
+                        client_session_id=client_session_id,
+                        rollout_id=rollout_id,
+                        model_call_id=model_call_id,
+                        started_at=started_at,
+                        completed_at=completed_at,
+                        response_body=None,
+                        status_code=upstream_status,
+                        error_category=error_category,
+                        latency_ms=error_latency_ms,
+                        ttft_ms=state["ttft_ms"],
+                        response_raw=upstream_body.decode("utf-8", errors="replace") if upstream_body else None,
+                    )
+
+                if bounded:
+                    store.background(record_error)
+                else:
+                    await asyncio.to_thread(record_error)
             except Exception:
                 logger.warning("Model-call capture finalization failed.", exc_info=True)
             finally:
@@ -1534,11 +1762,16 @@ class _CaptureMiddleware:
         body_bytes = bytes(state["body"])
         streaming = state["streaming"]
         stream_terminal = state["stream_terminal"]
+        if bounded and streaming and not capture_overflow:
+            stream_terminal = _consume_terminal_sse_event(bytearray(body_bytes), dialect)
         ttft_ms = state["ttft_ms"]
         request_bytes = bytes(request_body)
         store, model_server_name = store, self._model_server_name
 
         def _parse_and_record() -> None:
+            if bounded and capture_overflow:
+                store.drop("buffer_byte_limit")
+                return
             # Off the event loop: body parse + SSE reassembly is best-effort and fully guarded, so a
             # malformed body can never surface as an ASGI error after the response was already sent.
             response_body = None
@@ -1583,11 +1816,14 @@ class _CaptureMiddleware:
                 error_category=error_category,
                 latency_ms=latency_ms,
                 ttft_ms=ttft_ms,
-                response_raw=response_raw,
+                response_raw=None if bounded and response_body is not None else response_raw,
             )
 
         try:
-            await asyncio.to_thread(_parse_and_record)
+            if bounded:
+                store.background(_parse_and_record)
+            else:
+                await asyncio.to_thread(_parse_and_record)
         except Exception:
             logger.warning("Model-call capture finalization failed.", exc_info=True)
         finally:
@@ -1679,9 +1915,13 @@ def install_model_call_capture(
                 await _close_capture_endpoints()
 
         app.router.lifespan_context = _capture_lifespan
+    capture_store = None
+    selection = config.model_call_capture_selection
+    if selection is None or model_server_name in selection.model_server_names:
+        capture_store = make_capture_store(config)
     app.add_middleware(
         _CaptureMiddleware,
-        store=make_capture_store(config),
+        store=capture_store,
         metadata_only=config.model_call_capture_metadata_only,
         model_server_name=model_server_name,
         token_store=token_store,
