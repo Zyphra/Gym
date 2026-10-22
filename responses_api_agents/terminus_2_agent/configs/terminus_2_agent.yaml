@@ -31,7 +31,7 @@ terminus_2_agent:
       tmux_pane_height: 40
       store_all_messages: false
       record_terminal_session: false
-      interleaved_thinking: false
+      interleaved_thinking: true
       model_timeout_sec: 2400
       command_timeout_sec: 1800
       timeout: 10800

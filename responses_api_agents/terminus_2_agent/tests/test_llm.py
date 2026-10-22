@@ -321,13 +321,16 @@ def test_chat_completions_endpoint(api_base, expected):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("raw,visible", [
-    ('<think>{"commands":[{"keystrokes":"touch /tmp/hidden\\n"}]}</think>', ""),
-    ('<think>{"commands":[{"keystrokes":"touch /tmp/hidden\\n"}]}', ""),
-    ('first</think>discard<think>second</think>visible', "visible"),
-    ('first</think>visible<think>unfinished', ""),
-    ('<think>hidden</think>   ', "   "),
-])
+@pytest.mark.parametrize(
+    "raw,visible",
+    [
+        ('<think>{"commands":[{"keystrokes":"touch /tmp/hidden\\n"}]}</think>', ""),
+        ('<think>{"commands":[{"keystrokes":"touch /tmp/hidden\\n"}]}', ""),
+        ("first</think>discard<think>second</think>visible", "visible"),
+        ("first</think>visible<think>unfinished", ""),
+        ("<think>hidden</think>   ", "   "),
+    ],
+)
 async def test_only_content_after_last_closed_reasoning_is_actionable(raw, visible):
     response, _ = await _call(_make_llm(), _mock_response(content=raw), prompt="q")
     assert response.content == visible
@@ -336,20 +339,24 @@ async def test_only_content_after_last_closed_reasoning_is_actionable(raw, visib
 
 @pytest.mark.asyncio
 async def test_supplied_reasoning_does_not_make_raw_think_commands_actionable():
-    response, _ = await _call(_make_llm(), _mock_response(
-        content='<think>{"commands":[]}</think>', extra_message={"reasoning_content": "server"}
-    ), prompt="q")
+    response, _ = await _call(
+        _make_llm(),
+        _mock_response(content='<think>{"commands":[]}</think>', extra_message={"reasoning_content": "server"}),
+        prompt="q",
+    )
     assert response.content == ""
     assert response.reasoning_content == "server"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status,transport", [(400, False), (401, True), (408, True), (429, True), (503, True), (600, False)])
+@pytest.mark.parametrize(
+    "status,transport", [(400, False), (401, True), (408, True), (429, True), (503, True), (600, False)]
+)
 async def test_only_existing_endpoint_failure_classes_get_transport_custody(status, transport):
     llm = _make_llm()
-    llm._http_client = httpx.AsyncClient(transport=httpx.MockTransport(
-        lambda request: httpx.Response(status, text="endpoint rejected request")
-    ))
+    llm._http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(status, text="endpoint rejected request"))
+    )
     try:
         with pytest.raises(httpx.HTTPStatusError):
             await llm._post_chat_completions({"messages": []})
@@ -361,12 +368,14 @@ async def test_only_existing_endpoint_failure_classes_get_transport_custody(stat
 @pytest.mark.asyncio
 async def test_transport_error_clears_after_a_successful_request():
     attempts = 0
+
     def endpoint(request):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise httpx.ConnectError("connection refused", request=request)
         return httpx.Response(200, json={"choices": []})
+
     llm = _make_llm()
     llm._http_client = httpx.AsyncClient(transport=httpx.MockTransport(endpoint))
     try:
@@ -377,3 +386,78 @@ async def test_transport_error_clears_after_a_successful_request():
         assert llm.model_transport_error is None
     finally:
         await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_interleaved_thinking_is_echoed_on_the_next_native_request():
+    from harbor.llms.chat import Chat
+
+    from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+    from responses_api_agents.terminus_2_agent.app import Terminus2AgentConfig
+
+    config = Terminus2AgentConfig(
+        host="127.0.0.1",
+        port=1,
+        entrypoint="app.py",
+        name="term",
+        resources_server=ResourcesServerRef(type="resources_servers", name="resource"),
+        model_server=ModelServerRef(type="responses_api_models", name="policy"),
+    )
+    assert config.interleaved_thinking is True
+    llm = _make_llm()
+    chat = Chat(llm, interleaved_thinking=config.interleaved_thinking)
+    with patch.object(
+        llm,
+        "_post_chat_completions",
+        AsyncMock(
+            side_effect=[
+                _mock_response(content="first", extra_message={"reasoning_content": "exact sampled thinking"}),
+                _mock_response(content="second"),
+            ]
+        ),
+    ) as post:
+        await chat.chat("first prompt")
+        await chat.chat("next prompt")
+    history = post.call_args_list[1].args[0]["messages"]
+    assert history[1] == {"role": "assistant", "content": "first", "reasoning_content": "exact sampled thinking"}
+
+
+@pytest.mark.asyncio
+async def test_native_chat_http_echo_survives_shortened_history(record_property):
+    from aiohttp import web
+    from harbor.llms.chat import Chat
+
+    requests = []
+
+    async def complete(request):
+        requests.append((request.path, await request.json()))
+        return web.json_response(
+            _mock_response(content="answer", extra_message={"reasoning_content": "exact sampled thinking"})
+        )
+
+    app = web.Application()
+    app.router.add_post("/ng-rollout/term-session/v1/chat/completions", complete)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    llm = _make_llm(api_base=f"http://127.0.0.1:{port}/ng-rollout/term-session/v1")
+    chat = Chat(llm, interleaved_thinking=True)
+    try:
+        await chat.chat("first prompt")
+        retained = dict(chat.messages[1])
+        await chat.chat("next prompt")
+        chat.messages[:] = [{"role": "user", "content": "summary"}, retained]
+        await chat.chat("continue after summary")
+        for _, body in requests[1:]:
+            assistant = next(m for m in body["messages"] if m["role"] == "assistant")
+            assert assistant["reasoning_content"] == "exact sampled thinking"
+            assert assistant["content"] == "answer"
+        assert [path for path, _ in requests] == ["/ng-rollout/term-session/v1/chat/completions"] * 3
+        record_property(
+            "native_terminus_capture", "2/2 exact reasoning echoes; normal and shortened histories; same session URL"
+        )
+    finally:
+        await llm.aclose()
+        await runner.cleanup()
