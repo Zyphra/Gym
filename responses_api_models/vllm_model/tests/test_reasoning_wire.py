@@ -9,8 +9,45 @@ import pytest
 from fastapi.testclient import TestClient
 
 from nemo_gym.global_config import GlobalConfigDictParserConfig, get_global_config_dict
+from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import ServerClient, close_global_aiohttp_client
 from responses_api_models.vllm_model.app import VLLMModel, VLLMModelConfig
+
+
+@pytest.mark.parametrize("raw_history", [False, True])
+def test_existing_explicit_raw_history_option_reaches_responses_converter(raw_history):
+    model = VLLMModel(
+        config=VLLMModelConfig(
+            host="127.0.0.1",
+            port=0,
+            name="policy",
+            entrypoint="app.py",
+            base_url="http://127.0.0.1:1/v1",
+            api_key="local-control",
+            model="policy",
+            return_token_id_information=False,
+            uses_reasoning_parser=True,
+            preserve_reasoning_in_assistant_content=raw_history,
+        ),
+        server_client=ServerClient.model_construct(global_config_dict={}),
+    )
+    params = model.get_converter().responses_to_chat_completion_create_params(
+        NeMoGymResponseCreateParamsNonStreaming(
+            input=[
+                {
+                    "type": "reasoning",
+                    "id": "reason",
+                    "status": "completed",
+                    "summary": [{"type": "summary_text", "text": "plan"}],
+                },
+                {"role": "assistant", "type": "message", "content": "answer"},
+            ]
+        )
+    )
+    if raw_history:
+        assert params.messages == [{"role": "assistant", "content": "<think>plan</think>answer"}]
+    else:
+        assert params.messages == [{"role": "assistant", "content": "answer", "reasoning_content": "plan"}]
 
 
 @pytest.mark.parametrize("api", ["chat/completions", "responses"])
