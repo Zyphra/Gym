@@ -377,3 +377,25 @@ async def test_transport_error_clears_after_a_successful_request():
         assert llm.model_transport_error is None
     finally:
         await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_default_interleaved_thinking_is_echoed_on_the_next_native_request():
+    from harbor.llms.chat import Chat
+    from responses_api_agents.terminus_2_agent.app import Terminus2AgentConfig
+    from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+
+    config = Terminus2AgentConfig(host="127.0.0.1", port=1, entrypoint="app.py", name="term",
+        resources_server=ResourcesServerRef(type="resources_servers", name="resource"),
+        model_server=ModelServerRef(type="responses_api_models", name="policy"))
+    assert config.interleaved_thinking is True
+    llm = _make_llm()
+    chat = Chat(llm, interleaved_thinking=config.interleaved_thinking)
+    with patch.object(llm, "_post_chat_completions", AsyncMock(side_effect=[
+        _mock_response(content="first", extra_message={"reasoning_content": "exact sampled thinking"}),
+        _mock_response(content="second"),
+    ])) as post:
+        await chat.chat("first prompt")
+        await chat.chat("next prompt")
+    history = post.call_args_list[1].args[0]["messages"]
+    assert history[1] == {"role": "assistant", "content": "first", "reasoning_content": "exact sampled thinking"}

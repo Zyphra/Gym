@@ -505,7 +505,7 @@ class Terminus2AgentConfig(BaseResponsesAPIAgentConfig):
     store_all_messages: bool = False
     record_terminal_session: bool = False
     teardown_tmux: bool = True
-    interleaved_thinking: bool = False
+    interleaved_thinking: bool = True
     model_timeout_sec: float = 2400
     command_timeout_sec: float = 1800
     timeout: float = 10800

@@ -30,3 +30,10 @@ sets `workspace_root: "."` because each task already runs in an isolated contain
 
 The agent converts the Terminus-2 trajectory to Responses API messages and tool
 calls. Sampling parameters are forwarded to the configured model server.
+
+
+`interleaved_thinking` defaults to `true` in both the typed agent and standalone
+configuration. Harbor keeps the exact returned `reasoning_content` in retained
+assistant messages and echoes it on the next request, for training and evaluation.
+Compaction can discard old messages; retained messages keep their reasoning.
+The native summarization subagent's content-only prompt remains unchanged.
