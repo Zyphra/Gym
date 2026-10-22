@@ -308,8 +308,10 @@ def _bind_policy_summary(agent) -> None:
         choice = response.choices[0]
         content = choice.message.content
         if (
-            choice.finish_reason != "stop" or choice.message.tool_calls
-            or not isinstance(content, str) or not content.strip()
+            choice.finish_reason != "stop"
+            or choice.message.tool_calls
+            or not isinstance(content, str)
+            or not content.strip()
         ):
             raise RuntimeError("Hermes policy summary was empty, truncated, or emitted tool calls")
         return content
@@ -556,7 +558,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
         was_interrupted = bool(result.get("interrupted")) or interrupted_by_dispatch
 
         harness_error = result.get("error")
-        context_exhausted = isinstance(harness_error, str) and harness_error.startswith("Context length exceeded") and harness_error.endswith("Cannot compress further.")
+        context_exhausted = (
+            isinstance(harness_error, str)
+            and harness_error.startswith("Context length exceeded")
+            and harness_error.endswith("Cannot compress further.")
+        )
         agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not context_exhausted
         metadata: dict[str, str] = {
             "interrupted": "true" if was_interrupted else "false",
@@ -588,7 +594,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             model=model_name,
             object="response",
             output=output_items,
-            status="incomplete" if context_exhausted else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
+            status="incomplete"
+            if context_exhausted
+            else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
             error=response_error,
             metadata=metadata,
             tool_choice=body.tool_choice,
