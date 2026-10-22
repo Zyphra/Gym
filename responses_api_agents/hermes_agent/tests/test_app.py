@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -192,6 +193,7 @@ class TestSigtermHandler:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self.context_compressor = SimpleNamespace(managed_summary_callback=None)
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 hermes.interrupted_agents.add(id(self))
@@ -356,6 +358,7 @@ class TestRolloutCorrelation:
                 seen["base_url"] = kwargs.get("base_url")
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self.context_compressor = SimpleNamespace(managed_summary_callback=None)
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
@@ -400,6 +403,7 @@ class TestMaxTokens:
                 seen["max_tokens"] = kwargs.get("max_tokens")
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self.context_compressor = SimpleNamespace(managed_summary_callback=None)
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
@@ -473,6 +477,7 @@ class TestObservability:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self.context_compressor = SimpleNamespace(managed_summary_callback=None)
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 return {
@@ -566,6 +571,7 @@ class TestObservability:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self.context_compressor = SimpleNamespace(managed_summary_callback=None)
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 raise ValueError("agent failed")
