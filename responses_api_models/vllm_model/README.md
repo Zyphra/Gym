@@ -109,3 +109,12 @@ Once you see that server instances are up, call the server. If you see a model r
 ```bash
 python responses_api_agents/simple_agent/client.py
 ```
+
+## Parsed reasoning history
+
+With `uses_reasoning_parser: true`, parsed `reasoning_content`/`reasoning`
+stays separate from visible assistant content on the Chat wire. Echoed explicit
+fields are forwarded without parsing think tags inside that visible content.
+The Responses converter also carries reasoning items in the structured field.
+The existing `preserve_reasoning_in_assistant_content` option retains the
+explicit raw-content contract for models that require it.

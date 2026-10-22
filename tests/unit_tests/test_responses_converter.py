@@ -620,7 +620,7 @@ def test_responses_to_chat_completion_chat_shaped_tool_turn(converter: Responses
     assert tool_msg["content"] == "sunny"
 
 
-def test_responses_to_chat_completion_reasoning_prepended(converter: ResponsesConverter):
+def test_responses_to_chat_completion_reasoning_stays_structured(converter: ResponsesConverter):
     reasoning = NeMoGymResponseReasoningItem(
         id="rs_1",
         type="reasoning",
@@ -635,7 +635,8 @@ def test_responses_to_chat_completion_reasoning_prepended(converter: ResponsesCo
             ]
         )
     )
-    assert params.messages[0]["content"] == "<think>thinking...</think>the answer"
+    assert params.messages[0]["content"] == "the answer"
+    assert params.messages[0]["reasoning_content"] == "thinking..."
 
 
 def test_responses_to_chat_completion_reasoning_without_summary_is_noop(converter: ResponsesConverter):
@@ -1594,7 +1595,8 @@ def test_round_trip_with_tool_calls(converter: ResponsesConverter):
     )
     assistant_msg = params.messages[0]
     assert assistant_msg["role"] == "assistant"
-    assert assistant_msg["content"] == "<think>thinking</think>chatting"
+    assert assistant_msg["content"] == "chatting"
+    assert assistant_msg["reasoning_content"] == "thinking"
     assert assistant_msg["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
