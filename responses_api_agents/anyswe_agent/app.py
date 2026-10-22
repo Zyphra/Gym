@@ -24,12 +24,11 @@ import time
 import uuid
 from asyncio import Semaphore
 from collections.abc import Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
 from subprocess import Popen
 from traceback import format_exc
 from typing import Any, Dict, Optional, Sequence
-from contextlib import nullcontext
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -334,7 +333,7 @@ class AnySweAgentConfig(BaseResponsesAPIAgentConfig):
     )
     swebench_tests_timeout: int = 1800
     swebench_agent_timeout: int = 2700
-    concurrency: int = 256
+    concurrency: Optional[int] = Field(default=256, gt=0)
     private_grader: Optional[PrivateGraderConfig] = None
     test_authority_restore: Optional[str] = Field(
         default=None,
@@ -494,7 +493,7 @@ class _AnySweAgentServer(SimpleResponsesAPIAgent):
     _server: Optional[AnySweServerConfig] = None
 
     def model_post_init(self, context: Any) -> None:
-        self._sem = Semaphore(self.config.concurrency)
+        self._sem = Semaphore(self.config.concurrency) if self.config.concurrency is not None else None
 
         model_url = self.config.sandbox_model_base_url or ""
         if self.config.model_server is not None:
@@ -1255,7 +1254,7 @@ class AnySweAgent(_AnySweAgentServer):
         return await self._responses(body)
 
     async def run(self, body: AnySweRunRequest) -> AnySweVerifyResponse:
-        async with self._sem:
+        async with self._sem if self._sem is not None else nullcontext():
             response = await self._responses(body.responses_create_params, self.rollout_id_from_run(body))
 
             meta, response.metadata = response.metadata, None

@@ -22,7 +22,7 @@ anyswe_hermes:
       sandbox_model_base_url: ${oc.env:NEMO_GYM_SANDBOX_MODEL_BASE_URL,null}
       swebench_agent_timeout: 2700
       swebench_tests_timeout: 1800
-      concurrency: 4
+      concurrency: null
 
       model_server:
         name: policy_model

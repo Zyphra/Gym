@@ -4,6 +4,14 @@ AnySWE runs a Gym agent inside a SWE task image, extracts its repository patch,
 and grades the patch in a fresh OpenSandbox environment. It supports SWE-bench,
 SWE-bench Multilingual, and R2E-Gym.
 
+## Concurrency
+
+`concurrency: null` runs requests without an agent-level semaphore; the Pi and
+Hermes configs select it. Positive integer values keep a bounded semaphore.
+Zero and negative values are rejected rather than creating a permanently
+blocked queue. Other configurations retain the default 256 request limit.
+Sandbox resources and the model server retain their own admission controls.
+
 ## Run
 
 Create `env.yaml` for the policy model:
