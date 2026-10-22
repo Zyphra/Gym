@@ -382,8 +382,9 @@ async def test_transport_error_clears_after_a_successful_request():
 @pytest.mark.asyncio
 async def test_default_interleaved_thinking_is_echoed_on_the_next_native_request():
     from harbor.llms.chat import Chat
-    from responses_api_agents.terminus_2_agent.app import Terminus2AgentConfig
+
     from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+    from responses_api_agents.terminus_2_agent.app import Terminus2AgentConfig
 
     config = Terminus2AgentConfig(host="127.0.0.1", port=1, entrypoint="app.py", name="term",
         resources_server=ResourcesServerRef(type="resources_servers", name="resource"),
