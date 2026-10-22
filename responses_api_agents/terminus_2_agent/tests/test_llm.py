@@ -420,3 +420,44 @@ async def test_default_interleaved_thinking_is_echoed_on_the_next_native_request
         await chat.chat("next prompt")
     history = post.call_args_list[1].args[0]["messages"]
     assert history[1] == {"role": "assistant", "content": "first", "reasoning_content": "exact sampled thinking"}
+
+
+@pytest.mark.asyncio
+async def test_native_chat_http_echo_survives_shortened_history(record_property):
+    from aiohttp import web
+    from harbor.llms.chat import Chat
+
+    requests = []
+
+    async def complete(request):
+        requests.append((request.path, await request.json()))
+        return web.json_response(
+            _mock_response(content="answer", extra_message={"reasoning_content": "exact sampled thinking"})
+        )
+
+    app = web.Application()
+    app.router.add_post("/ng-rollout/term-session/v1/chat/completions", complete)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    llm = _make_llm(api_base=f"http://127.0.0.1:{port}/ng-rollout/term-session/v1")
+    chat = Chat(llm, interleaved_thinking=True)
+    try:
+        await chat.chat("first prompt")
+        retained = dict(chat.messages[1])
+        await chat.chat("next prompt")
+        chat.messages[:] = [{"role": "user", "content": "summary"}, retained]
+        await chat.chat("continue after summary")
+        for _, body in requests[1:]:
+            assistant = next(m for m in body["messages"] if m["role"] == "assistant")
+            assert assistant["reasoning_content"] == "exact sampled thinking"
+            assert assistant["content"] == "answer"
+        assert [path for path, _ in requests] == ["/ng-rollout/term-session/v1/chat/completions"] * 3
+        record_property(
+            "native_terminus_capture", "2/2 exact reasoning echoes; normal and shortened histories; same session URL"
+        )
+    finally:
+        await llm.aclose()
+        await runner.cleanup()
