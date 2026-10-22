@@ -438,9 +438,11 @@ class VLLMModel(SimpleResponsesAPIModel):
         if boundary_mode is not None:
             if boundary_mode not in {"true", "false"}:
                 raise ValueError("preserve_explicit_assistant_boundaries metadata must be true or false")
-            converter = converter.model_copy(update={
-                "preserve_explicit_assistant_boundaries": boundary_mode == "true",
-            })
+            converter = converter.model_copy(
+                update={
+                    "preserve_explicit_assistant_boundaries": boundary_mode == "true",
+                }
+            )
         chat_completion_create_params = converter.responses_to_chat_completion_create_params(body)
         body.model = self.config.model
 
@@ -640,6 +642,12 @@ class VLLMModel(SimpleResponsesAPIModel):
         if self.config.uses_reasoning_parser and not self.config.preserve_reasoning_in_assistant_content:
             for message_dict in body_dict["messages"]:
                 if message_dict.get("role") != "assistant" or "content" not in message_dict:
+                    continue
+                # Parsed fields are the wire authority. Reinterpreting tags in
+                # visible content can change an already parsed assistant turn.
+                if isinstance(message_dict.get("reasoning_content"), str) or isinstance(
+                    message_dict.get("reasoning"), str
+                ):
                     continue
 
                 content = message_dict["content"]
@@ -1006,7 +1014,7 @@ class VLLMModel(SimpleResponsesAPIModel):
 
         choice_dict = chat_completion_dict["choices"][0]
         self._verify_generation_prefix(body_dict, chat_completion_dict)
-        if self.config.uses_reasoning_parser:
+        if self.config.uses_reasoning_parser and self.config.preserve_reasoning_in_assistant_content:
             # See the TODO wrt reasoning_content above
             reasoning_content = choice_dict["message"].get("reasoning_content") or choice_dict["message"].get(
                 "reasoning"
@@ -1025,7 +1033,7 @@ class VLLMModel(SimpleResponsesAPIModel):
                         [reasoning_content]
                     ) + (choice_dict["message"].get("content") or "")
 
-        else:
+        elif not self.config.uses_reasoning_parser:
             # See the TODO wrt reasoning_content above
             assert not (choice_dict["message"].get("reasoning_content") or choice_dict["message"].get("reasoning")), (
                 f"NeMo Gym server `{self.config.name}` config has explicitly been set to not use a reasoning parser i.e. `uses_reasoning_parser: false`. Please do not use a reasoning parser in your vLLM endpoint, or fix the `{self.config.name}` server config!"

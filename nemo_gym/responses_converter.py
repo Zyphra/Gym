@@ -90,6 +90,7 @@ class ResponsesConverterState(BaseModel):
     messages: List[NeMoGymChatCompletionMessageParam] = Field(default_factory=list)
 
     content_buffer: str = ""
+    reasoning_buffer: List[str] = Field(default_factory=list)
     refusal_buffer: str = ""
     tool_calls_buffer: List[NeMoGymChatCompletionMessageToolCallParam] = Field(default_factory=list)
     assistant_item_buffered: bool = False
@@ -111,6 +112,8 @@ class ResponsesConverterState(BaseModel):
             shared_params["tool_calls"] = self.tool_calls_buffer
         if self.refusal_buffer:
             shared_params["refusal"] = self.refusal_buffer
+        if self.reasoning_buffer:
+            shared_params["reasoning_content"] = "\n".join(self.reasoning_buffer)
 
         if self.return_token_id_information and self.token_information is not None:
             message = NeMoGymChatCompletionAssistantMessageForTrainingParam(
@@ -123,6 +126,7 @@ class ResponsesConverterState(BaseModel):
         self.messages.append(message)
 
         self.content_buffer = ""
+        self.reasoning_buffer = []
         self.refusal_buffer = ""
         self.tool_calls_buffer = []
         self.assistant_item_buffered = False
@@ -509,7 +513,9 @@ class ResponsesConverter(BaseModel):
         state.assistant_item_buffered = True
         if "summary" in m and m["summary"]:
             texts = [s["text"] for s in m["summary"]]
-            state.content_buffer += self._wrap_reasoning_in_think_tags(texts)
+            # Keep parsed reasoning separate from visible text. A literal think
+            # block in the answer must not be reparsed as another sampled turn.
+            state.reasoning_buffer.extend(texts)
 
     def _format_function_call(
         self,
