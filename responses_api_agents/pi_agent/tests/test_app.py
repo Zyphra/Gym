@@ -15,6 +15,8 @@
 
 import asyncio
 import json
+import os
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -184,8 +186,36 @@ class TestModelServer:
         assert provider["baseUrl"] == "http://model/ng-rollout/1-2/v1"
         assert provider["models"][0]["id"] == "Qwen3.6-35B-A3B"
         assert provider["models"][0]["maxTokens"] == 131072
+        assert provider["compat"]["requiresThinkingAsText"] is False
+        assert provider["compat"]["requiresReasoningContentOnAssistantMessages"] is True
         assert agent.config.models_config == models_config
         resolve.assert_called_once_with("policy_model", "1-2")
+
+    @pytest.mark.skipif(not os.environ.get("TASK_STOCK_PI_RUNTIME"), reason="native Pi runtime not supplied")
+    def test_native_thinking_echo(self, record_property) -> None:
+        runtime = Path(os.environ["TASK_STOCK_PI_RUNTIME"])
+        agent = _make_agent(
+            model="fixture-policy", model_server=ModelServerRef(type="responses_api_models", name="policy")
+        )
+        with patch.object(PiAgent, "resolve_model_base_url", return_value="http://127.0.0.1/unused"):
+            compat = agent._build_models_config("session")["providers"]["nemo"]["compat"]
+        result = subprocess.run(
+            [
+                str(runtime / "bin/node"),
+                str(Path(__file__).with_name("thinking_echo.mjs")),
+                str(runtime),
+                json.dumps(compat),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        capture = json.loads(result.stdout)
+        assert capture["baseline_echoes"] == 2
+        assert capture["explicit_echoes"] == 2
+        assert capture["paths"] == ["/ng-rollout/pi-session/v1/chat/completions"] * 6
+        record_property("native_pi_capture", result.stdout)
 
     def test_preserves_explicit_provider_without_model_server(self) -> None:
         config = {"providers": {"custom": {"baseUrl": "https://example.test"}}}
