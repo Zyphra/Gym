@@ -83,6 +83,7 @@ def test_native_summary_reuses_the_main_client_model_and_rollout_url(monkeypatch
                 model_server=ModelServerRef(type="responses_api_models", name="policy"),
                 resources_server=ResourcesServerRef(type="resources_servers", name="resource"),
                 model="fixture-policy",
+                api_key="local-control",
                 max_turns=2,
                 max_tokens=64,
                 enabled_toolsets=[],
