@@ -403,7 +403,11 @@ class TestMaxTokens:
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
-                return retained_result if retained_result is not None else {"messages": [{"role": "assistant", "content": "ok"}]}
+                return (
+                    retained_result
+                    if retained_result is not None
+                    else {"messages": [{"role": "assistant", "content": "ok"}]}
+                )
 
         monkeypatch.setattr("run_agent.AIAgent", _StubAIAgent)
         return agent, seen
@@ -414,10 +418,16 @@ class TestMaxTokens:
 
         raw = json.loads((Path(__file__).parent / "fixtures/context-stop.json").read_text())
         message = raw["error"]["message"] if context_stop else "API request failed"
-        agent, _ = self._agent_and_seen(monkeypatch, retained_result={
-            "error": message, "completed": False, "partial": True, "api_calls": int(raw["metadata"]["turns"]),
-            "messages": [{"role": "assistant", "content": "retained partial output"}],
-        })
+        agent, _ = self._agent_and_seen(
+            monkeypatch,
+            retained_result={
+                "error": message,
+                "completed": False,
+                "partial": True,
+                "api_calls": int(raw["metadata"]["turns"]),
+                "messages": [{"role": "assistant", "content": "retained partial output"}],
+            },
+        )
         response = asyncio.run(agent._create_response(NeMoGymResponseCreateParamsNonStreaming(input="continue")))
         assert response.metadata["hermes_error"] == message
         assert response.metadata["turns"] == raw["metadata"]["turns"]
