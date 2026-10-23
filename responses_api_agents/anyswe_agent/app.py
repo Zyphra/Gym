@@ -76,7 +76,11 @@ def _overlay_files(overlay: Dict[str, str]) -> Dict[str, str]:
             raise ValueError(f"agent runtime overlay directory not found: {root}")
         if target.suffix == ".py":
             raise ValueError("agent runtime overlay module must select a Python file")
-        modules = sorted(path for path in root.rglob("*") if path.is_file() and path.suffix in (".py", ".ts") and "__pycache__" not in path.parts)
+        modules = sorted(
+            path
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix in (".py", ".ts") and "__pycache__" not in path.parts
+        )
         if not modules:
             raise ValueError(f"agent runtime overlay holds no modules: {root}")
         for module in modules:
@@ -108,6 +112,7 @@ class SWEBenchMetrics(SandboxMemoryEvents):
     eval_timed_out: Optional[bool] = None
     error_kind: Optional[str] = None
     error_detail: Optional[str] = None
+    artifact_path: Optional[str] = None
     mask_sample: Optional[bool] = None
 
     agent_run_time: Optional[float] = None
@@ -270,7 +275,8 @@ def _should_mask_sample(
     agent_stop_reason: Optional[str] = None,
 ) -> bool:
     expected_budget_stop = (agent_error_kind, agent_stop_reason) in {
-        ("max_iteration", "max_iterations"), ("context_window", "context_exhausted")
+        ("max_iteration", "max_iterations"),
+        ("context_window", "context_exhausted"),
     }
     return bool(
         (resolved and agent_error_kind in ("max_iteration", "context_window") and not expected_budget_stop)
@@ -321,10 +327,12 @@ class AnySweAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_provider: str | Dict[str, Any] = "sandbox"
     sandbox_spec: Dict[str, Any] = Field(default_factory=dict)
     sandbox_grading_policy: Optional[str] = Field(
-        default=None, description="Trusted module:function projecting a fresh grading provider and spec",
+        default=None,
+        description="Trusted module:function projecting a fresh grading provider and spec",
     )
     sandbox_policy: Optional[str] = Field(
-        default=None, description="Trusted module:function providing an async policy sandbox context",
+        default=None,
+        description="Trusted module:function providing an async policy sandbox context",
     )
     agent_runtime_source: str = "baked"
     agent_runtime_overlay: Dict[str, str] = Field(
@@ -392,9 +400,7 @@ class AnySweEpisodePayload(BaseModel):
         )
 
     def unpack(self) -> AnySweInstanceConfig:
-        return self.instance_config.model_copy(
-            update={"private_grader_payload": self.private_grader_payload}
-        )
+        return self.instance_config.model_copy(update={"private_grader_payload": self.private_grader_payload})
 
     @classmethod
     def worker_payload(cls, params: AnySweInstanceConfig) -> Dict[str, Any]:
@@ -761,7 +767,8 @@ class AnySweSandboxRunner:
     ) -> tuple[bool, Optional[str], Optional[str]]:
         plan = self._private_grader_plan(params, patch)
         sandbox = self._grading_sandbox(
-            params, self._sandbox_spec(params, files=plan.files, workdir=plan.workdir),
+            params,
+            self._sandbox_spec(params, files=plan.files, workdir=plan.workdir),
         )
         try:
             await sandbox.start()
@@ -781,17 +788,13 @@ class AnySweSandboxRunner:
             return (
                 False,
                 "eval_timeout",
-                _error_detail(
-                    f"grader exec error_type={result.error_type}", f"rc={result.return_code}"
-                ),
+                _error_detail(f"grader exec error_type={result.error_type}", f"rc={result.return_code}"),
             )
         if result.error_type is not None:
             return (
                 False,
                 "sandbox" if result.error_type == "sandbox" else "grader",
-                _error_detail(
-                    f"grader exec error_type={result.error_type}", f"rc={result.return_code}"
-                ),
+                _error_detail(f"grader exec error_type={result.error_type}", f"rc={result.return_code}"),
             )
         if result.return_code == 0:
             return True, None, None
@@ -801,9 +804,7 @@ class AnySweSandboxRunner:
             return (
                 False,
                 "eval_timeout",
-                _error_detail(
-                    f"grader exec error_type={result.error_type}", f"rc={result.return_code}"
-                ),
+                _error_detail(f"grader exec error_type={result.error_type}", f"rc={result.return_code}"),
             )
         return (
             False,
@@ -956,7 +957,9 @@ class AnySweSandboxRunner:
                 if fetched.return_code != 0:
                     raise RuntimeError(f"agent runtime fetch failed: {(fetched.stderr or '')[:300]}")
             else:
-                runtime = await sandbox.exec("test -x /agent_deps_mount/bin/python", timeout_s=setup_timeout_seconds(30), user="root")
+                runtime = await sandbox.exec(
+                    "test -x /agent_deps_mount/bin/python", timeout_s=setup_timeout_seconds(30), user="root"
+                )
                 if runtime.return_code != 0:
                     raise RuntimeError("task image does not contain /agent_deps_mount/bin/python")
             if external_runtime:
@@ -1007,6 +1010,7 @@ class AnySweSandboxRunner:
             sandbox_failed = True
             sandbox_error_kind = sandbox_error_kind or "sandbox"
             error_detail = _grading_exception_detail(params, exc)
+            error_path = params.persistent_dir / "sandbox_error.txt"
             update_metrics(
                 params.metrics_fpath,
                 {
@@ -1014,11 +1018,12 @@ class AnySweSandboxRunner:
                     "patch_exists": False,
                     "error_kind": sandbox_error_kind,
                     "error_detail": error_detail,
+                    "artifact_path": str(error_path),
                     "mask_sample": True,
                     "agent_run_time": time.time() - started,
                 },
             )
-            (params.persistent_dir / "sandbox_error.txt").write_text(repr(exc))
+            error_path.write_text(repr(exc))
         finally:
             try:
                 if sandbox is not None:
@@ -1080,7 +1085,9 @@ class AnySweSandboxRunner:
             agent_error += "\n" + "\n".join(str(part) for part in declared_errors if part)
         if agent_stop_reason == "max_iterations" and not agent_error.strip():
             agent_error += "\nmax iterations"
-        agent_error_kind = "context_window" if agent_stop_reason == "context_exhausted" else _classify_agent_error(agent_error)
+        agent_error_kind = (
+            "context_window" if agent_stop_reason == "context_exhausted" else _classify_agent_error(agent_error)
+        )
         resolved = False
         # A runner exception outside the typed transport cases retains the old
         # task-zero behavior. Its partial patch is evidence, not a successful
