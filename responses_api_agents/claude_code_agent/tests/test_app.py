@@ -15,6 +15,7 @@
 
 import asyncio
 import json
+import sys
 import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23,6 +24,7 @@ import orjson
 import pytest
 import yaml
 from fastapi import Request
+from pydantic import ValidationError
 
 from nemo_gym.global_config import SKILLS_REF_KEY_NAME
 from nemo_gym.openai_utils import (
@@ -110,6 +112,12 @@ class TestSanity:
         agent = _make_agent(concurrency=4)
         assert agent.sem._value == 4
 
+    def test_env_rejects_agent_owned_keys(self) -> None:
+        # settings.json env overrides the process env, so a binding could otherwise redirect the transport.
+        with pytest.raises(ValidationError, match="ANTHROPIC_BASE_URL"):
+            _config(env={"ANTHROPIC_BASE_URL": "http://elsewhere", "DISABLE_AUTOUPDATER": "1"})
+        assert _config(env={"DISABLE_AUTOUPDATER": "1"}).env == {"DISABLE_AUTOUPDATER": "1"}
+
 
 class TestBuildCommand:
     def test_default_passes_bare(self) -> None:
@@ -172,6 +180,25 @@ class TestBuildCommand:
         assert cmd[cmd.index("--max-turns") + 1] == "7"
         assert cmd[cmd.index("--append-system-prompt") + 1] == "be terse"
 
+    def test_system_prompt_mode(self) -> None:
+        cmd = _make_agent()._build_command("m", "x", system_prompt="You are ZAYA.")
+        assert cmd[cmd.index("--append-system-prompt") + 1] == "You are ZAYA."
+        assert "--system-prompt" not in cmd
+        cmd = _make_agent(system_prompt_mode="replace")._build_command("m", "x", system_prompt="You are ZAYA.")
+        assert cmd[cmd.index("--system-prompt") + 1] == "You are ZAYA."
+        assert "--append-system-prompt" not in cmd
+        assert cmd.index("--system-prompt") < cmd.index("--")
+        assert "--system-prompt" not in _make_agent(system_prompt_mode="replace")._build_command("m", "x")
+
+    def test_tools_whitelist(self) -> None:
+        assert "--tools" not in _make_agent()._build_command("m", "x")
+        cmd = _make_agent(tools="Bash,Read,Edit")._build_command("m", "x")
+        assert cmd[cmd.index("--tools") + 1] == "Bash,Read,Edit"
+        assert cmd.index("--tools") < cmd.index("--")
+        # An empty whitelist is a real choice (no built-in tools), not an absent one.
+        cmd = _make_agent(tools="")._build_command("m", "x")
+        assert cmd[cmd.index("--tools") + 1] == ""
+
 
 class TestBuildSettings:
     def test_default_disables_telemetry(self) -> None:
@@ -198,6 +225,35 @@ class TestBuildSettings:
         agent = _make_agent(settings=str(settings_file))
         settings = agent._build_settings()
         assert settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "1"
+
+    def test_config_env_merged_last(self, tmp_path: Path) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({"env": {"FOO": "file", "DISABLE_COMPACT": "0"}}))
+        agent = _make_agent(settings=str(settings_file), env={"DISABLE_COMPACT": "1", "DISABLE_AUTOUPDATER": "1"})
+        env = agent._build_settings()["env"]
+        assert env["DISABLE_COMPACT"] == "1"
+        assert env["DISABLE_AUTOUPDATER"] == "1"
+        assert env["FOO"] == "file"
+        assert env["CLAUDE_CODE_ENABLE_TELEMETRY"] == "0"
+
+
+class TestSettingsOverrides:
+    def test_overrides_layer_over_base_and_file(self, tmp_path: Path) -> None:
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps({"includeCoAuthoredBy": True, "permissions": {"allow": ["Bash"]}}))
+        agent = _make_agent(
+            settings=str(settings_file),
+            settings_overrides={"includeCoAuthoredBy": False, "attribution": {"commit": "", "pr": ""}},
+        )
+        settings = agent._build_settings()
+        assert settings["includeCoAuthoredBy"] is False
+        assert settings["attribution"] == {"commit": "", "pr": ""}
+        assert settings["permissions"] == {"allow": ["Bash"]}
+        assert settings["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "0"
+
+    def test_overrides_reject_env(self) -> None:
+        with pytest.raises(ValueError, match="settings_overrides must not set env"):
+            _make_agent(settings_overrides={"env": {"FOO": "1"}})
 
 
 class TestSetupConfigDir:
@@ -858,6 +914,64 @@ class TestRolloutCorrelation:
         base_url = self._run_and_capture_base_url(agent, tmp_path, rollout_id="task3-roll1")
 
         assert base_url == "http://model-server:9000/ng-rollout/task3-roll1/training-token-capture"
+
+    def test_sandbox_model_base_url_is_not_scoped_again(self, tmp_path: Path) -> None:
+        # The sandbox relay's upstream already carries the rollout scope; a second prefix is refused there.
+        agent = _make_agent(
+            model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+            sandbox_model_base_url="http://127.0.0.1:18080",
+            token_id_capture=True,
+        )
+        agent.server_client.global_config_dict = {"token_id_capture": {"enabled": True}}
+
+        assert self._run_and_capture_base_url(agent, tmp_path, rollout_id="task3-roll1") == "http://127.0.0.1:18080"
+        assert agent._resolve_call_base_url(None) == "http://127.0.0.1:18080"
+
+        # The CLI appends /v1/messages itself.
+        agent.config.sandbox_model_base_url = "http://127.0.0.1:18080/v1/"
+        assert agent._resolve_call_base_url("task3-roll1") == "http://127.0.0.1:18080"
+
+    def test_sandbox_transport_reaches_the_cli_process(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A real subprocess named ``claude`` on PATH records what the CLI would receive.
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        record = tmp_path / "record.json"
+        fake = bin_dir / "claude"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "if sys.argv[1:] == ['--version']:\n"
+            "    print('0.0.0 (fake)')\n"
+            "    raise SystemExit(0)\n"
+            "settings = json.loads((Path(os.environ['CLAUDE_CONFIG_DIR']) / 'settings.json').read_text())\n"
+            "keys = ('ANTHROPIC_BASE_URL', 'DISABLE_AUTOUPDATER', 'CLAUDE_STREAM_IDLE_TIMEOUT_MS')\n"
+            "record = {'argv': sys.argv[1:], 'env': {k: os.environ.get(k) for k in keys}, 'settings': settings}\n"
+            f"Path({str(record)!r}).write_text(json.dumps(record))\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False,"
+            " 'usage': {'input_tokens': 1, 'output_tokens': 1}}))\n"
+        )
+        fake.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}:{Path(sys.executable).parent}")
+        monkeypatch.setenv("HOME", str(tmp_path))
+        tools = "Bash,Read,Edit,Write,Glob,Grep,TodoWrite"
+        env = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "1800000"}
+        agent = _make_agent(
+            model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+            sandbox_model_base_url="http://127.0.0.1:18080",
+            tools=tools,
+            env=env,
+        )
+
+        _, _, metadata = asyncio.run(agent._run_claude_code("hi", rollout_id="task3-roll1"))
+
+        seen = json.loads(record.read_text())
+        assert metadata["status"] == "completed"
+        assert seen["env"] == {"ANTHROPIC_BASE_URL": "http://127.0.0.1:18080", **env}
+        assert seen["argv"][seen["argv"].index("--tools") + 1] == tools
+        assert seen["argv"][-2:] == ["--", "hi"]
+        assert seen["settings"]["env"]["DISABLE_AUTOUPDATER"] == "1"
+        assert seen["settings"]["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"] == "0"
 
 
 class TestExtractInstruction:

@@ -52,6 +52,13 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from nemo_gym.anthropic_converter import AnthropicConverter
+from nemo_gym.anthropic_tool_echo import (
+    record_served_turn,
+    repair_tool_name_case,
+    request_anchor,
+    restore_served_turns,
+    store_for,
+)
 from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_chat_completion_sse
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT, ModelServerRef
 from nemo_gym.openai_utils import (
@@ -66,7 +73,7 @@ from nemo_gym.responses_streaming import (
     synthesize_responses_sse,
     validate_streaming_responses_params,
 )
-from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_from_run_body
 from nemo_gym.rollout_observability import AgentObservationBundle, ObservationGap, join_model_call_observations
 from nemo_gym.server_utils import (
     BaseRunServerInstanceConfig,
@@ -112,6 +119,35 @@ def _reject_external_capture_streaming(body: dict[str, Any]) -> None:
 
 # Stateless; shared by every model server's default /v1/messages handler.
 _ANTHROPIC_CONVERTER = AnthropicConverter()
+
+# The identity blocks Claude Code 2.1.x always sends as their own system block, whatever
+# --system-prompt or --append-system-prompt says (the CLI picks one per mode).
+CLAUDE_CODE_IDENTITY_BLOCKS = frozenset(
+    {
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+        "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+        "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+    }
+)
+
+
+def drop_client_identity(body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Return ``body`` without system blocks that exactly match a Claude Code identity block."""
+    system = body.get("system")
+    if isinstance(system, str):
+        return ({**body, "system": ""}, 1) if system in CLAUDE_CODE_IDENTITY_BLOCKS else (body, 0)
+    if not isinstance(system, list):
+        return body, 0
+    kept = [
+        block
+        for block in system
+        if not (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and block.get("text") in CLAUDE_CODE_IDENTITY_BLOCKS
+        )
+    ]
+    return ({**body, "system": kept}, len(system) - len(kept)) if len(kept) != len(system) else (body, 0)
 
 
 def _request_messages(body: Any) -> list[dict]:
@@ -191,7 +227,14 @@ def _orjson_dispatch_response(content: Any) -> Any:
 
 
 class BaseResponsesAPIModelConfig(BaseRunServerInstanceConfig):
-    pass
+    # Drop the Claude Code CLI's own identity block from /v1/messages system prompts before
+    # conversion, so a non-Claude backend never sees it. Only exact copies of the CLI's fixed
+    # identity strings are dropped; every other system block passes through unchanged.
+    anthropic_drop_client_identity: bool = False
+    # Give a /v1/messages client each served tool_use name that differs from exactly one offered
+    # tool only in case renamed to that tool (the policy wrote ``bash``, the request offers
+    # ``Bash``). The served name is recorded, so the client's echo is restored to it.
+    anthropic_tool_name_case_repair: bool = False
 
 
 class BaseResponsesAPIModel(BaseServer):
@@ -352,12 +395,38 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         result back to an Anthropic Messages response. When the client requested ``stream: true``
         (the Claude Code CLI always does), the complete response is re-emitted as a synthesized
         Anthropic SSE event stream. Servers may override this for native Messages handling.
+
+        Each served turn with tool calls is recorded for its rollout. An echoed assistant
+        turn with the same ``tool_use`` ids, names and block order gets the served content
+        back before conversion, whatever the client changed in it, so the history reaching
+        the backend is the one it served; each difference goes to the rollout's restore log.
+        Turns that match no served turn, and user and ``tool_result`` content, pass through
+        (``nemo_gym.anthropic_tool_echo``). With ``anthropic_drop_client_identity``, the
+        CLI's fixed identity system block is dropped first (``drop_client_identity``). With
+        ``anthropic_tool_name_case_repair``, the client gets a tool name that differs from one
+        offered tool only in case as that tool's name (``repair_tool_name_case``); the record
+        keeps the served name.
         """
         _reject_external_capture_streaming(body)
+        if getattr(self.config, "anthropic_drop_client_identity", False):
+            body, dropped = drop_client_identity(body)
+            if dropped:
+                logger.debug("dropped %d Claude Code identity system block(s)", dropped)
+        rollout_id = current_rollout_id()
+        served_turns = store_for(self.config.name, self.config.host, self.config.port)
+        # Empty served turns are recorded with the client's own last user message (before any restore), and
+        # only in the rollout's own file: their keys are not unique across conversations.
+        anchor = request_anchor(body.get("messages")) if served_turns.scoped(rollout_id) else None
+        body, _ = restore_served_turns(body, served_turns, rollout_id)
         params = _ANTHROPIC_CONVERTER.anthropic_request_to_responses(body)
         response = await self._invoke_responses(request, params)
         model_name = body.get("model") or response.model
         anthropic_response = _ANTHROPIC_CONVERTER.responses_to_anthropic_response(response, model=model_name)
+        record_served_turn(anthropic_response, served_turns, rollout_id, anchor=anchor)
+        if getattr(self.config, "anthropic_tool_name_case_repair", False):
+            anthropic_response, renamed = repair_tool_name_case(anthropic_response, body.get("tools"))
+            if renamed:
+                logger.debug("renamed %d served tool name(s) to the offered case: %s", len(renamed), renamed)
         if body.get("stream"):
             return StreamingResponse(
                 _ANTHROPIC_CONVERTER.anthropic_response_to_sse(anthropic_response),

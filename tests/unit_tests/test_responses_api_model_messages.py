@@ -93,12 +93,12 @@ class _RequestAwareModel(SimpleResponsesAPIModel):
         raise NotImplementedError
 
 
-def _config() -> BaseResponsesAPIModelConfig:
-    return BaseResponsesAPIModelConfig(host="0.0.0.0", port=8099, entrypoint="", name="")
+def _config(**overrides) -> BaseResponsesAPIModelConfig:
+    return BaseResponsesAPIModelConfig(host="0.0.0.0", port=8099, entrypoint="", name="", **overrides)
 
 
-def _client(model_cls) -> TestClient:
-    server = model_cls(config=_config(), server_client=MagicMock(spec=ServerClient, global_config_dict={}))
+def _client(model_cls, **overrides) -> TestClient:
+    server = model_cls(config=_config(**overrides), server_client=MagicMock(spec=ServerClient, global_config_dict={}))
     return TestClient(server.setup_webserver()), server
 
 
@@ -150,3 +150,51 @@ class TestDefaultMessagesRoute:
         assert "event: message_start" in body
         assert "event: content_block_delta" in body
         assert "event: message_stop" in body
+
+
+class TestClientIdentityDrop:
+    IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+
+    def _post(self, client, system) -> None:
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-x",
+                "max_tokens": 8,
+                "system": system,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 200
+
+    def test_off_by_default(self) -> None:
+        client, server = _client(_BodyOnlyModel)
+        self._post(client, [{"type": "text", "text": self.IDENTITY}, {"type": "text", "text": "You are ZAYA."}])
+        assert server.last_params.instructions == self.IDENTITY + "\nYou are ZAYA."
+
+    def test_drops_only_exact_identity_blocks(self) -> None:
+        client, server = _client(_BodyOnlyModel, anthropic_drop_client_identity=True)
+        system = [
+            {"type": "text", "text": self.IDENTITY, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "You are ZAYA, a coding agent developed by Zyphra."},
+            {"type": "text", "text": self.IDENTITY + " Extra."},
+        ]
+        self._post(client, system)
+        assert (
+            server.last_params.instructions
+            == "You are ZAYA, a coding agent developed by Zyphra.\n" + self.IDENTITY + " Extra."
+        )
+
+    def test_every_cli_identity_variant(self) -> None:
+        from nemo_gym.base_responses_api_model import CLAUDE_CODE_IDENTITY_BLOCKS, drop_client_identity
+
+        assert len(CLAUDE_CODE_IDENTITY_BLOCKS) == 3
+        for text in CLAUDE_CODE_IDENTITY_BLOCKS:
+            body, dropped = drop_client_identity(
+                {"system": [{"type": "text", "text": text}, {"type": "text", "text": "task"}]}
+            )
+            assert dropped == 1 and body["system"] == [{"type": "text", "text": "task"}]
+            assert drop_client_identity({"system": text}) == ({"system": ""}, 1)
+        unchanged = {"system": [{"type": "text", "text": "task"}]}
+        assert drop_client_identity(unchanged) == (unchanged, 0)
+        assert drop_client_identity({"messages": []}) == ({"messages": []}, 0)
