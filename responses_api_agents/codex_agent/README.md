@@ -88,7 +88,9 @@ Codex talks to the model via the OpenAI Responses API over SSE (`wire_api = "cha
 
 Each request gets a fresh `CODEX_HOME` with a generated `config.toml` that pins a Gym-owned model provider (no `codex login` needed — the `openai_api_key` config value is handed to the subprocess as `OPENAI_API_KEY`, the provider's `env_key`), sets `approval_policy = "never"`, and disables everything that would make a rollout depend on ambient host state or phone home: analytics, update checks, on-disk history, server-side web search, and the multi-agent tool. Session persistence is disabled via `--ephemeral`. The `CODEX_HOME` and scratch working directory are removed after the run, so rollouts cannot contaminate one another.
 
-Codex is auto-installed on first startup via npm or a local Node.js binary if not already on PATH.
+Codex is auto-installed on first startup via npm or a local Node.js binary if not already on PATH. With `codex_install: offline` startup never installs or downloads anything: the `codex` on PATH must report exactly `codex_version`, or the agent fails to start.
+
+To run Codex on an existing repository (e.g. a SWE task's `/testbed`) instead of a scratch directory, set `cwd`. AnySWE starts the agent in the task's working directory, so `cwd: .` runs Codex there.
 
 ## Configuration
 
@@ -109,6 +111,7 @@ codex_agent:
       system_prompt: null
       reasoning_effort: null
       codex_version: 0.144.4
+      codex_install: auto
       cwd: null
       stream_idle_timeout_ms: null
       extra_config: {}
@@ -123,7 +126,8 @@ codex_agent:
 - `system_prompt`: inserted as a `developer` role message via Codex's `developer_instructions` config. The data's system message (if any) is appended after this
 - `reasoning_effort`: passed as `model_reasoning_effort` (e.g. `low`, `medium`, `high`)
 - `codex_version`: **required** — npm version pinned on auto-install. Every config must pin an explicit version so runs are reproducible and cannot silently drift as new Codex releases land; version bumps become explicit, tested changes
-- `cwd`: working root handed to `codex exec --cd`. `null` creates a fresh temp dir per request and removes it afterwards
+- `codex_install`: `auto` (default) uses any `codex` on PATH or `~/.local/bin`, else installs `codex_version` via npm. `offline` never installs or downloads: startup fails unless the `codex` on PATH reports exactly `codex_version` (`codex --version`), and every request runs that verified executable. Use `offline` where the pinned binary ships with the runtime and the sandbox has no network
+- `cwd`: working root handed to `codex exec --cd`. `null` creates a fresh temp dir per request and removes it afterwards. A relative path resolves against the agent process's working directory when the request runs, so `.` is the directory the agent was started in (AnySWE: the task workdir, e.g. `/testbed`). A `cwd` that is not a directory fails the request
 - `stream_idle_timeout_ms`: provider stream idle budget. Gym model servers emit the synthesized SSE only once the full response is computed, so this must cover an entire generation; `null` defaults it to `timeout * 1000`
 - `extra_config`: extra `config.toml` content deep-merged over the generated base config — add MCP servers, feature flags, `model_verbosity`, etc. Per-rollout Gym MCP entries take precedence on name collisions
 

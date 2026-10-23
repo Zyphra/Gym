@@ -105,6 +105,35 @@ def _input_message_text(item: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def _complete_echoed_assistant_message(item: Any, index: int) -> Any:
+    """Fill the output-message fields a client may omit when it replays an assistant message.
+
+    The Responses API accepts an assistant ``message`` input whose ``output_text`` parts carry only
+    ``text`` (the Codex CLI replays its own earlier output this way), while the Gym input union
+    requires an output message ``id`` and per-part ``annotations``. Dropping the item would delete
+    the assistant's visible text from the replayed history (a tool-call turn's text, even the
+    whitespace a reasoning parser leaves between its think block and the call), so the backend would
+    see a different turn than the one it served. Only those two fields (and ``status``) are filled;
+    the text is unchanged, and the id is positional so a replayed history converts identically on
+    every turn.
+    """
+    if not (
+        isinstance(item, dict)
+        and item.get("type") == "message"
+        and item.get("role") == "assistant"
+        and isinstance(item.get("content"), list)
+        and item["content"]
+        and all(isinstance(part, dict) and part.get("type") == "output_text" for part in item["content"])
+    ):
+        return item
+    return {
+        **item,
+        "id": item.get("id") or f"msg_replayed_{index}",
+        "status": item.get("status") or "completed",
+        "content": [{**part, "annotations": part.get("annotations") or []} for part in item["content"]],
+    }
+
+
 def sanitize_streaming_responses_body(body: dict[str, Any]) -> tuple[dict[str, Any], NamespaceMap]:
     """Map a streaming-dialect request body onto the strict non-streaming params shape.
 
@@ -133,7 +162,8 @@ def sanitize_streaming_responses_body(body: dict[str, Any]) -> tuple[dict[str, A
     if isinstance(input_items, list):
         kept_items = []
         carrier_tools: list[Any] = []
-        for item in input_items:
+        for index, item in enumerate(input_items):
+            item = _complete_echoed_assistant_message(item, index)
             if isinstance(item, dict) and item.get("type") == "function_call" and item.get("namespace"):
                 item["name"] = f"{item.pop('namespace')}{NAMESPACE_TOOL_DELIMITER}{item.get('name')}"
             # Codex's code mode ships tools inside an `additional_tools` input item instead of the

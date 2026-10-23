@@ -1,0 +1,68 @@
+anyswe_codex:
+  responses_api_agents:
+    anyswe_agent:
+      entrypoint: app.py
+      domain: coding
+      description: SWE-bench run by the Codex CLI natively inside the task container.
+      value: Eval software engineering capabilities on SWE-bench with any Gym agent.
+
+      agent_server_module: responses_api_agents.codex_agent.app
+      agent_server_class: CodexAgent
+      agent_config_class: CodexAgentConfig
+      agent_kwargs:
+        # The runtime ships this exact CLI (setup_scripts/codex_agent_deps.sh). Startup never
+        # installs or downloads Codex and refuses any other version.
+        codex_version: 0.144.4
+        codex_install: offline
+        # AnySWE starts the agent in the task workdir, so Codex works on the task repository.
+        cwd: .
+        timeout: 1800
+        system_prompt: "You are fixing a bug in the repository at /testbed. Edit the source files to fix the root cause, then verify. You MUST actually apply the fix with your file-editing tools; do not just describe it."
+        # Codex calls the policy model's Responses API (the Gym model server, or
+        # sandbox_model_base_url in a policy sandbox). The generated config already turns off
+        # analytics, update checks, history, web search, subagents and code mode.
+        extra_config:
+          # The task repository's AGENTS.md files are not part of the task.
+          project_doc_max_bytes: 0
+          # No bundled system skills (image generation, OpenAI docs, plugin and skill
+          # creators, skill installer) and no skills listing in the developer message.
+          skills:
+            bundled:
+              enabled: false
+            include_instructions: false
+          # Non-interactive runs cannot answer the user-input tool.
+          tools:
+            experimental_request_user_input:
+              enabled: false
+          # Hosted product features a task container cannot use. Plugins would also sync
+          # a marketplace from GitHub at startup.
+          features:
+            apps: false
+            plugins: false
+            remote_plugin: false
+            tool_suggest: false
+            goals: false
+            memories: false
+            image_generation: false
+            browser_use: false
+            computer_use: false
+            in_app_browser: false
+            hooks: false
+            skill_mcp_dependency_install: false
+            enable_request_compression: false
+
+      container_formatter: ${oc.env:ANYSWE_CONTAINER_FORMATTER}
+      sandbox_provider: sandbox
+      sandbox_model_base_url: ${oc.env:NEMO_GYM_SANDBOX_MODEL_BASE_URL,null}
+      swebench_agent_timeout: 2700
+      swebench_tests_timeout: 1800
+      concurrency: 4
+
+      model_server:
+        name: policy_model
+        type: responses_api_models
+
+      datasets:
+        - name: example
+          type: example
+          jsonl_fpath: responses_api_agents/anyswe_agent/data/example.jsonl

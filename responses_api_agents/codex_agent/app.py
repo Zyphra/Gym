@@ -23,6 +23,7 @@ import signal
 import subprocess
 import tempfile
 from asyncio import Semaphore
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from time import time
@@ -30,7 +31,7 @@ from typing import Any, Literal, Optional
 from uuid import uuid4
 
 from fastapi import Request
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, PrivateAttr
 
 from nemo_gym.base_resources_server import NEMO_GYM_MCP_METADATA_KEY, BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body, SimpleResponsesAPIAgent
@@ -50,7 +51,7 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.server_utils import get_response_json, raise_for_status
 from nemo_gym.skills import stage_skills
-from responses_api_agents.codex_agent.setup_codex import ensure_codex
+from responses_api_agents.codex_agent.setup_codex import ensure_codex, require_pinned_codex
 
 
 LOG = logging.getLogger(__name__)
@@ -303,8 +304,15 @@ class CodexAgentConfig(BaseResponsesAPIAgentConfig):
     # Required: every config pins an explicit npm version so auto-install is reproducible and cannot
     # silently drift as new Codex releases land. Version bumps are then explicit, tested changes.
     codex_version: str
+    # How startup provisions the CLI. "auto": any `codex` on PATH (or ~/.local/bin), else an npm
+    # install of codex_version (downloading Node.js when npm is absent). "offline": never install or
+    # download; the `codex` on PATH must report exactly codex_version, else startup fails, and every
+    # request runs that verified executable. For runtimes that ship the pinned binary, no network.
+    codex_install: Literal["auto", "offline"] = "auto"
     # Working root handed to `codex exec --cd`. None -> a fresh temp dir per request, removed
-    # afterwards, so rollouts cannot see each other's files.
+    # afterwards, so rollouts cannot see each other's files. A relative path resolves against the
+    # agent process's working directory when the request runs: AnySWE starts the agent in the task
+    # workdir (e.g. /testbed), so "." runs Codex on the task repository. It must be a directory.
     cwd: Optional[str] = None
     # Provider stream idle timeout. Gym model servers emit the synthesized SSE only once the full
     # response is computed, so the idle budget must cover an entire generation; None -> timeout * 1000.
@@ -328,9 +336,14 @@ class CodexAgent(SimpleResponsesAPIAgent):
     config: CodexAgentConfig
     sem: Semaphore = None
     model_config = ConfigDict(arbitrary_types_allowed=True)
+    _codex_executable: str = PrivateAttr(default="codex")
 
     def model_post_init(self, __context: Any) -> None:
         self.sem = Semaphore(self.config.concurrency)
+        if self.config.codex_install == "offline":
+            self._codex_executable = require_pinned_codex(self.config.codex_version)
+            LOG.warning("codex version: %s (pinned, %s)", self.config.codex_version, self._codex_executable)
+            return
         ensure_codex(self.config.codex_version)
         try:
             ver = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
@@ -445,7 +458,7 @@ class CodexAgent(SimpleResponsesAPIAgent):
         The ``--`` separator keeps prompts from being parsed as flags or subcommands.
         """
         return [
-            "codex",
+            self._codex_executable,
             "exec",
             "--json",
             "--ephemeral",
@@ -486,6 +499,10 @@ class CodexAgent(SimpleResponsesAPIAgent):
             cwd = self.config.cwd
             if cwd is None:
                 cwd = scratch_cwd = tempfile.mkdtemp(prefix="nemo_gym_codex_ws_")
+            else:
+                cwd = os.path.abspath(cwd)
+                if not os.path.isdir(cwd):
+                    raise NotADirectoryError(f"codex_agent cwd {self.config.cwd!r} is not a directory ({cwd})")
 
             env = {
                 **os.environ,
@@ -629,7 +646,11 @@ class CodexAgent(SimpleResponsesAPIAgent):
         request: Request,
         body: NeMoGymResponseCreateParamsNonStreaming = Body(),
     ) -> NeMoGymResponse:
-        return await self._create_response(body)
+        # Prefixed self-calls and the AnySWE runner carry the rollout id as a path parameter; it
+        # correlates the CLI's model calls exactly as run()'s id does.
+        path_params = getattr(request, "path_params", None)
+        rollout_id = path_params.get("rollout_id") if isinstance(path_params, Mapping) else None
+        return await self._create_response(body, rollout_id=rollout_id)
 
     async def run(self, request: Request, body: CodexAgentRunRequest) -> CodexAgentVerifyResponse:
         async with self.sem:

@@ -15,9 +15,11 @@
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -28,6 +30,8 @@ _CODEX_PKG = "@openai/codex"
 _NODE_VERSION = "22.15.0"
 _NODE_DIST_URL = f"https://nodejs.org/dist/v{_NODE_VERSION}/node-v{_NODE_VERSION}-linux-x64.tar.xz"
 _LOCAL_PREFIX = Path(__file__).parent / ".codex_node"
+# `codex --version` prints e.g. "codex-cli 0.144.4".
+_VERSION_LINE = re.compile(r"^codex(?:-cli)?\s+v?(\S+)$")
 
 
 def _npm_install(npm_bin: str, version: str | None) -> None:
@@ -55,6 +59,53 @@ def _install_node_locally() -> Path:
     nested.rmdir()
     tarball.unlink(missing_ok=True)
     return _LOCAL_PREFIX / "bin"
+
+
+def _codex_cli_version(executable: str) -> str | None:
+    """The version ``<executable> --version`` reports (``codex-cli 0.144.4`` -> ``0.144.4``), or None.
+
+    A run that exits non-zero reports nothing, whatever it printed. The probe runs with a
+    throwaway CODEX_HOME, so it never writes into a real Codex home.
+    """
+    with tempfile.TemporaryDirectory(prefix="codex_version_") as codex_home:
+        try:
+            result = subprocess.run(
+                [executable, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "CODEX_HOME": codex_home},
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        match = _VERSION_LINE.match(line.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def require_pinned_codex(version: str) -> str:
+    """Return the ``codex`` on PATH if it reports exactly ``version``; never install or download.
+
+    For runtimes that ship the pinned binary and run without network: a missing or mismatched
+    binary raises at startup instead of being replaced or used silently.
+    """
+    executable = shutil.which("codex")
+    if executable is None:
+        raise RuntimeError(
+            f"codex {version} is not on PATH and offline provisioning never installs it; "
+            "ship the pinned binary with the runtime"
+        )
+    reported = _codex_cli_version(executable)
+    if reported != version:
+        raise RuntimeError(
+            f"{executable} reports codex version {reported!r} but codex_version pins {version!r}; "
+            "offline provisioning never installs a replacement"
+        )
+    return executable
 
 
 def ensure_codex(version: str | None = None) -> None:
