@@ -184,6 +184,38 @@ def _keep_tool_calls(tool_calls: list) -> list:
     return tool_calls
 
 
+MAX_TOOL_RESULT_CHARS = 20_000
+
+
+def _limit_tool_results(agent: Any) -> None:
+    """Bound each new tool observation before Hermes sends its next request.
+
+    The pinned Hermes executor has a larger, hardcoded result limit and no
+    setting for it. Wrap its common dispatcher so both execution branches keep
+    their ordering, errors and tool identities. Never rewrite earlier history.
+    """
+    execute_tool_calls = agent._execute_tool_calls
+
+    def execute_then_limit(assistant_message, messages, *args, **kwargs):
+        first_new_message = len(messages)
+        try:
+            return execute_tool_calls(assistant_message, messages, *args, **kwargs)
+        finally:
+            for message in messages[first_new_message:]:
+                content = message.get("content")
+                if message.get("role") != "tool" or not isinstance(content, str):
+                    continue
+                if len(content) > MAX_TOOL_RESULT_CHARS:
+                    note = (
+                        f"\n\n[Truncated: tool result was {len(content):,} characters; "
+                        f"limit {MAX_TOOL_RESULT_CHARS:,} characters including this note. "
+                        "Use a narrower search or read range.]"
+                    )
+                    message["content"] = content[: MAX_TOOL_RESULT_CHARS - len(note)] + note
+
+    agent._execute_tool_calls = execute_then_limit
+
+
 # OpenHands' built-in `finish` schema (openhands/sdk/tool/builtins/finish.py), so a
 # harness mix offers one completion contract.
 FINISH_TOOL_SCHEMA = {
@@ -420,6 +452,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
 
         agent._build_api_kwargs = _patched_build_api_kwargs
         _execute_every_tool_call(agent)
+        _limit_tool_results(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         observer = None
         if observation_collector is not None:
@@ -526,7 +559,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
         was_interrupted = bool(result.get("interrupted")) or interrupted_by_dispatch
 
         harness_error = result.get("error")
-        context_exhausted = isinstance(harness_error, str) and harness_error.startswith("Context length exceeded") and harness_error.endswith("Cannot compress further.")
+        context_exhausted = (
+            isinstance(harness_error, str)
+            and harness_error.startswith("Context length exceeded")
+            and harness_error.endswith("Cannot compress further.")
+        )
         agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not context_exhausted
         metadata: dict[str, str] = {
             "interrupted": "true" if was_interrupted else "false",
@@ -558,7 +595,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             model=model_name,
             object="response",
             output=output_items,
-            status="incomplete" if context_exhausted else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
+            status="incomplete"
+            if context_exhausted
+            else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
             error=response_error,
             metadata=metadata,
             tool_choice=body.tool_choice,
