@@ -841,6 +841,123 @@ class TestEmptyTurnNudge:
         assert reasoning == ["cut 0", "cut 1"]
         assert self._shape(server)[-1] == ("user", reminder["text"] + "\n" + tool_echo.OUTPUT_LIMIT_NUDGE)
 
+    def test_without_a_rollout_id_no_dropped_turn_is_recorded_or_restored(self, private_store) -> None:
+        client, server = _server([self._capped(("reasoning", "cut 0"))])
+        _post(client, [TASK], prefix="")
+        _post(client, [{**TASK, "content": self._cli_nudged(TASK["content"], 1)}], prefix="")
+        assert not any(item.get("type") == "reasoning" for item in _backend_input(server))
+        assert _restore_log(private_store) == []
+
+    def test_rollouts_with_the_same_prompt_get_their_own_dropped_turns(self) -> None:
+        # A GRPO group: every rollout starts with the same task and records the same key.
+        client, server = _server([self._capped(("reasoning", "cut a")), self._capped(("reasoning", "cut b"))])
+        _post(client, [TASK], prefix="/ng-rollout/roll-a")
+        _post(client, [TASK], prefix="/ng-rollout/roll-b")
+        for rollout in ("b", "a"):
+            _post(
+                client,
+                [{**TASK, "content": self._cli_nudged(TASK["content"], 1)}],
+                prefix=f"/ng-rollout/roll-{rollout}",
+            )
+            reasoning = [
+                item["summary"][0]["text"] for item in _backend_input(server) if item.get("type") == "reasoning"
+            ]
+            assert reasoning == [f"cut {rollout}"]
+
+    def test_another_conversation_of_the_rollout_does_not_replace_the_dropped_turn(self, private_store) -> None:
+        # A side query in the same rollout records the same key with its own anchor.
+        client, server = _server([self._capped(("reasoning", "main")), self._capped(("reasoning", "side"))])
+        _post(client, [TASK])
+        _post(client, [{"role": "user", "content": "A side question."}])
+        _post(client, [{**TASK, "content": self._cli_nudged(TASK["content"], 1)}])
+        reasoning = [item["summary"][0]["text"] for item in _backend_input(server) if item.get("type") == "reasoning"]
+        assert reasoning == ["main"]
+
+    def test_two_nudged_messages_in_one_history_are_both_restored(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server(
+            [self._capped(("reasoning", "cut 0")), _turn(("tool", "call_1", "Bash", SERVED)), _text(""), _text("ok")]
+        )
+        date = {"role": "system", "content": "Today's date is 2026-10-23."}
+        task = {**TASK, "content": self._cli_nudged(TASK["content"], 1)}
+        inputs = []
+        for messages in (
+            [TASK, date],
+            [task, date],
+            [task, date, {"role": "assistant", "content": [first]}, _results([first])],
+            [
+                task,
+                date,
+                {"role": "assistant", "content": [first]},
+                {
+                    "role": "user",
+                    "content": self._cli_nudged(_results([first])["content"], 1, tool_echo.EMPTY_TURN_NUDGE),
+                },
+            ],
+        ):
+            _post(client, messages)
+            inputs.append(_comparable(server)["input"])
+        for earlier, later in zip(inputs, inputs[1:]):
+            assert later[: len(earlier)] == earlier
+        assert _kinds(_restore_log(private_store)) == {"output_limit_nudge": 1, "empty_turn_nudge": 1}
+
+    def test_a_mixed_stack_of_empty_and_output_limit_nudges_is_restored_in_order(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server(
+            [
+                _turn(("tool", "call_1", "Bash", SERVED)),
+                _turn(("reasoning", "empty")),
+                self._capped(("reasoning", "cut")),
+            ]
+        )
+        _post(client, [TASK])
+        before = [TASK, {"role": "assistant", "content": [first]}]
+        results = _results([first])
+        _post(client, [*before, results])
+        once = self._cli_nudged(results["content"], 1, tool_echo.EMPTY_TURN_NUDGE)
+        _post(client, [*before, {**results, "content": once}])
+        earlier = _comparable(server)["input"]
+        _post(client, [*before, {**results, "content": self._cli_nudged(once, 1)}])
+        assert _comparable(server)["input"][: len(earlier)] == earlier
+        reasoning = [item["summary"][0]["text"] for item in _backend_input(server) if item.get("type") == "reasoning"]
+        assert reasoning == ["empty", "cut"]
+        assert self._shape(server)[-4:] == [
+            ("reasoning", None),
+            ("user", tool_echo.EMPTY_TURN_NUDGE),
+            ("reasoning", None),
+            ("user", tool_echo.OUTPUT_LIMIT_NUDGE),
+        ]
+
+    def test_a_capped_turn_with_a_tool_call_is_not_recorded_as_droppable(self) -> None:
+        # The CLI runs a capped turn's tool calls and keeps the turn.
+        called = {"content": [_tool("call_1", "Bash", SERVED)], "stop_reason": "max_tokens"}
+        records = tool_echo.served_turns(called, {"index": 0, "content": "x"})
+        assert [record["id"] for record in records] == [tool_echo.turn_key(["call_1"])]
+
+    def test_blocks_appended_after_the_last_nudge_stay_with_its_turn(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), self._capped(("reasoning", "cut 0"))])
+        _post(client, [TASK])
+        _post(client, _history([first]))
+        reminder = {"type": "text", "text": "<system-reminder>Keep going.</system-reminder>"}
+        nudged = _history([first])
+        content = self._cli_nudged(nudged[-1]["content"], 1)
+        content[-1] = {**content[-1], "text": content[-1]["text"] + "\n"}
+        nudged[-1] = {**nudged[-1], "content": [*content, reminder]}
+        _post(client, nudged)
+        assert self._shape(server)[-2:] == [
+            ("reasoning", None),
+            ("user", tool_echo.OUTPUT_LIMIT_NUDGE + "\n" + reminder["text"]),
+        ]
+
+    def test_only_the_last_anchor_block_may_gain_the_cli_newline(self) -> None:
+        text = {"type": "text", "text": "a"}
+        grown = {"type": "text", "text": "a\n"}
+        assert tool_echo._grown_from([text], [grown, text])
+        assert tool_echo._grown_from([text, text], [text, grown])
+        assert not tool_echo._grown_from([text, text], [grown, text])
+        assert tool_echo._grown_from([{**text, "cache_control": {"type": "ephemeral"}}], [text])
+
     def test_a_nudged_message_that_no_longer_starts_with_its_anchor_passes_through(self, private_store) -> None:
         first = _tool("call_1", "Bash", SERVED)
         client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), self._capped(("reasoning", "cut 0"))])

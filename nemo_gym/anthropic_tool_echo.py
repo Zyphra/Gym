@@ -41,17 +41,20 @@ name the backend served; the echo of that turn is restored to it and logged as
 matches several tools are never renamed.
 
 Claude Code also drops a served turn that presents nothing (no tool call, no
-visible text; reasoning only) or that stopped at the output token limit, and appends
-a fixed nudge text block to the last user message instead (several such turns in a
-row stack several nudges there). Appending, it ends the block before with a newline,
-and turns a plain-string message into blocks. ``messages()`` records such turns too,
-with that user message as the client sent it then (its anchor), keyed by its index
-and block count. A user message ending in an exact nudge, with records at block
-counts that each end in a nudge, is rebuilt from them: the first anchor, the system
-messages that follow it, then each dropped turn followed by a new user message with
-the blocks appended for it, as the client sent them; the history the backend served.
-Any other layout passes through. The restore log classifies these as
-``empty_turn_nudge`` and ``output_limit_nudge``.
+visible text; reasoning only) or that stopped at the output token limit without a
+tool call, and appends a fixed nudge text block to the last user message instead
+(several such turns in a row stack several nudges there). Appending, it ends the
+block before with a newline, and turns a plain-string message into blocks.
+``messages()`` records such turns, in the rollout's own file only (the keys are not
+unique across conversations), with that user message as the client sent it then
+(its anchor), keyed by its index and block count. A user message holding a nudge,
+for which every chosen record (per block count, the newest whose anchor the message
+still begins with) leaves exactly one nudge among the blocks appended for its turn,
+is rebuilt from them: the first anchor, the system messages that follow it, then
+each dropped turn followed by a new user message with the blocks appended for it,
+as the client sent them; the history the backend served. Any other layout passes
+through. The restore log classifies these as ``empty_turn_nudge`` and
+``output_limit_nudge``.
 
 Anything else passes through: turns that match no served turn (a compaction
 summary, any other dropped or added turn, other ids, reordered or added blocks), and
@@ -457,6 +460,20 @@ class ServedToolInputStore:
                 found[record["id"]] = record
         return found
 
+    def scoped(self, rollout_id: Optional[str]) -> bool:
+        """Records of this rollout live in its own file: neither the shared per-process map nor another rollout."""
+        return rollout_id is not None and self.root is not None
+
+    def lookup_all(self, rollout_id: Optional[str], ids: set[str]) -> dict[str, list[dict[str, Any]]]:
+        """Every record of the rollout under each of ``ids``, oldest first (``lookup`` keeps the newest)."""
+        if not ids or not self.scoped(rollout_id):
+            return {}
+        found: dict[str, list[dict[str, Any]]] = {}
+        for record in self._read(self._path(rollout_id)):
+            if record.get("id") in ids:
+                found.setdefault(record["id"], []).append(record)
+        return found
+
     def log_restores(self, rollout_id: Optional[str], entries: list[dict[str, Any]]) -> None:
         """Append each restore entry once per rollout (a turn is echoed again on every later request)."""
         if not entries:
@@ -562,7 +579,8 @@ def served_turns(
         presents_nothing = not ids and not any(
             isinstance(block, Mapping) and block.get("type") == "text" and not _blank_text(block) for block in content
         )
-        if presents_nothing or anthropic_response.get("stop_reason") == "max_tokens":
+        # The CLI runs the tool calls of a turn cut at the output limit; only a turn without one is dropped.
+        if presents_nothing or (not ids and anthropic_response.get("stop_reason") == "max_tokens"):
             key = empty_turn_key(anchor["index"], len(_blocks(anchor["content"])))
             records.append({"id": key, "content": copy.deepcopy(content), "anchor": copy.deepcopy(anchor["content"])})
     return records
@@ -611,54 +629,61 @@ def restore_served_turns(
 
 
 def _grown_from(anchor: list, current: list) -> bool:
-    """``current`` begins with ``anchor`` as Claude Code keeps it after appending to the message: each
-    block unchanged apart from ``cache_control``, or a text block ended with one newline."""
+    """``current`` begins with ``anchor`` as Claude Code keeps it after appending to the message: every block
+    unchanged apart from ``cache_control``, except that the anchor's last block, if text, may end with one
+    more newline."""
     if len(current) < len(anchor):
         return False
-    for before, after in zip(anchor, current):
+    for position, (before, after) in enumerate(zip(anchor, current)):
         before, after = _client_view(before), _client_view(after)
         if before == after:
             continue
-        if not (isinstance(before, Mapping) and isinstance(after, Mapping) and before.get("type") == "text"):
-            return False
-        if after != {**before, "text": f"{before.get('text', '')}\n"}:
+        last_text = position == len(anchor) - 1 and isinstance(before, Mapping) and before.get("type") == "text"
+        if not (last_text and after == {**before, "text": f"{before.get('text', '')}\n"}):
             return False
     return True
 
 
+def _any_nudge_kind(block: Any) -> Optional[str]:
+    return _nudge_kind(block) or _stacked_nudge_kind(block)
+
+
 def _nudged_rebuild(
-    index: int, message: Mapping[str, Any], served: Mapping[str, dict[str, Any]]
+    index: int, message: Mapping[str, Any], served: Mapping[str, list[dict[str, Any]]]
 ) -> Optional[tuple[list[dict[str, Any]], list[tuple[int, dict[str, Any], str]]]]:
     """The served history for a nudged user message: its first anchor, then for each dropped turn the turn
     and a user message with the blocks appended for it; with (block count, record, nudge kind) per turn.
     None unless the records fit the message (see the module docstring)."""
     blocks = message["content"]
-    counts = [count for count in range(1, len(blocks)) if empty_turn_key(index, count) in served]
-    if not counts:
+    chosen = {}
+    for count in range(1, len(blocks)):
+        # Another conversation of the rollout can record the same key; its anchor does not fit this message.
+        fitting = [
+            record
+            for record in served.get(empty_turn_key(index, count), [])
+            if len(_blocks(record.get("anchor"))) == count and _grown_from(_blocks(record.get("anchor")), blocks)
+        ]
+        if fitting:
+            chosen[count] = fitting[-1]
+    if not chosen:
         return None
-    records = [served[empty_turn_key(index, count)] for count in counts]
+    counts = sorted(chosen)
     ends = [*counts[1:], len(blocks)]
     turns, kinds = [], []
-    for position, (count, end, record) in enumerate(zip(counts, ends, records)):
-        final = position == len(counts) - 1
-        last = blocks[end - 1]
-        kind = _nudge_kind(last) if final else (_nudge_kind(last) or _stacked_nudge_kind(last))
-        anchor = _blocks(record.get("anchor"))
-        if kind is None or len(anchor) != count or not _grown_from(anchor, blocks):
-            return None
+    for position, (count, end) in enumerate(zip(counts, ends)):
+        record = chosen[count]
         # The blocks appended for this turn, as the client sent them when they were last.
-        appended = blocks[count:] if final else _blocks(records[position + 1]["anchor"])[count:end]
-        # One dropped turn, one nudge: an earlier nudge in its blocks belongs to a turn with no record.
-        if len(appended) != end - count or any(
-            _nudge_kind(block) or _stacked_nudge_kind(block) for block in blocks[count : end - 1]
-        ):
+        appended = blocks[count:] if end == len(blocks) else _blocks(chosen[end]["anchor"])[count:end]
+        nudges = [kind for kind in map(_any_nudge_kind, appended) if kind]
+        # One dropped turn, one nudge: another nudge in its blocks belongs to a turn with no record.
+        if len(appended) != end - count or len(nudges) != 1:
             return None
         turns += [
             {"role": "assistant", "content": copy.deepcopy(record["content"])},
             {"role": "user", "content": copy.deepcopy(appended)},
         ]
-        kinds.append((count, record, kind))
-    return [{**message, "content": copy.deepcopy(records[0]["anchor"])}, *turns], kinds
+        kinds.append((count, record, nudges[0]))
+    return [{**message, "content": copy.deepcopy(chosen[counts[0]]["anchor"])}, *turns], kinds
 
 
 def _restore_empty_turns(
@@ -673,12 +698,12 @@ def _restore_empty_turns(
         and message.get("role") == "user"
         and isinstance(message.get("content"), list)
         and len(message["content"]) > 1
-        and _nudge_kind(message["content"][-1])
+        and any(map(_any_nudge_kind, message["content"][1:]))
     ]
-    if not nudged:
+    if not nudged or not store.scoped(rollout_id):
         return body, []
     try:
-        served = store.lookup(
+        served = store.lookup_all(
             rollout_id,
             {empty_turn_key(index, count) for index in nudged for count in range(1, len(messages[index]["content"]))},
         )

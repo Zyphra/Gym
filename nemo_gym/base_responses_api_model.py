@@ -409,8 +409,9 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
                 logger.debug("dropped %d Claude Code identity system block(s)", dropped)
         rollout_id = current_rollout_id()
         served_turns = store_for(self.config.name, self.config.host, self.config.port)
-        # Empty served turns are recorded with the client's own last user message (before any restore).
-        anchor = request_anchor(body.get("messages"))
+        # Empty served turns are recorded with the client's own last user message (before any restore), and
+        # only in the rollout's own file: their keys are not unique across conversations.
+        anchor = request_anchor(body.get("messages")) if served_turns.scoped(rollout_id) else None
         body, _ = restore_served_turns(body, served_turns, rollout_id)
         params = _ANTHROPIC_CONVERTER.anthropic_request_to_responses(body)
         response = await self._invoke_responses(request, params)
