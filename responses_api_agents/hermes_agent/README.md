@@ -40,7 +40,7 @@ Runs [hermes-agent](https://github.com/NousResearch/hermes-agent) in a nemo gym 
 
 `hermes-agent` is pinned in `requirements.txt` to a fork branch with patches for token id tracking, chat template, and sampling parameters needed for training.
 
-For agent integrations like this, the agent must point at Gym's model server, it must include prompt and generation token id in requests for Nemo RL and other trainer integration on policy token id correction, it must not override sampling parameters like temperature and top p, and it must not do non-monotonic things like dropping past reasoning content or context compaction.
+For agent integrations like this, the agent must point at Gym's model server, it must include prompt and generation token id in requests for Nemo RL and other trainer integration on policy token id correction, it must not override sampling parameters like temperature and top p, and it must preserve sampled reasoning in retained history. When compression is enabled, the native per-instance managed summary callback uses the same policy client, model and rollout URL as main turns; auxiliary provider auto-detection is not used. The pinned Hermes runtime must expose that callback. Summary requests retain the offered tool schema, forbid tool execution and fail on empty, truncated or tool-calling responses.
 
 ## Resources server compatibility
 

@@ -289,6 +289,36 @@ class HermesAgentVerifyResponse(BaseVerifyResponse):
     )
 
 
+def _bind_policy_summary(agent) -> None:
+    """Use Hermes' existing summary callback with this run's policy client.
+
+    A process-global auxiliary provider cannot carry concurrent rollout URLs.
+    The admitted native compressor exposes this per-instance callback; older
+    runtimes must be replaced rather than silently making untracked summaries.
+    """
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None or not hasattr(compressor, "managed_summary_callback"):
+        raise RuntimeError("Hermes compression requires the native managed summary callback")
+
+    def summary(messages, max_tokens):
+        kwargs = agent._build_api_kwargs(messages)
+        kwargs.pop("max_completion_tokens", None)
+        kwargs.update(model=agent.model, max_tokens=max_tokens, tool_choice="none")
+        response = agent.client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+        content = choice.message.content
+        if (
+            choice.finish_reason != "stop"
+            or choice.message.tool_calls
+            or not isinstance(content, str)
+            or not content.strip()
+        ):
+            raise RuntimeError("Hermes policy summary was empty, truncated, or emitted tool calls")
+        return content
+
+    compressor.managed_summary_callback = summary
+
+
 class HermesAgent(SimpleResponsesAPIAgent):
     config: HermesAgentConfig
     sem: Semaphore = None
@@ -419,6 +449,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
             return kw
 
         agent._build_api_kwargs = _patched_build_api_kwargs
+        if self.config.compression_enabled:
+            _bind_policy_summary(agent)
         _execute_every_tool_call(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         observer = None
@@ -526,7 +558,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
         was_interrupted = bool(result.get("interrupted")) or interrupted_by_dispatch
 
         harness_error = result.get("error")
-        context_exhausted = isinstance(harness_error, str) and harness_error.startswith("Context length exceeded") and harness_error.endswith("Cannot compress further.")
+        context_exhausted = (
+            isinstance(harness_error, str)
+            and harness_error.startswith("Context length exceeded")
+            and harness_error.endswith("Cannot compress further.")
+        )
         agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not context_exhausted
         metadata: dict[str, str] = {
             "interrupted": "true" if was_interrupted else "false",
@@ -558,7 +594,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             model=model_name,
             object="response",
             output=output_items,
-            status="incomplete" if context_exhausted else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
+            status="incomplete"
+            if context_exhausted
+            else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
             error=response_error,
             metadata=metadata,
             tool_choice=body.tool_choice,
