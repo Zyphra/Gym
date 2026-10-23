@@ -191,6 +191,7 @@ class TestSigtermHandler:
         class _FailingInterruptedAIAgent:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
+                self._execute_tool_calls = lambda *_args, **_kwargs: None
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 hermes.interrupted_agents.add(id(self))
@@ -354,6 +355,7 @@ class TestRolloutCorrelation:
             def __init__(self, **kwargs) -> None:
                 seen["base_url"] = kwargs.get("base_url")
                 self._build_api_kwargs = lambda _messages: {}
+                self._execute_tool_calls = lambda *_args, **_kwargs: None
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
@@ -397,10 +399,15 @@ class TestMaxTokens:
             def __init__(self, **kwargs) -> None:
                 seen["max_tokens"] = kwargs.get("max_tokens")
                 self._build_api_kwargs = lambda _messages: {}
+                self._execute_tool_calls = lambda *_args, **_kwargs: None
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
-                return retained_result if retained_result is not None else {"messages": [{"role": "assistant", "content": "ok"}]}
+                return (
+                    retained_result
+                    if retained_result is not None
+                    else {"messages": [{"role": "assistant", "content": "ok"}]}
+                )
 
         monkeypatch.setattr("run_agent.AIAgent", _StubAIAgent)
         return agent, seen
@@ -411,10 +418,16 @@ class TestMaxTokens:
 
         raw = json.loads((Path(__file__).parent / "fixtures/context-stop.json").read_text())
         message = raw["error"]["message"] if context_stop else "API request failed"
-        agent, _ = self._agent_and_seen(monkeypatch, retained_result={
-            "error": message, "completed": False, "partial": True, "api_calls": int(raw["metadata"]["turns"]),
-            "messages": [{"role": "assistant", "content": "retained partial output"}],
-        })
+        agent, _ = self._agent_and_seen(
+            monkeypatch,
+            retained_result={
+                "error": message,
+                "completed": False,
+                "partial": True,
+                "api_calls": int(raw["metadata"]["turns"]),
+                "messages": [{"role": "assistant", "content": "retained partial output"}],
+            },
+        )
         response = asyncio.run(agent._create_response(NeMoGymResponseCreateParamsNonStreaming(input="continue")))
         assert response.metadata["hermes_error"] == message
         assert response.metadata["turns"] == raw["metadata"]["turns"]
@@ -459,6 +472,7 @@ class TestObservability:
         class _StubAIAgent:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
+                self._execute_tool_calls = lambda *_args, **_kwargs: None
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 return {
@@ -551,6 +565,7 @@ class TestObservability:
         class _FailingAIAgent:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
+                self._execute_tool_calls = lambda *_args, **_kwargs: None
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 raise ValueError("agent failed")

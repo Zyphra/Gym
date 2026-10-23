@@ -36,6 +36,24 @@ Example training reward for small multi environment test is shown [here](https:/
 
 Runs [hermes-agent](https://github.com/NousResearch/hermes-agent) in a nemo gym agent server via the `run_agent.AIAgent` entrypoint, which matches the hermes-agent CLI and user experience. Can be used for benchmarks with hermes agent, or training in the harness.
 
+Every newly produced tool result is limited to **20,000 characters, including a
+truncation note**. Smaller results remain unchanged. This applies to every tool
+and both sequential and concurrent execution, for all Hermes lanes. It bounds
+each result, not the combined observations from a multi-tool turn or the total
+context. Earlier history, assistant reasoning, tool IDs, execution and rewards
+are unchanged. The pinned Hermes runtime's `file_read_max_chars` setting covers
+file reads only; its larger general result ceiling is hardcoded, so Gym applies
+this limit at the common tool-dispatch boundary.
+
+Focused CPU controls exercise real Hermes search execution and preserve small
+results, previous history and thinking. They do not establish a model pass-rate
+gain or qualify a changed source under an earlier end-to-end run. Run the focused
+controls with the declared Hermes runtime and selected Gym source:
+
+```bash
+python -m unittest responses_api_agents.hermes_agent.tests.test_tool_results -v
+```
+
 ## Setup
 
 `hermes-agent` is pinned in `requirements.txt` to a fork branch with patches for token id tracking, chat template, and sampling parameters needed for training.
