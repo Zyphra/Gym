@@ -158,7 +158,12 @@ class TestClientIdentityDrop:
     def _post(self, client, system) -> None:
         resp = client.post(
             "/v1/messages",
-            json={"model": "claude-x", "max_tokens": 8, "system": system, "messages": [{"role": "user", "content": "hi"}]},
+            json={
+                "model": "claude-x",
+                "max_tokens": 8,
+                "system": system,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
         )
         assert resp.status_code == 200
 
@@ -175,14 +180,19 @@ class TestClientIdentityDrop:
             {"type": "text", "text": self.IDENTITY + " Extra."},
         ]
         self._post(client, system)
-        assert server.last_params.instructions == "You are ZAYA, a coding agent developed by Zyphra.\n" + self.IDENTITY + " Extra."
+        assert (
+            server.last_params.instructions
+            == "You are ZAYA, a coding agent developed by Zyphra.\n" + self.IDENTITY + " Extra."
+        )
 
     def test_every_cli_identity_variant(self) -> None:
         from nemo_gym.base_responses_api_model import CLAUDE_CODE_IDENTITY_BLOCKS, drop_client_identity
 
         assert len(CLAUDE_CODE_IDENTITY_BLOCKS) == 3
         for text in CLAUDE_CODE_IDENTITY_BLOCKS:
-            body, dropped = drop_client_identity({"system": [{"type": "text", "text": text}, {"type": "text", "text": "task"}]})
+            body, dropped = drop_client_identity(
+                {"system": [{"type": "text", "text": text}, {"type": "text", "text": "task"}]}
+            )
             assert dropped == 1 and body["system"] == [{"type": "text", "text": "task"}]
             assert drop_client_identity({"system": text}) == ({"system": ""}, 1)
         unchanged = {"system": [{"type": "text", "text": "task"}]}

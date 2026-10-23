@@ -658,7 +658,7 @@ class TestEmptyTurnNudge:
         assert _comparable(server)["input"] == _comparable(exact)["input"]
         assert self._shape(server)[-1] == ("user", tool_echo.EMPTY_TURN_NUDGE)
         (entry,) = _restore_log(private_store)
-        assert entry["counts"] == {"empty_turn_nudge": 1} and entry["key"] == "empty:3#empty_turn_nudge"
+        assert entry["counts"] == {"empty_turn_nudge": 1} and entry["key"] == "empty:2@1#empty_turn_nudge"
 
     def test_later_requests_keep_the_restored_turn_and_restore_tool_turns_after_it(self, private_store) -> None:
         first, second = _tool("call_1", "Bash", SERVED), _tool("call_2", "Bash", SERVED)
@@ -751,9 +751,9 @@ class TestEmptyTurnNudge:
         ]
         keys = sorted(entry["key"] for entry in _restore_log(private_store))
         assert keys == [
-            "empty:3#output_limit_nudge",
-            "empty:3+1#output_limit_nudge",
-            "empty:3+2#output_limit_nudge",
+            "empty:2@1#output_limit_nudge",
+            "empty:2@2#output_limit_nudge",
+            "empty:2@3#output_limit_nudge",
         ]
 
     def test_stacked_nudges_with_an_unrecorded_turn_pass_through(self, private_store) -> None:
@@ -769,23 +769,88 @@ class TestEmptyTurnNudge:
         assert not any(item.get("type") == "reasoning" for item in _backend_input(server))
         assert _restore_log(private_store) == []
 
-    def test_turns_are_keyed_by_request_length_and_stacked_nudges(self) -> None:
-        nudge = {"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE}
-        assert tool_echo.empty_turn_key(3) == tool_echo.empty_turn_key(3, 0) == "empty:3"
-        assert tool_echo.empty_turn_key(3, 2) == "empty:3+2"
-        assert (
-            tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, nudge, nudge]}) == 2
-        )
-        assert tool_echo.trailing_nudges({"role": "user", "content": [nudge, {"type": "text", "text": "x"}]}) == 0
-        assert tool_echo.trailing_nudges({"role": "assistant", "content": [nudge]}) == 0
-        stacked = {"type": "text", "text": tool_echo.EMPTY_TURN_NUDGE + "\n"}
-        assert (
-            tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, stacked, nudge]})
-            == 2
-        )
-        # Only an earlier, stacked nudge may end with the newline.
-        assert tool_echo.trailing_nudges({"role": "user", "content": [{"type": "text", "text": "x"}, stacked]}) == 0
-        assert tool_echo.served_turns({"content": [], "stop_reason": "max_tokens"}, 3, 2)[0]["id"] == "empty:3+2"
+    def test_turns_are_keyed_by_the_last_user_message_and_its_block_count(self) -> None:
+        assert tool_echo.empty_turn_key(2, 3) == "empty:2@3"
+        messages = [TASK, {"role": "system", "content": "today"}]
+        assert tool_echo.request_anchor(messages) == {"index": 0, "content": TASK["content"]}
+        assert tool_echo.request_anchor([{"role": "assistant", "content": "x"}]) is None
+        (record,) = tool_echo.served_turns({"content": [], "stop_reason": "max_tokens"}, {"index": 0, "content": "x"})
+        assert record["id"] == "empty:0@1" and record["anchor"] == "x"
+
+    @staticmethod
+    def _cli_nudged(content, nudges: int, kind: str = tool_echo.OUTPUT_LIMIT_NUDGE) -> list:
+        """A user message after the CLI appended ``nudges`` nudges: it ends the block before each with a newline."""
+        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else copy.deepcopy(content)
+        for _ in range(nudges):
+            if blocks[-1].get("type") == "text":
+                blocks[-1] = {key: value for key, value in blocks[-1].items() if key != "cache_control"}
+                blocks[-1]["text"] += "\n"
+            blocks.append({"type": "text", "text": kind, "cache_control": {"type": "ephemeral"}})
+        return blocks
+
+    def _stack(self, client, server, before: list, user: dict, after: list, nudges: int) -> list:
+        """Post the request, then the CLI's requests after ``nudges`` dropped turns; the backend input of each."""
+        inputs = []
+        for stacked in range(nudges + 1):
+            content = user["content"] if not stacked else self._cli_nudged(user["content"], stacked)
+            _post(client, [*before, {**user, "content": content}, *after])
+            inputs.append(_comparable(server)["input"])
+        return inputs
+
+    def test_a_first_turn_prompt_with_the_date_after_it_is_restored_as_served(self, private_store) -> None:
+        # The CLI's first request: the task as a plain string, then its date as a system message. Each nudge
+        # goes into the task message, which turns into blocks with a newline closing the one before.
+        capped = [self._capped(("reasoning", f"cut {index}")) for index in range(2)]
+        client, server = _server([*capped, _text("ok")])
+        date = {"role": "system", "content": [{"type": "text", "text": "Today's date is 2026-10-23."}]}
+        inputs = self._stack(client, server, [], TASK, [date], 2)
+        for earlier, later in zip(inputs, inputs[1:]):
+            assert later[: len(earlier)] == earlier
+        assert self._shape(server) == [
+            ("user", TASK["content"]),
+            ("system", "Today's date is 2026-10-23."),
+            *[("reasoning", None), ("user", tool_echo.OUTPUT_LIMIT_NUDGE)] * 2,
+        ]
+        assert _kinds(_restore_log(private_store)) == {"output_limit_nudge": 2}
+
+    def test_a_text_block_after_a_tool_result_is_restored_without_the_cli_newline(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), self._capped(("reasoning", "cut 0"))])
+        _post(client, [TASK])
+        reminder = {"type": "text", "text": "<system-reminder>Keep going.</system-reminder>"}
+        results = _results([first])
+        user = {**results, "content": [*results["content"], reminder]}
+        inputs = self._stack(client, server, [TASK, {"role": "assistant", "content": [first]}], user, [], 1)
+        assert inputs[1][: len(inputs[0])] == inputs[0]
+        assert self._shape(server)[-2:] == [("reasoning", None), ("user", tool_echo.OUTPUT_LIMIT_NUDGE)]
+
+    def test_a_reminder_between_stacked_nudges_stays_with_its_turn(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        capped = [self._capped(("reasoning", f"cut {index}")) for index in range(2)]
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), *capped, _text("ok")])
+        _post(client, [TASK])
+        before = [TASK, {"role": "assistant", "content": [first]}]
+        results = _results([first])
+        inputs = self._stack(client, server, before, results, [], 1)
+        # The CLI appends a reminder and then the second nudge to the same message.
+        reminder = {"type": "text", "text": "<system-reminder>Keep going.</system-reminder>"}
+        content = self._cli_nudged([*self._cli_nudged(results["content"], 1), reminder], 1)
+        _post(client, [*before, {**results, "content": content}])
+        assert _comparable(server)["input"][: len(inputs[-1])] == inputs[-1]
+        reasoning = [item["summary"][0]["text"] for item in _backend_input(server) if item.get("type") == "reasoning"]
+        assert reasoning == ["cut 0", "cut 1"]
+        assert self._shape(server)[-1] == ("user", reminder["text"] + "\n" + tool_echo.OUTPUT_LIMIT_NUDGE)
+
+    def test_a_nudged_message_that_no_longer_starts_with_its_anchor_passes_through(self, private_store) -> None:
+        first = _tool("call_1", "Bash", SERVED)
+        client, server = _server([_turn(("tool", "call_1", "Bash", SERVED)), self._capped(("reasoning", "cut 0"))])
+        _post(client, [TASK])
+        _post(client, _history([first]))
+        nudged = _history([first])
+        nudged[-1] = {**nudged[-1], "content": self._cli_nudged(_results([first], content="changed")["content"], 1)}
+        _post(client, nudged)
+        assert not any(item.get("type") == "reasoning" for item in _backend_input(server))
+        assert _restore_log(private_store) == []
 
     def test_a_length_capped_turn_dropped_for_the_output_limit_nudge_is_restored(self, private_store) -> None:
         first = _tool("call_1", "Bash", SERVED)
@@ -793,7 +858,7 @@ class TestEmptyTurnNudge:
         capped = {"content": [{"type": "text", "text": "partial answer cut at the"}], "stop_reason": "max_tokens"}
         store = tool_echo.store_for("policy_model", "127.0.0.1", 8099)
         _post(client, [TASK])
-        tool_echo.record_served_turn(capped, store, "roll-1", request_length=3)
+        tool_echo.record_served_turn(capped, store, "roll-1", anchor=tool_echo.request_anchor(_history([first])))
         nudged = _history([first])
         nudged[-1] = {
             **nudged[-1],
@@ -808,17 +873,21 @@ class TestEmptyTurnNudge:
         assert entry["counts"] == {"output_limit_nudge": 1}
         # A turn that was neither empty nor length-capped is never keyed by request length.
         assert (
-            tool_echo.served_turns({"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"}, 3) == []
+            tool_echo.served_turns(
+                {"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"}, {"index": 2, "content": "x"}
+            )
+            == []
         )
 
     def test_served_turn_keys(self) -> None:
         empty = {"content": [{"type": "text", "text": ""}]}
+        anchor = {"index": 7, "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
         assert tool_echo.served_turn(empty) is None
-        assert tool_echo.served_turn(empty, 7)["id"] == "empty:7"
-        assert tool_echo.served_turn({"content": [{"type": "thinking", "thinking": "x"}]}, 7)["id"] == "empty:7"
-        assert tool_echo.served_turn({"content": [{"type": "text", "text": "hi"}]}, 7) is None
+        assert tool_echo.served_turn(empty, anchor)["id"] == "empty:7@2"
+        assert tool_echo.served_turn({"content": [{"type": "thinking", "thinking": "x"}]}, anchor)["id"] == "empty:7@2"
+        assert tool_echo.served_turn({"content": [{"type": "text", "text": "hi"}]}, anchor) is None
         called = {"content": [{"type": "tool_use", "id": "call_1", "name": "Bash", "input": {}}]}
-        assert tool_echo.served_turn(called, 7)["id"] == tool_echo.turn_key(["call_1"])
+        assert tool_echo.served_turn(called, anchor)["id"] == tool_echo.turn_key(["call_1"])
 
 
 class TestDifferenceKinds:
