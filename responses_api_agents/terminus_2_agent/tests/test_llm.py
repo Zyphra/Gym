@@ -475,6 +475,19 @@ async def test_terminal_policy_stop_does_not_reenter_native_compaction(tmp_path)
 
     async def complete(request):
         requests.append(await request.json())
+        if len(requests) == 1:
+            # A normal model stop may omit usage. It still contains policy output.
+            return web.json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "summary"},
+                            "finish_reason": "stop",
+                            "stop_reason": "eos",
+                        }
+                    ],
+                }
+            )
         return web.json_response(
             {
                 "id": "terminal-session",
@@ -500,12 +513,13 @@ async def test_terminal_policy_stop_does_not_reenter_native_compaction(tmp_path)
     llm = _make_llm(api_base=f"http://127.0.0.1:{port}/v1")
     agent = StandaloneTerminus2(logs_dir=tmp_path, model_name="test-model", llm=llm, enable_summarize=True)
     try:
+        assert (await llm.call("summarize")).content == "summary"
         chat = Chat(llm)
         with pytest.raises(EpisodeTerminatedError, match="context_exhausted"):
             await agent._query_llm(chat, "continue after compaction", (None, None, None))
         with pytest.raises(EpisodeTerminatedError):
             await llm.call("summarize again")
-        assert len(requests) == 1
+        assert len(requests) == 2
         assert llm.context_length_exceeded
         assert llm.model_transport_error is None
     finally:

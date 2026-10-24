@@ -149,7 +149,7 @@ class NemoGymLLM(BaseLLM):
         if (
             isinstance(choice, dict)
             and choice.get("stop_reason")
-            and not (response_dict.get("usage") or {}).get("completion_tokens")
+            and (response_dict.get("usage") or {}).get("completion_tokens") == 0
         ):
             self.terminal_stop_reason = str(choice["stop_reason"])
             self.context_length_exceeded = self.terminal_stop_reason == "context_exhausted"
