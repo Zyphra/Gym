@@ -2,7 +2,8 @@
 
 Runs any Gym agent inside a Terminal Bench task container and evaluates the result
 by running the task's `tests/test.sh` in the same container. Works with
-`hermes_agent`, `claude_code_agent`, `terminus_2_agent`, or any other compatible Gym agent.
+`hermes_agent`, `claude_code_agent`, `terminus_2_agent`, `pi_agent` (`configs/anyterminal_pi.yaml`),
+or any other compatible Gym agent.
 
 Unlike `anyswe_agent` (which runs agent and eval in two concurrent containers),
 anyterminal runs everything sequentially in one container: agent finishes, then
@@ -93,6 +94,10 @@ agent_kwargs:
   terminal_backend: local
 ```
 
+Agents whose configuration declares `working_directory` (Pi) run their tools in
+the task's working directory unless `agent_kwargs` supplies one, as under
+`anyswe_agent`.
+
 Agent dependencies are installed once at startup into a portable Python prefix
 mounted read-only inside the task container at `/agent_deps_mount`. To support a
 new agent, add `responses_api_agents/<agent_dir>/scripts/<agent_dir>_deps.sh` (see
@@ -117,5 +122,6 @@ either:
 | `tb_agent_timeout` | `1800` | Seconds before the agent is killed |
 | `agent_timeout_is_failure` | `false` | Opt in to counting agent timeouts as unmasked reward-zero failures; independent infrastructure remains masked. |
 | `tb_eval_timeout` | `300` | Seconds for `test.sh` to complete |
+| `verifier_environment` | `{}` | Values for the names a task's `[verifier.env]` references. `test.sh` receives each declared variable with Harbor's `${NAME}` / `${NAME:-default}` templates resolved against these values, never the worker environment; an unsupplied reference without a default fails the row before the agent runs. |
 | `apptainer_memory_limit_mb` | `32768` | Per-container memory cap via `ulimit -v` |
 | `concurrency` | `256` | Max concurrent tasks dispatched to Ray |

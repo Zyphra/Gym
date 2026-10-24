@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1715,3 +1716,120 @@ def test_apptainer_preserves_existing_mount_exclusions(tmp_path, monkeypatch, ar
     actual = provider._create_config.extra_start_args
     assert any("bind-paths,home,tmp" in value for value in actual)
     assert args in (["--no-mount", "bind-paths"], ["--no-mount=bind-paths"])
+
+
+_JUDGE_TASK_TOML = """
+[verifier]
+timeout_sec = 900.0
+
+[verifier.env]
+EVAL_API_KEY = "${OPENAI_API_KEY}"
+EVAL_BASE_URL = "${OPENAI_API_BASE}"
+EVAL_MODEL = "${EVAL_MODEL:-anthropic/claude-opus-4-5-20251101}"
+LITERAL = "unchanged"
+"""
+
+
+def _harbor_task(tmp_path: Path, toml: str = _JUDGE_TASK_TOML) -> Path:
+    (tmp_path / "task.toml").write_text(toml)
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "test.sh").write_text("exit 0\n")
+    return tmp_path
+
+
+class TestHarborVerifierEnvironment:
+    def test_task_declares_names_and_caller_supplies_values(self, tmp_path: Path) -> None:
+        values = {"OPENAI_API_KEY": "judge-key", "OPENAI_API_BASE": "http://judge/v1", "EVAL_MODEL": "judge-model"}
+        assert app.task_verifier_environment(_harbor_task(tmp_path), values) == {
+            "EVAL_API_KEY": "judge-key",
+            "EVAL_BASE_URL": "http://judge/v1",
+            "EVAL_MODEL": "judge-model",
+            "LITERAL": "unchanged",
+        }
+
+    def test_default_applies_only_to_unsupplied_or_empty_values(self, tmp_path: Path) -> None:
+        values = {"OPENAI_API_KEY": "k", "OPENAI_API_BASE": "http://judge/v1", "EVAL_MODEL": ""}
+        resolved = app.task_verifier_environment(_harbor_task(tmp_path), values)
+        assert resolved["EVAL_MODEL"] == "anthropic/claude-opus-4-5-20251101"
+
+    def test_unsupplied_reference_without_default_fails(self, tmp_path: Path, monkeypatch) -> None:
+        # The worker's ambient environment never satisfies a task reference.
+        monkeypatch.setenv("OPENAI_API_KEY", "ambient")
+        with pytest.raises(ValueError, match="EVAL_API_KEY references OPENAI_API_KEY"):
+            app.task_verifier_environment(_harbor_task(tmp_path), {"OPENAI_API_BASE": "http://judge/v1"})
+
+    def test_tasks_without_verifier_environment_are_unchanged(self, tmp_path: Path) -> None:
+        assert app.task_verifier_environment(_harbor_task(tmp_path, "[verifier]\ntimeout_sec = 1\n"), {}) == {}
+        assert app.task_verifier_environment(tmp_path / "absent", {"A": "b"}) == {}
+
+    @pytest.mark.asyncio
+    async def test_verifier_receives_resolved_environment(self, tmp_path: Path) -> None:
+        (tmp_path / "task").mkdir()
+        task = _harbor_task(tmp_path / "task")
+        values = {"OPENAI_API_KEY": "judge-key", "OPENAI_API_BASE": "http://judge/v1", "EVAL_MODEL": "judge-model"}
+        cfg = _make_instance_config(
+            tmp_path,
+            verifier_environment=values,
+            problem_info={"task_name": "t", "task_dir": str(task), "docker_image": "ubuntu:22.04",
+                          "cpus": 1, "memory_mb": 1024, "pids": 64, "gpus": 0},
+        )
+        sandbox = AsyncMock()
+        sandbox.exec.return_value = SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+        await RunTerminalAgent(config=cfg)._run_eval(sandbox, cfg)
+        (grading,) = sandbox.exec.await_args_list
+        assert grading.kwargs["env"] == {
+            "EVAL_API_KEY": "judge-key", "EVAL_BASE_URL": "http://judge/v1",
+            "EVAL_MODEL": "judge-model", "LITERAL": "unchanged",
+        }
+        assert "judge-key" not in _safe_config_json(cfg)
+
+    @pytest.mark.asyncio
+    async def test_tasks_without_declarations_keep_the_default_environment(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, verifier_environment={"OPENAI_API_KEY": "unused"})
+        sandbox = AsyncMock()
+        sandbox.exec.return_value = SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+        await RunTerminalAgent(config=cfg)._run_eval(sandbox, cfg)
+        (grading,) = sandbox.exec.await_args_list
+        assert grading.kwargs["env"] is None
+
+
+class TestTaskWorkingDirectory:
+    def test_agent_env_carries_task_workdir(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        cfg.problem_info["workdir"] = "/workspace"
+        assert RunTerminalAgent(config=cfg)._agent_env(cfg)["NGTB_TASK_WORKDIR"] == "/workspace"
+
+    def test_runner_defaults_declared_working_directory_to_the_task(self, tmp_path: Path, monkeypatch) -> None:
+        from responses_api_agents.pi_agent.app import PiAgentConfig
+
+        rendered = _RUNNER_TEMPLATE.format(
+            agent_module="responses_api_agents.pi_agent.app", agent_class="PiAgent",
+            agent_cfg_class="PiAgentConfig", agent_class_lower="piagent",
+        )
+        prefix = rendered.split("\nagent = ")[0]
+        monkeypatch.setenv("NGTB_MODEL_NAME", "m")
+        monkeypatch.setenv("NGTB_TASK_WORKDIR", "/workspace")
+        namespace: dict = {}
+        with patch.object(Path, "read_text", return_value="instruction"):
+            exec(compile(prefix, "<runner>", "exec"), namespace)
+        assert isinstance(namespace["config"], PiAgentConfig)
+        assert namespace["config"].working_directory == "/workspace"
+        monkeypatch.setenv("NGTB_AGENT_KWARGS", json.dumps({"working_directory": "/explicit"}))
+        namespace = {}
+        with patch.object(Path, "read_text", return_value="instruction"):
+            exec(compile(prefix, "<runner>", "exec"), namespace)
+        assert namespace["config"].working_directory == "/explicit"
+
+
+def test_pi_terminal_config_selects_the_pi_agent() -> None:
+    import yaml
+
+    config = yaml.safe_load((Path(__file__).parents[1] / "configs" / "anyterminal_pi.yaml").read_text())
+    agent = config["anyterminal_pi"]["responses_api_agents"]["anyterminal_agent"]
+    from responses_api_agents.pi_agent.app import PiAgentConfig
+
+    assert (agent["agent_server_module"], agent["agent_server_class"], agent["agent_config_class"]) == (
+        "responses_api_agents.pi_agent.app", "PiAgent", "PiAgentConfig",
+    )
+    assert "working_directory" in PiAgentConfig.model_fields
+    assert "working_directory" not in agent["agent_kwargs"]
