@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -28,7 +29,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from subprocess import Popen
 from traceback import format_exc
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -98,6 +99,40 @@ def _read_task_meta(task_dir: Path) -> dict:
                 if len(parts) > 1:
                     result["workdir"] = parts[1]
     return result
+
+
+_HARBOR_TEMPLATE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def task_verifier_environment(task_dir: Path, values: Mapping[str, str]) -> Dict[str, str]:
+    """Resolve a Harbor task's ``[verifier.env]`` against caller-supplied values.
+
+    The task declares which variables its verifier receives, as Harbor
+    ``${NAME}`` / ``${NAME:-default}`` templates; the caller supplies only the
+    values, never the worker's ambient environment. A referenced name the
+    caller did not supply and that has no default is an infrastructure error.
+    """
+    toml_path = task_dir / "task.toml"
+    if not toml_path.is_file():
+        return {}
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib  # type: ignore[no-redef]
+    declared = (tomllib.loads(toml_path.read_text()).get("verifier") or {}).get("env") or {}
+    resolved: Dict[str, str] = {}
+    for name, template in declared.items():
+
+        def substitute(match: "re.Match[str]") -> str:
+            key, default = match.group(1), match.group(2)
+            if values.get(key):
+                return values[key]
+            if default is not None:
+                return default
+            raise ValueError(f"task verifier variable {name} references {key}, which the caller did not supply")
+
+        resolved[name] = _HARBOR_TEMPLATE.sub(substitute, str(template))
+    return resolved
 
 
 def _instruction_from_input(body: NeMoGymResponseCreateParamsNonStreaming) -> str:
@@ -278,6 +313,8 @@ INSTRUCTION  = Path("/trajectories_mount/instruction.txt").read_text()
 AGENT_KWARGS = json.loads(os.environ.get("NGTB_AGENT_KWARGS", "{{}}"))
 SAMPLING     = json.loads(os.environ.get("NGTB_SAMPLING", "{{}}"))
 
+TASK_WORKDIR = os.environ.get("NGTB_TASK_WORKDIR") or str(Path.cwd())
+
 openclaw_defaults = AGENT_KWARGS.get("openclaw_config", {{}}).get("agents", {{}}).get("defaults", {{}})
 if openclaw_defaults.get("workspace") == ".":
     openclaw_defaults["workspace"] = str(Path.cwd())
@@ -291,6 +328,9 @@ _mock_client = ServerClient.model_construct(global_config_dict={{}})
 _mock_client._build_server_base_url = lambda cfg: MODEL_URL
 
 _cfg_sampling = {{k: v for k, v in SAMPLING.items() if k in {agent_cfg_class}.model_fields}}
+# Agents that declare a working directory run their tools in the task's, as under anyswe_agent.
+if "working_directory" in {agent_cfg_class}.model_fields:
+    AGENT_KWARGS.setdefault("working_directory", TASK_WORKDIR)
 
 _model_server = ModelServerRef(name="policy_model", type="responses_api_models") if MODEL_URL else None
 config = {agent_cfg_class}(
@@ -412,6 +452,8 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     apptainer_shared_pid_namespace: bool = False
     task_network: Optional[TaskNetwork] = None
     agent_environment: Dict[str, str] = Field(default_factory=dict)
+    # Values for the names a task's [verifier.env] references (see task_verifier_environment).
+    verifier_environment: Dict[str, str] = Field(default_factory=dict)
 
     @field_validator("task_network", mode="before")
     @classmethod
@@ -773,6 +815,8 @@ class RunTerminalAgent(BaseModel):
         }
         if cfg.model_server_url:
             env["NGTB_MODEL_URL"] = cfg.model_server_url
+        if cfg.problem_info.get("workdir"):
+            env["NGTB_TASK_WORKDIR"] = str(cfg.problem_info["workdir"])
         env.update(cfg.agent_environment)
         return env
 
@@ -920,6 +964,9 @@ class RunTerminalAgent(BaseModel):
         """Run test.sh: elapsed, timed out or sandbox error, and the verifier's return code and error type."""
         t0 = time.time()
         verifier_env = await self._prepare_verifier_runtime(sandbox, cfg)
+        task_env = task_verifier_environment(Path(cfg.problem_info["task_dir"]), cfg.verifier_environment)
+        if task_env:
+            verifier_env = {**task_env, **(verifier_env or {})}
         test_cmd = (
             ("readlink /proc/self/ns/net > /logs/verifier/network-namespace.txt && "
              if cfg.task_network is not None else "")
@@ -1277,6 +1324,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
             required_meta.append("storage_mb")
         if not all(k in problem_info for k in required_meta):
             problem_info.update({k: v for k, v in _read_task_meta(task_dir).items() if k not in problem_info})
+        task_verifier_environment(task_dir, self.config.verifier_environment)
 
         instance_dir = f"{task_name}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
         persistent_dir = self._server.base_results_dir / instance_dir
