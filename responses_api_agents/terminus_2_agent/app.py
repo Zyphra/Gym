@@ -58,7 +58,7 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.server_utils import get_response_json, raise_for_status
 from responses_api_agents.terminus_2_agent.context_budget import ServedContextTerminus2
-from responses_api_agents.terminus_2_agent.llm import NemoGymLLM
+from responses_api_agents.terminus_2_agent.llm import EpisodeTerminatedError, NemoGymLLM
 from responses_api_agents.terminus_2_agent.output import trajectory_to_responses
 
 
@@ -408,6 +408,8 @@ class StandaloneTerminus2(ServedContextTerminus2):
                 causes = getattr(self, "_setup_errors", None) or ["tmux session is not alive after setup"]
                 self.logger.warning("Agent setup failed: %s: %s", self.agent_error, causes[0])
             await super().run(instruction, environment, context)
+        except EpisodeTerminatedError:
+            pass  # A policy stop keeps the completed trajectory for grading.
         except Exception as exc:
             # The partial trajectory is still scored; name the cause so a model
             # or transport failure is not indistinguishable from a policy miss.
@@ -646,6 +648,7 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 "context_length_exceeded": agent.context_length_exceeded,
                 "agent_error": getattr(agent, "agent_error", None),
                 "model_transport_error": getattr(agent, "model_transport_error", None),
+                "stop_reason": agent._llm.terminal_stop_reason,
             }
             return trajectory, context, flags, timed_out, agent.finished_naturally
         finally:
@@ -737,6 +740,7 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                     }
                 ),
                 **({"model_transport_error": "true"} if flags.get("model_transport_error") else {}),
+                **({"stop_reason": flags["stop_reason"]} if flags.get("stop_reason") else {}),
                 # Harness-neutral label a wrapping agent (anyterminal) carries.
                 **({"agent_error": flags["agent_error"]} if flags.get("agent_error") else {}),
             },

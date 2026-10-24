@@ -49,6 +49,10 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
 
+class EpisodeTerminatedError(RuntimeError):
+    """The policy episode ended; compaction cannot reopen it."""
+
+
 class NemoGymLLM(BaseLLM):
     """LLM backend that calls NeMo Gym model servers via chat completions."""
 
@@ -83,6 +87,7 @@ class NemoGymLLM(BaseLLM):
         self._ambiguous_routed_expert_keys: set[_RolloutDetailsKey] = set()
 
         self.context_length_exceeded = False
+        self.terminal_stop_reason: str | None = None
         self.model_transport_error: str | None = None
         self._extra_chat_params = self._build_extra_chat_params(responses_create_params or {})
 
@@ -93,6 +98,7 @@ class NemoGymLLM(BaseLLM):
             retry_if_exception_type(Exception)
             & retry_if_not_exception_type(
                 (
+                    EpisodeTerminatedError,
                     ContextLengthExceededError,
                     OutputLengthExceededError,
                 )
@@ -106,6 +112,8 @@ class NemoGymLLM(BaseLLM):
         message_history: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
+        if self.terminal_stop_reason is not None:
+            raise EpisodeTerminatedError(self.terminal_stop_reason)
         if message_history is None:
             message_history = []
         messages = message_history + [{"role": "user", "content": prompt}]
@@ -138,6 +146,14 @@ class NemoGymLLM(BaseLLM):
 
         choices = response_dict.get("choices", [])
         choice = choices[0] if isinstance(choices, list) and choices else {}
+        if (
+            isinstance(choice, dict)
+            and choice.get("stop_reason")
+            and not (response_dict.get("usage") or {}).get("completion_tokens")
+        ):
+            self.terminal_stop_reason = str(choice["stop_reason"])
+            self.context_length_exceeded = self.terminal_stop_reason == "context_exhausted"
+            raise EpisodeTerminatedError(self.terminal_stop_reason)
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
         content = message.get("content", "") if isinstance(message, dict) else ""
         if content is None:

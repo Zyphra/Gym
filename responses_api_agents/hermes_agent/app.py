@@ -290,6 +290,7 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     concurrency: int = 32
     max_turns: int = 90
     max_tokens: Optional[int] = None
+    context_window: int | None = Field(default=None, gt=0)
     enabled_toolsets: Optional[list[str]] = None
     disabled_toolsets: Optional[list[str]] = None
     temperature: float | None = None
@@ -408,6 +409,12 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 "enabled": self.config.checkpoints_enabled,
             },
         }
+        if self.config.context_window is not None:
+            config["model"] = {"default": self._model_name(), "context_length": self.config.context_window}
+            reserve = self.config.max_tokens or 0
+            if reserve >= self.config.context_window:
+                raise ValueError("Hermes output reserve must be smaller than its context window")
+            config["compression"]["threshold"] *= 1 - reserve / self.config.context_window
         return yaml.dump(config, default_flow_style=False)
 
     def model_post_init(self, __context: Any) -> None:
