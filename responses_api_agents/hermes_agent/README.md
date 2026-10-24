@@ -82,3 +82,5 @@ hermes_agent:
 | `finish_tool` | `false` | offers OpenHands' `finish(message)` tool; every call in the turn that calls it executes, then the run ends as completed without another model request |
 
 The model-server url is resolved at request time and passed to `AIAgent(base_url=..., api_key="gym")`. <!-- pragma: allowlist secret -->
+
+`context_window` binds the native compressor to the served model window. Its compression threshold reserves `max_tokens` for the next completion before applying `compression_threshold`; model-name fallback metadata must not override a configured training window.

@@ -461,3 +461,67 @@ async def test_native_chat_http_echo_survives_shortened_history(record_property)
     finally:
         await llm.aclose()
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_terminal_policy_stop_does_not_reenter_native_compaction(tmp_path):
+    from aiohttp import web
+    from harbor.llms.chat import Chat
+
+    from responses_api_agents.terminus_2_agent.app import StandaloneTerminus2
+    from responses_api_agents.terminus_2_agent.llm import EpisodeTerminatedError
+
+    requests = []
+
+    async def complete(request):
+        requests.append(await request.json())
+        if len(requests) == 1:
+            # A normal model stop may omit usage. It still contains policy output.
+            return web.json_response(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "summary"},
+                            "finish_reason": "stop",
+                            "stop_reason": "eos",
+                        }
+                    ],
+                }
+            )
+        return web.json_response(
+            {
+                "id": "terminal-session",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop",
+                        "stop_reason": "context_exhausted",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", complete)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    llm = _make_llm(api_base=f"http://127.0.0.1:{port}/v1")
+    agent = StandaloneTerminus2(logs_dir=tmp_path, model_name="test-model", llm=llm, enable_summarize=True)
+    try:
+        assert (await llm.call("summarize")).content == "summary"
+        chat = Chat(llm)
+        with pytest.raises(EpisodeTerminatedError, match="context_exhausted"):
+            await agent._query_llm(chat, "continue after compaction", (None, None, None))
+        with pytest.raises(EpisodeTerminatedError):
+            await llm.call("summarize again")
+        assert len(requests) == 2
+        assert llm.context_length_exceeded
+        assert llm.model_transport_error is None
+    finally:
+        await llm.aclose()
+        await runner.cleanup()
