@@ -497,6 +497,11 @@ class ModelCallCaptureSelection(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
     model_server_names: list[str] = Field(min_length=1, max_length=64)
+    model_server_role: str = Field(default="judge", pattern="^(judge|user_simulator)$")
+    rollout_selection: str = Field(default="exact", pattern="^(exact|first_eligible)$")
+    rollout_ids: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    max_rollouts: int | None = Field(default=None, gt=0, le=64)
+    max_records_per_rollout: int | None = Field(default=None, gt=0, le=100000)
     max_records_per_model: int = Field(gt=0, le=100000)
     max_record_bytes: int = Field(ge=1024, le=16 * 1024 * 1024)
     max_total_bytes: int = Field(gt=0, le=64 * 1024**3)
@@ -509,6 +514,25 @@ class ModelCallCaptureSelection(BaseModel):
             raise ValueError("capture model server names must be unique")
         if any(not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) for name in self.model_server_names):
             raise ValueError("capture requires exact model server names")
+        if self.rollout_ids is not None and (
+            len(set(self.rollout_ids)) != len(self.rollout_ids)
+            or any(not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", name) for name in self.rollout_ids)
+        ):
+            raise ValueError("capture requires unique exact rollout IDs")
+        if self.rollout_selection == "first_eligible":
+            if (
+                self.model_server_role != "user_simulator"
+                or self.rollout_ids is not None
+                or self.max_rollouts is None
+                or self.max_records_per_rollout is None
+            ):
+                raise ValueError("first-eligible capture requires bounded USER rollouts and no exact ID list")
+        elif self.max_rollouts is not None:
+            raise ValueError("max_rollouts requires first-eligible selection")
+        elif self.model_server_role == "user_simulator" and (
+            self.rollout_ids is None or self.max_records_per_rollout is None
+        ):
+            raise ValueError("USER capture requires exact rollout IDs and a per-rollout bound")
         if self.capture_until.tzinfo is None:
             raise ValueError("capture_until requires a timezone")
         if self.max_record_bytes > self.max_total_bytes:
@@ -570,6 +594,8 @@ class CaptureStore:
         self._pending = None
         self._writer = None
         self.dropped: dict[str, int] = {}
+        self._fixed_rollouts: frozenset[str] | None = None
+        self._full_rollouts: set[str] = set()
         if selection is not None:
             info = self._root.lstat()
             if (
@@ -582,12 +608,27 @@ class CaptureStore:
             self._pending = threading.BoundedSemaphore(selection.pending_records_per_process)
             self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-call-capture")
 
-    def admit(self) -> bool:
+    def admit(self, rollout_id: str | None = None) -> bool:
         """Reserve bounded buffering/write capacity without storage IO or waiting."""
         if self._selection is None:
             return True
         if time.time() >= self._selection.capture_until.timestamp():
             self.drop("capture_window_closed")
+            return False
+        if rollout_id is not None:
+            if (
+                self._selection.rollout_ids is not None
+                and rollout_id not in self._selection.rollout_ids
+                or self._fixed_rollouts is not None
+                and rollout_id not in self._fixed_rollouts
+            ):
+                self.drop("unselected_rollout")
+                return False
+            if rollout_id in self._full_rollouts:
+                self.drop("rollout_record_limit")
+                return False
+        elif self._selection.model_server_role == "user_simulator":
+            self.drop("missing_rollout")
             return False
         if not self._pending.acquire(blocking=False):
             self.drop("pending_limit")
@@ -596,6 +637,25 @@ class CaptureStore:
 
     def drop(self, reason: str) -> None:
         self.dropped[reason] = self.dropped.get(reason, 0) + 1
+
+    def _remember_committed_limits(self, state: dict[str, Any]) -> None:
+        """Cache only monotonic facts read/written under the existing root lock.
+
+        Other writer processes learn the fixed cohort on their first bounded
+        finalization; subsequent unselected calls skip buffering without IO.
+        The root policy is immutable. These caches never grant quota.
+        """
+        selection = self._selection
+        if selection.rollout_selection == "first_eligible":
+            selected = state.get("selected_rollouts", [])
+            if len(selected) >= selection.max_rollouts:
+                self._fixed_rollouts = frozenset(selected)
+        if selection.max_records_per_rollout is not None:
+            self._full_rollouts.update(
+                identity
+                for identity, count in state.get("rollouts", {}).items()
+                if count >= selection.max_records_per_rollout
+            )
 
     def background(self, callback) -> None:
         """An admitted record never waits for parse, flock or fsync on response delivery."""
@@ -637,6 +697,14 @@ class CaptureStore:
         if model not in selection.model_server_names:
             self.drop("unselected_model")
             return
+        if selection.rollout_ids is not None and rollout_id not in selection.rollout_ids:
+            self.drop("unselected_rollout")
+            return
+        if selection.rollout_selection == "first_eligible":
+            _validate_rollout_id(rollout_id)
+            if len(rollout_id) > 128:
+                self.drop("rollout_identity_limit")
+                return
         redacted = []
         secret_fields = {"authorization", "api_key", "apikey", "access_token", "refresh_token", "password"}
 
@@ -662,6 +730,7 @@ class CaptureStore:
             "opaque_raw_omitted": any(exchange.get(k) is not None for k in ("request_raw", "response_raw")),
             "capture_until": selection.capture_until.isoformat(),
             "replay_eligible": not redacted and exchange.get("request") is not None,
+            "quota_scope": "capture_root",
         }
         line = orjson.dumps(clean, default=str, option=orjson.OPT_APPEND_NEWLINE)
         if len(line) > selection.max_record_bytes:
@@ -676,20 +745,38 @@ class CaptureStore:
             state = json.loads(raw) if raw else {"bytes": 0, "models": {}, "policy_sha256": policy_sha}
             if state.get("policy_sha256") != policy_sha:
                 raise ValueError("capture quota policy differs across model workers")
+            self._remember_committed_limits(state)
+            if selection.rollout_selection == "first_eligible":
+                selected = state.setdefault("selected_rollouts", [])
+                if rollout_id not in selected:
+                    if len(selected) >= selection.max_rollouts:
+                        self.drop("unselected_rollout")
+                        return
+                    # The existing root lock picks the first recordable exchange,
+                    # not the first scheduled or started episode. Never roll over
+                    # to another ID after this fixed cohort reaches its limits.
+                    selected.append(rollout_id)
             if state["bytes"] + len(line) > selection.max_total_bytes:
                 self.drop("total_byte_limit")
                 return
             if state["models"].get(model, 0) >= selection.max_records_per_model:
                 self.drop("model_record_limit")
                 return
+            rollouts = state.setdefault("rollouts", {}) if selection.max_records_per_rollout is not None else None
+            if rollouts is not None and rollouts.get(rollout_id, 0) >= selection.max_records_per_rollout:
+                self.drop("rollout_record_limit")
+                return
             # Reserve before append: a crash may waste quota, never silently exceed it.
             state["bytes"] += len(line)
             state["models"][model] = state["models"].get(model, 0) + 1
+            if rollouts is not None:
+                rollouts[rollout_id] = rollouts.get(rollout_id, 0) + 1
             quota.seek(0)
             quota.write(orjson.dumps(state))
             quota.truncate()
             quota.flush()
             os.fsync(quota.fileno())
+            self._remember_committed_limits(state)
             with os.fdopen(
                 self._private_fd(self.path_for(rollout_id), os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab"
             ) as handle:
@@ -1697,7 +1784,7 @@ class _CaptureMiddleware:
             sink_token = set_token_sink(capture_context)
 
         bounded = store is not None and store._selection is not None
-        if bounded and not store.admit():
+        if bounded and not store.admit(rollout_id):
             store = None
         # Training-only capture has no evaluation record.
         # Forward without buffering while the sink is active.
