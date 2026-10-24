@@ -1800,24 +1800,11 @@ class TestTaskWorkingDirectory:
         assert RunTerminalAgent(config=cfg)._agent_env(cfg)["NGTB_TASK_WORKDIR"] == "/workspace"
 
     def test_runner_defaults_declared_working_directory_to_the_task(self, tmp_path: Path, monkeypatch) -> None:
-        import types
+        from responses_api_agents.pi_agent.app import PiAgentConfig
 
-        module = types.ModuleType("fixture_wd_agent")
-        from pydantic import BaseModel as _Base
-
-        class FixtureConfig(_Base):
-            model_config = {"extra": "allow"}
-            working_directory: str | None = None
-
-        class FixtureAgent:
-            def __init__(self, config, server_client):
-                self.config = config
-
-        module.FixtureAgent, module.FixtureConfig = FixtureAgent, FixtureConfig
-        monkeypatch.setitem(sys.modules, "fixture_wd_agent", module)
         rendered = _RUNNER_TEMPLATE.format(
-            agent_module="fixture_wd_agent", agent_class="FixtureAgent",
-            agent_cfg_class="FixtureConfig", agent_class_lower="fixtureagent",
+            agent_module="responses_api_agents.pi_agent.app", agent_class="PiAgent",
+            agent_cfg_class="PiAgentConfig", agent_class_lower="piagent",
         )
         prefix = rendered.split("\nagent = ")[0]
         monkeypatch.setenv("NGTB_MODEL_NAME", "m")
@@ -1825,6 +1812,7 @@ class TestTaskWorkingDirectory:
         namespace: dict = {}
         with patch.object(Path, "read_text", return_value="instruction"):
             exec(compile(prefix, "<runner>", "exec"), namespace)
+        assert isinstance(namespace["config"], PiAgentConfig)
         assert namespace["config"].working_directory == "/workspace"
         monkeypatch.setenv("NGTB_AGENT_KWARGS", json.dumps({"working_directory": "/explicit"}))
         namespace = {}
