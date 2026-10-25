@@ -327,3 +327,76 @@ class TestRunReportsMaskSample:
 
         assert dumped["mask_sample"] is False
         assert dumped["instance_config"]["mask_sample"] is False
+
+
+async def test_policy_completion_precedes_swe_grading(tmp_path, monkeypatch):
+    from omegaconf import OmegaConf
+
+    from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+    from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app
+
+    client = ServerClient(
+        head_server_config=BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py"),
+        global_config_dict=OmegaConf.create({"results_dir": str(tmp_path)}),
+    )
+    agent = AnySweAgent(
+        config=_config(
+            model_server=None, agent_runtime_source="baked", sandbox_model_base_url="http://127.0.0.1:19002/v1"
+        ),
+        server_client=client,
+    )
+    agent._server.base_results_dir = tmp_path
+    body = NeMoGymResponseCreateParamsNonStreaming(
+        model="policy", input="Fix it", metadata={"instance_id": "test__test-1", "problem_statement": "Fix it"}
+    )
+    saved = NeMoGymResponse(
+        id="response",
+        created_at=1,
+        model="policy",
+        object="response",
+        output=[],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+    )
+    phases = []
+
+    class Sandbox:
+        def __init__(self, provider, spec):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            phases.append("settled")
+
+        async def exec(self, command, **kwargs):
+            if "agent_runner.py" in command:
+                phases.append("policy")
+            return SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+
+        async def download(self, remote, local):
+            local.write_text(
+                saved.model_dump_json() if remote.endswith("response.json") else "diff --git a/x b/x\n+x\n"
+            )
+
+    async def notify(params):
+        assert params is body
+        assert phases == ["policy"]
+        phases.append("policy_done")
+        return True
+
+    async def grade(self, params, patch):
+        assert phases == ["policy", "policy_done", "settled"]
+        assert patch.startswith("diff --git")
+        phases.append("grading")
+        return True, None
+
+    monkeypatch.setattr(app, "AsyncSandbox", Sandbox)
+    monkeypatch.setattr(app, "notify_policy_phase_done", notify)
+    monkeypatch.setattr(AnySweAgent, "_grade_sandbox_patch", grade)
+    result = await agent.run(AnySweRunRequest(responses_create_params=body))
+    assert result.reward == 1.0
+    assert phases == ["policy", "policy_done", "settled", "grading"]

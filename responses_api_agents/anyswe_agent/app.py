@@ -35,6 +35,7 @@ from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body,
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.policy_completion import notify_policy_phase_done
 from nemo_gym.sandbox import AsyncSandbox, SandboxCreateError, SandboxResources, SandboxSpec
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.server_utils import apply_rollout_prefix
@@ -545,6 +546,7 @@ class AnySweAgent(SimpleResponsesAPIAgent):
                 timeout_s=params.swebench_agent_timeout,
                 user="root",
             )
+            await notify_policy_phase_done(params.body)
             for remote, local in (
                 ("/trajectories_mount/response.json", params.persistent_dir / "response.json"),
                 ("/trajectories_mount/patch.diff", params.persistent_dir / "patch.diff"),

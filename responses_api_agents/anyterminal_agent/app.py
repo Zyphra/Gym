@@ -37,6 +37,7 @@ from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body,
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.policy_completion import notify_policy_phase_done
 from nemo_gym.sandbox import AsyncSandbox, SandboxSpec
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.providers.apptainer import ApptainerProvider
@@ -646,6 +647,7 @@ class RunTerminalAgent(BaseModel):
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_runtime(sandbox, cfg)
             agent_run_time, agent_timed_out = await self._run_agent(sandbox, cfg)
+            await notify_policy_phase_done(cfg.body)
             await self._stage_tests(cfg)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_tests(sandbox, cfg)
