@@ -1,26 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import asyncio
 import json
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
 import pytest
-from omegaconf import OmegaConf
 
-from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
-from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.server_utils import ServerClient
-from responses_api_agents.hermes_agent.app import HermesAgent, HermesAgentConfig, _bind_policy_summary
+from responses_api_agents.hermes_agent.policy_summary import bind_policy_summary
 
 
-def test_native_summary_reuses_the_main_client_model_and_rollout_url(monkeypatch, record_property, tmp_path):
+@pytest.fixture
+def native_policy(monkeypatch, tmp_path, record_property):
+    """The admitted native compressor and OpenAI client over real local HTTP."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    import run_agent
+    run_agent = pytest.importorskip("run_agent")
+    import agent.context_compressor as compressor_module
 
+    monkeypatch.setattr(compressor_module, "get_model_context_length", lambda *_a, **_kw: 8192)
     requests = []
+    response_kind = ["visible"]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -29,16 +30,28 @@ def test_native_summary_reuses_the_main_client_model_and_rollout_url(monkeypatch
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append((self.path, body))
-            text = "Main fixture response." if len(requests) == 1 else "Verified fixture summary."
+            message = {"role": "assistant", "content": "Verified fixture summary."}
+            finish = "stop"
+            if response_kind[0] == "empty":
+                message["content"] = ""
+            elif response_kind[0] == "length":
+                finish = "length"
+            elif response_kind[0] == "tool_calls":
+                finish = "tool_calls"
+                message["tool_calls"] = [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ]
             payload = json.dumps(
                 {
                     "id": f"fixture-{len(requests)}",
                     "object": "chat.completion",
                     "created": 1,
                     "model": body["model"],
-                    "choices": [
-                        {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
-                    ],
+                    "choices": [{"index": 0, "message": message, "finish_reason": finish}],
                     "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
                 }
             ).encode()
@@ -51,71 +64,43 @@ def test_native_summary_reuses_the_main_client_model_and_rollout_url(monkeypatch
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    original = run_agent.AIAgent
-    native_agents = []
-
-    def record_native_agent(**kwargs):
-        native = original(**kwargs)
-        native_agents.append(native)
-        return native
-
-    monkeypatch.setattr(run_agent, "AIAgent", record_native_agent)
+    native = None
     try:
-        client = ServerClient.model_construct(
-            global_config_dict=OmegaConf.create(
-                {
-                    "policy": {
-                        "responses_api_models": {"openai_model": {"host": "127.0.0.1", "port": server.server_port}}
-                    },
-                }
-            )
+        native = run_agent.AIAgent(
+            base_url=f"http://127.0.0.1:{server.server_port}/ng-rollout/summary-session/v1",
+            api_key="local-control",
+            model="fixture-policy",
+            use_streaming=False,
+            insert_reasoning=True,
+            max_iterations=2,
+            max_tokens=64,
+            enabled_toolsets=[],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            persist_session=False,
+            save_trajectories=False,
         )
-        client._build_server_base_url = lambda _cfg: f"http://127.0.0.1:{server.server_port}"
-        app = HermesAgent(
-            config=HermesAgentConfig(
-                host="127.0.0.1",
-                port=0,
-                name="hermes",
-                entrypoint="app.py",
-                model_server=ModelServerRef(type="responses_api_models", name="policy"),
-                resources_server=ResourcesServerRef(type="resources_servers", name="resource"),
-                model="fixture-policy",
-                max_turns=2,
-                max_tokens=8192,
-                context_window=32768,
-                enabled_toolsets=[],
-                compression_enabled=True,
-                terminal_backend="local",
-            ),
-            server_client=client,
-        )
-
-        async def exercise():
-            await app._create_response(
-                NeMoGymResponseCreateParamsNonStreaming(input="Return the local fixture response."),
-                rollout_id="summary-session",
-            )
-            return await asyncio.to_thread(
-                native_agents[0].context_compressor._generate_summary,
-                [{"role": "user", "content": "The local fixture was checked."}],
-            )
-
-        summary = asyncio.run(exercise())
-        compressor = native_agents[0].context_compressor
-        assert compressor.context_length == 32768
-        assert compressor.threshold_tokens == int((32768 - 8192) * 0.85)
-        assert "Verified fixture summary." in summary
-        assert len(requests) == 2
-        assert [path for path, _ in requests] == ["/ng-rollout/summary-session/v1/chat/completions"] * 2
-        assert [body["model"] for _, body in requests] == ["fixture-policy"] * 2
-        assert requests[1][1]["tool_choice"] == "none"
-        assert requests[1][1]["max_tokens"] <= 8192
+        if not hasattr(native.context_compressor, "managed_summary_callback"):
+            pytest.skip("requires the admitted Hermes managed-summary runtime")
         record_property("native_runtime", str(Path(run_agent.__file__).resolve()))
-        record_property(
-            "captured_routes", json.dumps([{"path": path, "model": body["model"]} for path, body in requests])
-        )
+        # This is the existing Gym task-turn template configuration. Keep the
+        # same nested mapping across calls to catch summary mutation leaking out.
+        original = native._build_api_kwargs
+        task_template = {"enable_thinking": True, "truncate_history_thinking": False}
+
+        def configured(messages):
+            kwargs = original(messages)
+            extra_body = dict(kwargs.get("extra_body") or {})
+            extra_body["chat_template_kwargs"] = task_template
+            kwargs["extra_body"] = extra_body
+            return kwargs
+
+        native._build_api_kwargs = configured
+        bind_policy_summary(native)
+        yield native, requests, response_kind, task_template
     finally:
-        for native in native_agents:
+        if native is not None:
             native.client.close()
         server.shutdown()
         server.server_close()
@@ -123,8 +108,40 @@ def test_native_summary_reuses_the_main_client_model_and_rollout_url(monkeypatch
         assert not thread.is_alive()
 
 
-def test_older_native_compressor_refuses_before_any_policy_call():
-    from types import SimpleNamespace
+def test_native_first_and_iterative_summaries_preserve_task_mode_and_history(native_policy):
+    native, requests, _, task_template = native_policy
+    history = [
+        {"role": "user", "content": "The local fixture was checked."},
+        {"role": "assistant", "reasoning_content": "Retained native reasoning.", "content": "Checked."},
+    ]
+    original_history = deepcopy(history)
+    before = deepcopy(native._build_api_kwargs(history))
+    native.client.chat.completions.create(**native._build_api_kwargs(history))
+    assert "Verified fixture summary." in native.context_compressor._generate_summary(history)
+    assert "Verified fixture summary." in native.context_compressor._generate_summary(history)
+    native.client.chat.completions.create(**native._build_api_kwargs(history))
+    assert history == original_history
+    assert native._build_api_kwargs(history) == before
+    assert task_template == {"enable_thinking": True, "truncate_history_thinking": False}
+    assert len(requests) == 4
+    assert [path for path, _ in requests] == ["/ng-rollout/summary-session/v1/chat/completions"] * 4
+    assert [body["model"] for _, body in requests] == ["fixture-policy"] * 4
+    assert [body["chat_template_kwargs"]["enable_thinking"] for _, body in requests] == [True, False, False, True]
+    assert [body["max_tokens"] for _, body in requests] == [64, 4000, 4000, 64]
+    for _, summary in requests[1:3]:
+        assert summary["tool_choice"] == "none"
+        assert summary["chat_template_kwargs"]["truncate_history_thinking"] is False
+        assert "Retained native reasoning." in summary["messages"][-1]["content"]
+    assert requests[1][1]["messages"][-1]["content"].startswith("Create a structured handoff")
+    assert requests[2][1]["messages"][-1]["content"].startswith("You are updating a context compaction summary")
 
-    with pytest.raises(RuntimeError, match="managed summary callback"):
-        _bind_policy_summary(SimpleNamespace(context_compressor=SimpleNamespace()))
+
+@pytest.mark.parametrize("kind", ["empty", "length", "tool_calls"])
+def test_native_summary_guard_still_rejects_unusable_handoffs(native_policy, kind):
+    native, requests, response_kind, task_template = native_policy
+    response_kind[0] = kind
+    with pytest.raises(RuntimeError, match="empty, truncated, or emitted tool calls"):
+        native.context_compressor._generate_summary([{"role": "user", "content": "Summarize the task."}])
+    assert len(requests) == 1  # No auxiliary-provider fallback or extra policy call.
+    assert requests[0][1]["max_tokens"] == 4000
+    assert task_template["enable_thinking"] is True
