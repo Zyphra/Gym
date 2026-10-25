@@ -7,7 +7,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
-import pytest
 from omegaconf import OmegaConf
 
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
@@ -124,4 +123,3 @@ def test_native_summary_reuses_the_main_client_model_and_rollout_url(monkeypatch
         server.server_close()
         thread.join(timeout=5)
         assert not thread.is_alive()
-
