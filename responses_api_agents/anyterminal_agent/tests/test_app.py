@@ -1715,3 +1715,31 @@ def test_apptainer_preserves_existing_mount_exclusions(tmp_path, monkeypatch, ar
     actual = provider._create_config.extra_start_args
     assert any("bind-paths,home,tmp" in value for value in actual)
     assert args in (["--no-mount", "bind-paths"], ["--no-mount=bind-paths"])
+
+
+async def test_policy_completion_precedes_terminal_grading(tmp_path, monkeypatch):
+    cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+    phases = []
+
+    async def execute(command, **kwargs):
+        if "run-the-agent" in command:
+            phases.append("policy")
+        if "bash /tests/test.sh" in command:
+            assert phases == ["policy", "policy_done"]
+            phases.append("grading")
+            (cfg.verifier_dir / "reward.txt").write_text("1.0")
+        return _sandbox_result()
+
+    async def notify(body):
+        assert body is cfg.body
+        assert phases == ["policy"]
+        phases.append("policy_done")
+        return True
+
+    sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=execute), stop=AsyncMock())
+    monkeypatch.setattr(app, "notify_policy_phase_done", notify)
+    with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+        with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+            assert await RunTerminalAgent(config=cfg).process_single_datapoint()
+    assert phases == ["policy", "policy_done", "grading"]
+    sandbox.stop.assert_awaited_once()

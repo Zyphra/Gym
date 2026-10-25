@@ -1530,8 +1530,17 @@ async def test_expected_budget_stop_keeps_graded_patch(
             destination.write_text(saved.model_dump_json() if source.endswith("response.json") else patch)
 
     graded = []
+    boundaries = []
+
+    async def policy_done(params):
+        assert params is not None
+        boundaries.append("policy_done")
+        return True
+
+    monkeypatch.setattr(app_module, "notify_policy_phase_done", policy_done)
 
     async def grade(self, params, received):
+        assert boundaries == ["policy_done"]
         graded.append(received)
         if grader_error == "raised_runtime":
             raise RuntimeError("verifier cleanup failed")
