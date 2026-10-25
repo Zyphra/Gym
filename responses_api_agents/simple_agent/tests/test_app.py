@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from omegaconf import OmegaConf
 from pytest import MonkeyPatch
 
+import nemo_gym.server_utils as server_utils
 from nemo_gym import server_utils
 from nemo_gym.config_types import BaseServerConfig
 from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
@@ -1242,3 +1243,60 @@ def test_final_answer_turn_keeps_the_offered_tools_and_forbids_calls() -> None:
     assert len(last.tools) == 1
     assert last.tool_choice == "none"
     assert res.json()["output"][-1]["content"][0]["text"] == "\\boxed{42}"
+
+
+@pytest.mark.parametrize("notification_status", [200, 503])
+async def test_policy_completion_http_precedes_verify_and_failure_keeps_grade(monkeypatch, notification_status):
+    """The real run method sends one callback before handing its result to grading."""
+    server, client = _make_agent(False)
+    order = []
+
+    async def done(request):
+        order.append("policy_done")
+        return web.json_response({}, status=notification_status)
+
+    app = web.Application()
+    app.router.add_post("/policy_done", done)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    payload = {
+        "id": "response",
+        "created_at": 1.0,
+        "model": "model",
+        "object": "response",
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "tools": [],
+        "output": [],
+    }
+
+    async def post(*, server_name, url_path, **kwargs):
+        if url_path == "/seed_session":
+            return _mock_response()
+        if server_name == "simple":
+            order.append("policy_response")
+            return _mock_response(payload)
+        assert url_path == "/verify"
+        order.append("verify")
+        assert order == ["policy_response", "policy_done", "verify"]
+        return _mock_response(kwargs["json"] | {"reward": 1.0})
+
+    client.post = AsyncMock(side_effect=post)
+    body = SimpleAgentRunRequest.model_validate(
+        {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "question"}],
+                "metadata": {"_ng_policy_completion_url": f"http://127.0.0.1:{port}/policy_done"},
+            }
+        }
+    )
+    try:
+        async with ClientSession() as session:
+            monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", session)
+            result = await server.run(MagicMock(cookies={}), body)
+        assert result.reward == 1.0
+    finally:
+        await runner.cleanup()

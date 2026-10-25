@@ -39,6 +39,7 @@ from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body,
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.policy_completion import notify_policy_phase_done
 from nemo_gym.rollout_observability import AgentObservationBundle, harness_response_error
 from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
@@ -194,7 +195,9 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
         if self.agent_timed_out and agent_timeout_is_failure:
             self.resolved = False
         self.mask_sample = bool(
-            self.mask_sample or self.container_timed_out or self.sandbox_failed
+            self.mask_sample
+            or self.container_timed_out
+            or self.sandbox_failed
             or (self.agent_timed_out and not agent_timeout_is_failure)
         )
 
@@ -512,8 +515,10 @@ class VerifierRuntime(BaseModel):
             (self.cache_dir, "verifier-cache.json", self.cache_manifest_sha256),
         ):
             if (
-                not directory.is_absolute() or directory.resolve() != directory
-                or directory.is_symlink() or not directory.is_dir()
+                not directory.is_absolute()
+                or directory.resolve() != directory
+                or directory.is_symlink()
+                or not directory.is_dir()
                 or any(c in str(directory) for c in (":", "\n", "\r", ","))
             ):
                 raise ValueError("verifier payload must be a canonical bindable directory")
@@ -560,9 +565,14 @@ def _episode_sandbox_resources(params: AnyTerminalInstanceConfig) -> SandboxReso
 
     def declared_int(key: str, *, optional: bool = False) -> Optional[int]:
         value = params.problem_info.get(key)
-        if value is None and optional and key == "pids" and (
-            params.task_network is not None
-            or next(iter(params.sandbox_provider), None) in {"enroot", "native_enroot"}
+        if (
+            value is None
+            and optional
+            and key == "pids"
+            and (
+                params.task_network is not None
+                or next(iter(params.sandbox_provider), None) in {"enroot", "native_enroot"}
+            )
         ):
             raw_pids = os.environ.get("NEMO_GYM_SANDBOX_PIDS", "")
             if not raw_pids.isdigit() or int(raw_pids) < 1:
@@ -583,8 +593,7 @@ def _episode_sandbox_resources(params: AnyTerminalInstanceConfig) -> SandboxReso
     apptainer = params.sandbox_provider.get("apptainer") or {}
     create = apptainer.get("create") or {}
     disk_enabled = (
-        next(iter(params.sandbox_provider), "docker") == "apptainer"
-        and create.get("disk_backed_overlay") is True
+        next(iter(params.sandbox_provider), "docker") == "apptainer" and create.get("disk_backed_overlay") is True
     )
     storage_mib = declared_int("storage_mb", optional=True) if disk_enabled else None
     if storage_mib is not None and storage_mib % 1024:
@@ -621,13 +630,17 @@ def _build_provider(params: AnyTerminalInstanceConfig):
         from core.sandbox.terminal_provider import terminal_provider
 
         verifier_binds = [] if params.verifier_runtime is None else params.verifier_runtime.binds()
-        return terminal_provider(params.sandbox_provider, [
-            f"{params.persistent_dir}:/trajectories_mount",
-            f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
-            f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-            f"{params.verifier_dir}:/logs/verifier",
-            *verifier_binds,
-        ], task_network=params.task_network)
+        return terminal_provider(
+            params.sandbox_provider,
+            [
+                f"{params.persistent_dir}:/trajectories_mount",
+                f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
+                f"{params.agent_deps_dir}:/agent_deps_mount:ro",
+                f"{params.verifier_dir}:/logs/verifier",
+                *verifier_binds,
+            ],
+            task_network=params.task_network,
+        )
     if params.task_network is not None:
         if name != "apptainer":
             raise ValueError("private task networking requires Apptainer")
@@ -644,12 +657,16 @@ def _build_provider(params: AnyTerminalInstanceConfig):
             if k in ("exec", "create", "probe")
         }
         exec_cfg = dict(appt.get("exec") or {})
-        exec_cfg["default_binds"] = list(exec_cfg.get("default_binds") or []) + [
-            f"{params.persistent_dir}:/trajectories_mount",
-            f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
-            f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-            f"{params.verifier_dir}:/logs/verifier",
-        ] + verifier_binds
+        exec_cfg["default_binds"] = (
+            list(exec_cfg.get("default_binds") or [])
+            + [
+                f"{params.persistent_dir}:/trajectories_mount",
+                f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
+                f"{params.agent_deps_dir}:/agent_deps_mount:ro",
+                f"{params.verifier_dir}:/logs/verifier",
+            ]
+            + verifier_binds
+        )
         exec_args = list(exec_cfg.get("extra_exec_args") or [])
         if params.apptainer_shared_pid_namespace:
             exec_args = [arg for arg in exec_args if arg != "--pid"]
@@ -685,10 +702,16 @@ def _build_provider(params: AnyTerminalInstanceConfig):
             from core.sandbox.service_apptainer import register_private_network_provider
 
             register_private_network_provider()
-            return create_provider({"apptainer_services": {
-                **appt, "tools_root": str(params.task_network.tools_root),
-                "tools_sha256": params.task_network.tools_sha256, "network_required": True,
-            }})
+            return create_provider(
+                {
+                    "apptainer_services": {
+                        **appt,
+                        "tools_root": str(params.task_network.tools_root),
+                        "tools_sha256": params.task_network.tools_sha256,
+                        "network_required": True,
+                    }
+                }
+            )
         return ApptainerProvider(**appt)
     if name != "docker":
         return params.sandbox_provider
@@ -704,7 +727,8 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 f"{params.agent_deps_dir}:/agent_deps_mount:ro",
                 "-v",
                 f"{params.verifier_dir}:/logs/verifier",
-            ] + [arg for bind in verifier_binds for arg in ("-v", bind)],
+            ]
+            + [arg for bind in verifier_binds for arg in ("-v", bind)],
         ),
     )
 
@@ -763,7 +787,9 @@ class RunTerminalAgent(BaseModel):
             if result.return_code != 0:
                 raise RuntimeError(result.stderr or "failed to fetch agent runtime")
         else:
-            result = await sandbox.exec("test -x /agent_deps_mount/bin/python", timeout_s=setup_timeout_seconds(30), user="root")
+            result = await sandbox.exec(
+                "test -x /agent_deps_mount/bin/python", timeout_s=setup_timeout_seconds(30), user="root"
+            )
             if result.return_code != 0:
                 raise RuntimeError("task image does not contain /agent_deps_mount/bin/python")
         if external_runtime:
@@ -835,10 +861,14 @@ class RunTerminalAgent(BaseModel):
             )
         finally:
             self._agent_phase_memory_events = memory_event_delta(before, sandbox_memory_snapshot(sandbox))
-            update_metrics(cfg.metrics_fpath, {
-                "agent_completed_at": time.time(),
-                "agent_phase_memory_events": self._agent_phase_memory_events or None,
-            }, cfg.task_name)
+            update_metrics(
+                cfg.metrics_fpath,
+                {
+                    "agent_completed_at": time.time(),
+                    "agent_phase_memory_events": self._agent_phase_memory_events or None,
+                },
+                cfg.task_name,
+            )
         (cfg.persistent_dir / "agent_result.json").write_text(
             json.dumps(
                 {
@@ -862,7 +892,9 @@ class RunTerminalAgent(BaseModel):
             shutil.rmtree(staging_tests)
         shutil.copytree(src, staging_tests)
 
-    async def _exec_verifier(self, sandbox: AsyncSandbox, command: str, *, env: dict[str, str] | None, timeout_s: int | float):
+    async def _exec_verifier(
+        self, sandbox: AsyncSandbox, command: str, *, env: dict[str, str] | None, timeout_s: int | float
+    ):
         # Apptainer's env-file shell reserves HOME. Set it only in the child
         # command, preserving the provider's validation and the agent's home.
         projected = None if env is None else dict(env)
@@ -885,11 +917,15 @@ class RunTerminalAgent(BaseModel):
             )
             command = (
                 "unshare -n -- /staging/env_files/python/verifier-python/bin/python3 -I -c "
-                + shlex.quote(setup) + " " + shlex.quote(command)
+                + shlex.quote(setup)
+                + " "
+                + shlex.quote(command)
             )
         return await sandbox.exec(command, env=projected, timeout_s=timeout_s, user="root")
 
-    async def _prepare_verifier_runtime(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> dict[str, str] | None:
+    async def _prepare_verifier_runtime(
+        self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig
+    ) -> dict[str, str] | None:
         """Create only verifier-local state; never run task helper setup or alter /app."""
         if cfg.verifier_runtime is None:
             return None
@@ -909,14 +945,21 @@ class RunTerminalAgent(BaseModel):
         )
         task_environment = await sandbox.exec(
             f"{helper}/verifier-python/bin/python3 -I -c " + shlex.quote(inspect),
-            timeout_s=cfg.tb_eval_timeout, user="root",
+            timeout_s=cfg.tb_eval_timeout,
+            user="root",
         )
         if task_environment.return_code != 0 or task_environment.error_type:
-            (cfg.verifier_dir / "runtime-setup.json").write_text(json.dumps({
-                "phase": "task_environment", "return_code": task_environment.return_code,
-                "error_type": task_environment.error_type, "stdout": task_environment.stdout,
-                "stderr": task_environment.stderr,
-            }))
+            (cfg.verifier_dir / "runtime-setup.json").write_text(
+                json.dumps(
+                    {
+                        "phase": "task_environment",
+                        "return_code": task_environment.return_code,
+                        "error_type": task_environment.error_type,
+                        "stdout": task_environment.stdout,
+                        "stderr": task_environment.stderr,
+                    }
+                )
+            )
             raise RuntimeError("private verifier runtime setup failed; see runtime-setup.json")
         task_env = json.loads(task_environment.stdout)
         env = {
@@ -968,8 +1011,11 @@ class RunTerminalAgent(BaseModel):
         if task_env:
             verifier_env = {**task_env, **(verifier_env or {})}
         test_cmd = (
-            ("readlink /proc/self/ns/net > /logs/verifier/network-namespace.txt && "
-             if cfg.task_network is not None else "")
+            (
+                "readlink /proc/self/ns/net > /logs/verifier/network-namespace.txt && "
+                if cfg.task_network is not None
+                else ""
+            )
             + "rm -rf /tests && ln -s /trajectories_mount/staging/tests /tests && "
             # A minimal pytest.ini at / stops pytest from picking up Gym's pyproject.toml
             # (whose --pyargs breaks paths inside the sandbox).
@@ -1027,6 +1073,7 @@ class RunTerminalAgent(BaseModel):
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_runtime(sandbox, cfg)
             agent_run_time, agent_timed_out, sandbox_failed, agent_return_code = await self._run_agent(sandbox, cfg)
+            await notify_policy_phase_done(cfg.body)
             await self._stage_tests(cfg)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_tests(sandbox, cfg)
@@ -1047,9 +1094,14 @@ class RunTerminalAgent(BaseModel):
                 verifier_memory_after = sandbox_memory_snapshot(sandbox)
                 grading_completed_at = time.time()
                 update_metrics(cfg.metrics_fpath, {"grading_completed_at": grading_completed_at}, cfg.task_name)
-                (cfg.verifier_dir / "grading-timing.json").write_text(json.dumps({
-                    "started_at": grading_started_at, "completed_at": grading_completed_at,
-                }))
+                (cfg.verifier_dir / "grading-timing.json").write_text(
+                    json.dumps(
+                        {
+                            "started_at": grading_started_at,
+                            "completed_at": grading_completed_at,
+                        }
+                    )
+                )
             if not self._uses_bind_mounts(cfg):
                 await self._collect_remote_outputs(sandbox, cfg)
         except VerifierIntegrityRefused as e:
@@ -1129,9 +1181,9 @@ class RunTerminalAgent(BaseModel):
             total_run_time=total_run_time,
             error_detail=memory_kill or verifier_kill,
             verifier_phase_memory_events=verifier_phase_events or None,
-            memory_failure_phase="verifier" if verifier_phase_kill else (
-                "agent_harness" if agent_phase_kill else "unknown" if memory_kill or verifier_kill else None
-            ),
+            memory_failure_phase="verifier"
+            if verifier_phase_kill
+            else ("agent_harness" if agent_phase_kill else "unknown" if memory_kill or verifier_kill else None),
             **memory_events,
         )
         metrics.apply_timeout_policy(agent_timeout_is_failure=cfg.agent_timeout_is_failure)
@@ -1156,7 +1208,9 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
             data = json.loads(response_path.read_text())
             data["model"] = params.model_name
             raw_observations = data.pop("_ng_agent_observations", None)
-            observations = AgentObservationBundle.model_validate(raw_observations) if raw_observations is not None else None
+            observations = (
+                AgentObservationBundle.model_validate(raw_observations) if raw_observations is not None else None
+            )
             saved = NeMoGymResponse.model_validate(data)
             agent_stop_reason = (saved.metadata or {}).get("stop_reason")
             harness_error = harness_response_error(saved, observations)
@@ -1320,7 +1374,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         # Fill in workdir and timeouts from task.toml/Dockerfile if not in JSONL metadata.
         task_dir = Path(problem_info["task_dir"])
         required_meta = ["workdir", "agent_timeout_sec", "verifier_timeout_sec"]
-        if (self.config.sandbox_provider.get("apptainer", {}).get("create", {}).get("disk_backed_overlay")):
+        if self.config.sandbox_provider.get("apptainer", {}).get("create", {}).get("disk_backed_overlay"):
             required_meta.append("storage_mb")
         if not all(k in problem_info for k in required_meta):
             problem_info.update({k: v for k, v in _read_task_meta(task_dir).items() if k not in problem_info})
@@ -1361,11 +1415,13 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
             **server_config,
             problem_info=problem_info,
             task_network=(
-                self.config.task_network if "task_network" not in problem_info
+                self.config.task_network
+                if "task_network" not in problem_info
                 else TaskNetwork.model_validate_json(problem_info["task_network"])
             ),
             verifier_runtime=(
-                None if "verifier_runtime" not in problem_info
+                None
+                if "verifier_runtime" not in problem_info
                 else VerifierRuntime.model_validate_json(problem_info["verifier_runtime"])
             ),
             body=body,
@@ -1374,7 +1430,9 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
             agent_run_id=agent_run_id,
             metrics_fpath=persistent_dir / "nemo_gym_metrics.json",
             container=_format_container(
-                self.config.container_formatter, task_name, problem_info.get("docker_image", "ubuntu:22.04"),
+                self.config.container_formatter,
+                task_name,
+                problem_info.get("docker_image", "ubuntu:22.04"),
                 runtime_image=problem_info.get("runtime_image"),
             ),
             ray_queue_timestamp=time.time(),

@@ -44,6 +44,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputMessage,
     accumulate_response_usage,
 )
+from nemo_gym.policy_completion import notify_policy_phase_done
 from nemo_gym.rollout_correlation import (
     FAILURE_ROLLOUT_HEADER,
     FAILURE_TOOL_CALL_HEADER,
@@ -380,6 +381,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         await raise_for_status(response)
         model_response_json = await get_response_json(response)
         cookies = response.cookies
+        await notify_policy_phase_done(body.responses_create_params)
 
         trajectory = None
         expected_rollout_id = self.rollout_id_from_run(body)

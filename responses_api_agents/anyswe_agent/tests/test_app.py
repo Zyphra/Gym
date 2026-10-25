@@ -25,6 +25,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+from nemo_gym.rollout_observability import (
+    AgentObservationBundle,
+    ToolCallObservation,
+)
+from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxHandle
+from nemo_gym.sandbox.episode import EPISODE_MEMORY_HEADROOM_MIB
 from responses_api_agents.anyswe_agent.agent_runner import (
     _agent_request,
     _extract_patch,
@@ -51,13 +58,6 @@ from responses_api_agents.anyswe_agent.app import (
     _write_grader_receipt,
 )
 from responses_api_agents.anyswe_agent.prepare import _to_gym_row
-
-from nemo_gym.rollout_observability import (
-    AgentObservationBundle,
-    ToolCallObservation,
-)
-from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxHandle
-from nemo_gym.sandbox.episode import EPISODE_MEMORY_HEADROOM_MIB
 
 
 def _config(**overrides) -> AnySweAgentConfig:
@@ -283,7 +283,9 @@ def test_saved_response_preserves_standardized_agent_observations(tmp_path) -> N
 def test_saved_harness_failure_is_typed_and_masked(tmp_path, index: int) -> None:
     from nemo_gym import PARENT_DIR
 
-    raw = json.loads((PARENT_DIR / "tests/unit_tests/fixtures/sandbox-harness-failures.json").read_text())[index]["response"]
+    raw = json.loads((PARENT_DIR / "tests/unit_tests/fixtures/sandbox-harness-failures.json").read_text())[index][
+        "response"
+    ]
     path = tmp_path / "response.json"
     path.write_text(json.dumps(raw))
     saved, observations = _read_saved_response(path)
@@ -360,10 +362,10 @@ def test_private_grader_contract_is_typed() -> None:
 
 async def test_private_setup_stages_only_planned_inputs(tmp_path, monkeypatch) -> None:
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent import app as app_module
 
     from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
 
     head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
     config = _config(
@@ -453,10 +455,10 @@ async def test_private_grader_external_runtime_uses_plan_workdir(tmp_path, monke
     import tarfile
 
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent import app as app_module
 
     from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
 
     archive = tmp_path / "hermes-runtime.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
@@ -527,10 +529,10 @@ async def test_private_grader_external_runtime_uses_plan_workdir(tmp_path, monke
 
 async def test_private_setup_timeout_is_retained_and_classified(tmp_path, monkeypatch) -> None:
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent import app as app_module
 
     from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
 
     head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
     config = _config(
@@ -597,10 +599,10 @@ async def test_private_setup_timeout_is_retained_and_classified(tmp_path, monkey
 )
 async def test_private_grader_return_code_contract(tmp_path, monkeypatch, result, expected) -> None:
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent import app as app_module
 
     from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
 
     head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
     config = _config(
@@ -653,10 +655,10 @@ async def test_private_grader_return_code_contract(tmp_path, monkeypatch, result
 async def test_private_grader_records_its_sandbox_memory_events(tmp_path, monkeypatch) -> None:
     """A grader the memory limit killed is told apart from a setup or scoring failure by its own events."""
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent import app as app_module
 
     from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
 
     head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
     config = _config(
@@ -700,7 +702,9 @@ async def test_private_grader_records_its_sandbox_memory_events(tmp_path, monkey
             assert self.closed, "events are read after the sandbox is stopped"
             return {"low": 0, "high": 0, "max": 12, "oom": 1, "oom_kill": 1}
 
-    monkeypatch.setattr(app_module, "AsyncSandbox", lambda provider, spec: AsyncSandbox(RetainedEventsProvider(), spec))
+    monkeypatch.setattr(
+        app_module, "AsyncSandbox", lambda provider, spec: AsyncSandbox(RetainedEventsProvider(), spec)
+    )
     assert await agent._grade_private_patch(params, "model patch") == (
         False,
         "grader",
@@ -721,9 +725,8 @@ async def test_private_grader_records_its_sandbox_memory_events(tmp_path, monkey
 @pytest.mark.skipif(not os.environ.get("ANYSWE_PATCH_PROBE_PARAMS"), reason="requires admitted SIF fixtures")
 @pytest.mark.parametrize("case_index", [0, 1])
 async def test_patch_baseline_in_admitted_sif(tmp_path, case_index):
-    from responses_api_agents.anyswe_agent.app import AnySweInstanceConfig
-
     from nemo_gym.sandbox import AsyncSandbox
+    from responses_api_agents.anyswe_agent.app import AnySweInstanceConfig
 
     paths = json.loads(Path(os.environ["ANYSWE_PATCH_PROBE_PARAMS"]).read_text())
     payload = json.loads(Path(paths[case_index]).read_text())
@@ -1427,10 +1430,10 @@ async def test_sandbox_error_detail_reaches_metrics(tmp_path) -> None:
 
     import pytest
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent.app import _MAX_ERROR_DETAIL_CHARS, _error_detail
 
     from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent.app import _MAX_ERROR_DETAIL_CHARS, _error_detail
 
     binary = shutil.which("apptainer")
     if not binary:
@@ -1484,10 +1487,10 @@ async def test_expected_budget_stop_keeps_graded_patch(
     tmp_path, monkeypatch, episode_submissions, stop_reason, grader_error, expected_mask
 ):
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent import app as app_module
 
     from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
 
     head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
     config = _config(
@@ -1531,8 +1534,17 @@ async def test_expected_budget_stop_keeps_graded_patch(
             destination.write_text(saved.model_dump_json() if source.endswith("response.json") else patch)
 
     graded = []
+    boundaries = []
+
+    async def policy_done(params):
+        assert params is not None
+        boundaries.append("policy_done")
+        return True
+
+    monkeypatch.setattr(app_module, "notify_policy_phase_done", policy_done)
 
     async def grade(self, params, received):
+        assert boundaries == ["policy_done"]
         graded.append(received)
         if grader_error == "raised_runtime":
             raise RuntimeError("verifier cleanup failed")
@@ -1557,7 +1569,14 @@ async def test_expected_budget_stop_keeps_graded_patch(
         assert result.error_kind == "grader"
         assert result.error_detail
     assert result.agent_stop_reason == stop_reason
-    assert 0 < result.submitted_at <= result.task_started_at <= result.sandbox_ready_at <= result.grading_started_at <= result.grading_completed_at
+    assert (
+        0
+        < result.submitted_at
+        <= result.task_started_at
+        <= result.sandbox_ready_at
+        <= result.grading_started_at
+        <= result.grading_completed_at
+    )
     assert result.agent_error_kind == ("max_iteration" if stop_reason else None)
 
 
@@ -1570,17 +1589,32 @@ async def test_expected_budget_stop_keeps_graded_patch(
         ("maximum iterations reached", True, False, None, "max_iteration", True),
         ("ContextWindowExceeded", False, True, None, "context_window", True),
         ("ContextWindowExceeded", False, True, "max_iterations", "context_window", True),
-        ("Context length exceeded (129,724 tokens). Cannot compress further.", False, True, "context_exhausted", "context_window", False),
+        (
+            "Context length exceeded (129,724 tokens). Cannot compress further.",
+            False,
+            True,
+            "context_exhausted",
+            "context_window",
+            False,
+        ),
     ],
 )
 async def test_only_declared_failures_affect_a_verified_patch(
-    tmp_path, monkeypatch, episode_submissions, text, process_failed, declared_error, stop_reason, expected_kind, expected_mask
+    tmp_path,
+    monkeypatch,
+    episode_submissions,
+    text,
+    process_failed,
+    declared_error,
+    stop_reason,
+    expected_kind,
+    expected_mask,
 ):
     from omegaconf import OmegaConf
-    from responses_api_agents.anyswe_agent import app as app_module
 
     from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
 
     head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
     config = _config(
@@ -1656,9 +1690,12 @@ async def test_only_declared_failures_affect_a_verified_patch(
 @pytest.mark.parametrize(
     "agent_return_code,oom_kill,infrastructure,startup,max_events",
     [(0, 1, False, False, 9), (137, 2, False, False, 9), (137, 0, False, False, 9), (137, 2, True, True, 9)]
-    + [pytest.param(raw["return_code"], raw["sandbox_oom_kill"], False, False,
-                    raw["sandbox_memory_max_events"], id=raw["name"])
-       for raw in json.loads((Path(__file__).parent / "fixtures/harness-memory-limit.json").read_text())],
+    + [
+        pytest.param(
+            raw["return_code"], raw["sandbox_oom_kill"], False, False, raw["sandbox_memory_max_events"], id=raw["name"]
+        )
+        for raw in json.loads((Path(__file__).parent / "fixtures/harness-memory-limit.json").read_text())
+    ],
 )
 async def test_memory_limit_death_after_harness_admission_is_zero_and_startup_is_infrastructure(
     tmp_path, monkeypatch, episode_submissions, agent_return_code, oom_kill, infrastructure, startup, max_events
@@ -1682,8 +1719,14 @@ async def test_memory_limit_death_after_harness_admission_is_zero_and_startup_is
         model="test-model", input="Fix it", metadata={"instance_id": "test__test-1", "problem_statement": "Fix it"}
     )
     saved = NeMoGymResponse(
-        id="r", created_at=1, model="test-model", object="response", output=[],
-        parallel_tool_calls=False, tool_choice="auto", tools=[],
+        id="r",
+        created_at=1,
+        model="test-model",
+        object="response",
+        output=[],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
     )
     patch = "diff --git a/fixed.txt b/fixed.txt\n+fixed\n"
 
@@ -1723,11 +1766,17 @@ async def test_memory_limit_death_after_harness_admission_is_zero_and_startup_is
         graded.append(received)
         return True, None, None
 
-    monkeypatch.setattr(app_module, "AsyncSandbox", lambda provider, spec: AsyncSandbox(RetainedEventsProvider(), spec))
+    monkeypatch.setattr(
+        app_module, "AsyncSandbox", lambda provider, spec: AsyncSandbox(RetainedEventsProvider(), spec)
+    )
     monkeypatch.setattr(AnySweSandboxRunner, "_grade_sandbox_patch", grade)
     result = await agent.run(AnySweRunRequest(responses_create_params=body))
 
-    assert (result.sandbox_oom, result.sandbox_oom_kill, result.sandbox_memory_max_events) == (oom_kill, oom_kill, max_events)
+    assert (result.sandbox_oom, result.sandbox_oom_kill, result.sandbox_memory_max_events) == (
+        oom_kill,
+        oom_kill,
+        max_events,
+    )
     assert result.mask_sample is infrastructure
     if infrastructure:
         assert result.error_kind == "sandbox"
