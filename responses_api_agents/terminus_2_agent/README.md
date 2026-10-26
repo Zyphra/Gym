@@ -37,3 +37,9 @@ configuration. Harbor keeps the exact returned `reasoning_content` in retained
 assistant messages and echoes it on the next request, for training and evaluation.
 Compaction can discard old messages; retained messages keep their reasoning.
 The native summarization subagent's content-only prompt remains unchanged.
+
+A policy completion with an explicit terminal stop reason ends the episode, including when received during compaction. The completed trajectory remains available for grading; a permanent stop is not retried as recoverable context overflow.
+
+Length-limited completions keep their served reasoning and token metadata when
+Harbor appends the truncated answer and asks again. Only the unchanged prefix and
+exact truncated answer qualify; edited or compacted histories are not repaired.

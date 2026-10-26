@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from copy import deepcopy
 from typing import Any, cast
 
 import httpx
@@ -49,6 +50,10 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
 
+class EpisodeTerminatedError(RuntimeError):
+    """The policy episode ended; compaction cannot reopen it."""
+
+
 class NemoGymLLM(BaseLLM):
     """LLM backend that calls NeMo Gym model servers via chat completions."""
 
@@ -75,6 +80,7 @@ class NemoGymLLM(BaseLLM):
         self._http_client: httpx.AsyncClient | None = None
 
         # The next turn sends these back for vLLM on-policy correction.
+        self._length_limited_turn: tuple[list[dict[str, Any]], dict[str, Any]] | None = None
         self._last_prompt_token_ids: list[int] | None = None
         self._last_completion_token_ids: list[int] | None = None
         self._last_logprobs: list[float] | None = None
@@ -83,6 +89,7 @@ class NemoGymLLM(BaseLLM):
         self._ambiguous_routed_expert_keys: set[_RolloutDetailsKey] = set()
 
         self.context_length_exceeded = False
+        self.terminal_stop_reason: str | None = None
         self.model_transport_error: str | None = None
         self._extra_chat_params = self._build_extra_chat_params(responses_create_params or {})
 
@@ -93,6 +100,7 @@ class NemoGymLLM(BaseLLM):
             retry_if_exception_type(Exception)
             & retry_if_not_exception_type(
                 (
+                    EpisodeTerminatedError,
                     ContextLengthExceededError,
                     OutputLengthExceededError,
                 )
@@ -106,8 +114,23 @@ class NemoGymLLM(BaseLLM):
         message_history: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> LLMResponse:
+        if self.terminal_stop_reason is not None:
+            raise EpisodeTerminatedError(self.terminal_stop_reason)
         if message_history is None:
             message_history = []
+        if self._length_limited_turn is not None:
+            prefix, served = self._length_limited_turn
+            index = len(prefix)
+            # Harbor's length-retry handler appends only truncated_response.
+            # Carry the same served reasoning on that exact turn before sending
+            # history again. A compacted or edited history is never repaired.
+            if (
+                len(message_history) > index
+                and message_history[:index] == prefix
+                and message_history[index] == {"role": "assistant", "content": served["content"]}
+            ):
+                message_history[index].update(served)
+            self._length_limited_turn = None
         messages = message_history + [{"role": "user", "content": prompt}]
 
         # Attach the prior generation metadata used by vLLM to replace prefix tokens.
@@ -138,6 +161,14 @@ class NemoGymLLM(BaseLLM):
 
         choices = response_dict.get("choices", [])
         choice = choices[0] if isinstance(choices, list) and choices else {}
+        if (
+            isinstance(choice, dict)
+            and choice.get("stop_reason")
+            and (response_dict.get("usage") or {}).get("completion_tokens") == 0
+        ):
+            self.terminal_stop_reason = str(choice["stop_reason"])
+            self.context_length_exceeded = self.terminal_stop_reason == "context_exhausted"
+            raise EpisodeTerminatedError(self.terminal_stop_reason)
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
         content = message.get("content", "") if isinstance(message, dict) else ""
         if content is None:
@@ -161,12 +192,6 @@ class NemoGymLLM(BaseLLM):
 
         usage = self._extract_usage_info(response_dict)
         record_served_context(self, messages, content, usage)
-        if isinstance(choice, dict) and choice.get("finish_reason") == "length":
-            raise OutputLengthExceededError(
-                f"Model {self._model_name} hit max_tokens limit. "
-                "Response was truncated. Consider increasing max_tokens if possible.",
-                truncated_response=content,
-            )
 
         prompt_token_ids = None
         completion_token_ids = None
@@ -184,6 +209,22 @@ class NemoGymLLM(BaseLLM):
                 completion_token_ids,
                 logprobs,
                 routed_experts,
+            )
+
+        if isinstance(choice, dict) and choice.get("finish_reason") == "length":
+            if reasoning_content is not None:
+                self._length_limited_turn = (
+                    deepcopy(messages),
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "reasoning_content": reasoning_content,
+                    },
+                )
+            raise OutputLengthExceededError(
+                f"Model {self._model_name} hit max_tokens limit. "
+                "Response was truncated. Consider increasing max_tokens if possible.",
+                truncated_response=content,
             )
 
         return LLMResponse(
