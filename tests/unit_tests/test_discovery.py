@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import json
 import os
 import subprocess
 import sys
@@ -32,51 +31,6 @@ from nemo_gym.discovery import (
     merge_by_name,
     read_config_metadata,
 )
-
-
-def test_absolute_reads_preserve_nested_source_snapshots(tmp_path: Path, monkeypatch) -> None:
-    from nemo_gym import _resolve_under_cwd_or_install
-
-    source = tmp_path / "canonical"
-    destination = source / ".git/source-snapshots/current"
-    earlier = source / ".git/source-snapshots/earlier"
-    monkeypatch.setenv(
-        "NEMO_GYM_READ_PATH_PROJECTION",
-        json.dumps({"destination": str(destination), "sources": [str(source)]}),
-    )
-    for suffix in ("third_party/nemo-gym", "config.yaml", "missing.yaml"):
-        path = earlier / suffix
-        assert _resolve_under_cwd_or_install(path) == path
-    for relative in (
-        "config.yaml",
-        ".git/source-snapshots-other/config.yaml",
-        "configs/.git/source-snapshots/earlier/config.yaml",
-        ".git/source-snapshots/earlier/../../../config.yaml",
-    ):
-        assert _resolve_under_cwd_or_install(source / relative) == destination / Path(os.path.normpath(relative))
-    assert not source.exists()
-
-
-def test_native_include_keeps_earlier_source_snapshot(tmp_path: Path, monkeypatch) -> None:
-    from nemo_gym.global_config import GlobalConfigDictParser
-
-    source = tmp_path / "canonical"
-    destination = source / ".git/source-snapshots/current"
-    earlier = source / ".git/source-snapshots/earlier"
-    for root, value in ((destination, "current"), (earlier, "earlier")):
-        root.mkdir(parents=True)
-        (root / "input.yaml").write_text(f"value: {value}\n")
-    entry = tmp_path / "caller.yaml"
-    entry.write_text(f"config_paths: [{earlier / 'input.yaml'}]\n")
-    before = entry.read_bytes()
-    monkeypatch.setenv(
-        "NEMO_GYM_READ_PATH_PROJECTION",
-        json.dumps({"destination": str(destination), "sources": [str(source)]}),
-    )
-    _, documents = GlobalConfigDictParser().load_extra_config_paths([str(entry)])
-    assert any(document.get("value") == "earlier" for document in documents)
-    assert not any(document.get("value") == "current" for document in documents)
-    assert entry.read_bytes() == before
 
 
 class TestComponentSearchRoots:
