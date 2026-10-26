@@ -19,7 +19,7 @@ from time import perf_counter, time
 from typing import Any, List
 
 from fastapi import Request, Response
-from pydantic import ConfigDict, ValidationError
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from nemo_gym.base_resources_server import (
     AggregateMetrics,
@@ -64,6 +64,16 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
     max_steps: int = None
+    system_prompt_suffix: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _check_system_prompt_suffix(self):
+        if self.system_prompt_suffix is not None:
+            if not self.system_prompt_suffix.strip():
+                raise ValueError("system_prompt_suffix must not be blank")
+            if "{max_steps}" in self.system_prompt_suffix and (self.max_steps is None or self.max_steps < 1):
+                raise ValueError("a {max_steps} instruction requires positive max_steps")
+        return self
 
 
 class SimpleAgentRunRequest(BaseRunRequest):
@@ -101,6 +111,17 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
         if isinstance(body.input, str):
             body.input = [NeMoGymEasyInputMessage(role="user", content=body.input)]
+
+        if self.config.system_prompt_suffix is not None:
+            instructions = self.config.system_prompt_suffix.replace("{max_steps}", str(self.config.max_steps))
+            position = 0
+            while position < len(body.input):
+                message = body.input[position]
+                role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+                if role != "system":
+                    break
+                position += 1
+            body.input.insert(position, NeMoGymEasyInputMessage(role="system", content=instructions))
 
         new_outputs = []
         usage = None
