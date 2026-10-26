@@ -80,6 +80,7 @@ from nemo_gym.server_utils import get_response_json, raise_for_status
 from nemo_gym.tool_access import MCPToolAccess
 from responses_api_agents.hermes_agent.model_kwargs import _model_api_kwargs
 from responses_api_agents.hermes_agent.observability import HermesAgentObserver, normalize_hermes_messages
+from responses_api_agents.hermes_agent.policy_summary import bind_policy_summary
 
 
 def _trajectory_to_output_items(messages, n_input):
@@ -1000,6 +1001,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
             )
 
         agent._build_api_kwargs = _patched_build_api_kwargs
+        if self.config.compression_enabled:
+            bind_policy_summary(agent)
         observer = None
         if observation_collector is not None:
             try:
