@@ -1424,10 +1424,7 @@ def test_chat_completion_to_response_envelope_id(
     assert response.id == expected_id
 
 
-def test_chat_completion_to_response_reports_omitted_usage_details_as_zero(converter: ResponsesConverter):
-    # The Responses API types both details as integers and the Codex CLI rejects a null there
-    # (tests/unit_tests/test_responses_converter_usage_details.py). A converted response therefore
-    # cannot tell "not reported" from 0, so its capture cache signal reads as a reported miss.
+def test_chat_completion_to_response_preserves_unknown_usage_details(converter: ResponsesConverter):
     response = converter.chat_completion_to_response(
         responses_create_params=NeMoGymResponseCreateParamsNonStreaming(model="", input="hello"),
         chat_completion=NeMoGymChatCompletion(
@@ -1447,9 +1444,9 @@ def test_chat_completion_to_response_reports_omitted_usage_details_as_zero(conve
     )
 
     assert response.usage is not None
-    assert response.usage.input_tokens_details.cached_tokens == 0
-    assert response.usage.output_tokens_details.reasoning_tokens == 0
-    assert _cache_signal(response.usage.model_dump()) == (False, 0)
+    assert response.usage.input_tokens_details.cached_tokens is None
+    assert response.usage.output_tokens_details.reasoning_tokens is None
+    assert _cache_signal(response.usage.model_dump()) == (None, None)
 
 
 def test_chat_completion_to_response_preserves_native_finish_reason(converter: ResponsesConverter):
