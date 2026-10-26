@@ -112,7 +112,6 @@ class SWEBenchMetrics(SandboxMemoryEvents):
     eval_timed_out: Optional[bool] = None
     error_kind: Optional[str] = None
     error_detail: Optional[str] = None
-    artifact_path: Optional[str] = None
     mask_sample: Optional[bool] = None
 
     agent_run_time: Optional[float] = None
@@ -1010,7 +1009,6 @@ class AnySweSandboxRunner:
             sandbox_failed = True
             sandbox_error_kind = sandbox_error_kind or "sandbox"
             error_detail = _grading_exception_detail(params, exc)
-            error_path = params.persistent_dir / "sandbox_error.txt"
             update_metrics(
                 params.metrics_fpath,
                 {
@@ -1018,12 +1016,11 @@ class AnySweSandboxRunner:
                     "patch_exists": False,
                     "error_kind": sandbox_error_kind,
                     "error_detail": error_detail,
-                    "artifact_path": str(error_path),
                     "mask_sample": True,
                     "agent_run_time": time.time() - started,
                 },
             )
-            error_path.write_text(repr(exc))
+            (params.persistent_dir / "sandbox_error.txt").write_text(repr(exc))
         finally:
             try:
                 if sandbox is not None:

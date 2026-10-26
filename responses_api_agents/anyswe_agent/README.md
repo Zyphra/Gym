@@ -12,12 +12,6 @@ Zero and negative values are rejected rather than creating a permanently
 blocked queue. Other configurations retain the default 256 request limit.
 Sandbox resources and the model server retain their own admission controls.
 
-Sandbox failures retain their private exception in `sandbox_error.txt` under the
-request's results directory. The native response publishes only that file's
-`artifact_path` alongside the existing class-level error and mask, so callers
-can retain the locator without copying private diagnostics. A locator does not
-guarantee later file retention; responses that never reach this writer have none.
-
 ## Run
 
 Create `env.yaml` for the policy model:
