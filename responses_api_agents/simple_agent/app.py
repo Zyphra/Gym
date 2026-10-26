@@ -92,11 +92,17 @@ class SimpleAgentConfig(BaseResponsesAPIAgentConfig):
     max_steps: int = None
     presented_tools_only: bool = False
     final_answer_after_max_steps: bool = Field(default=False, strict=True)
+    system_prompt_suffix: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _check_finalization_limit(self):
         if self.final_answer_after_max_steps and (self.max_steps is None or self.max_steps < 1):
             raise ValueError("final_answer_after_max_steps requires a positive max_steps")
+        if self.system_prompt_suffix is not None:
+            if not self.system_prompt_suffix.strip():
+                raise ValueError("system_prompt_suffix must not be blank")
+            if "{max_steps}" in self.system_prompt_suffix and (self.max_steps is None or self.max_steps < 1):
+                raise ValueError("a {max_steps} instruction requires positive max_steps")
         return self
 
 
@@ -144,6 +150,17 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         if isinstance(body.input, str):
             body.input = [NeMoGymEasyInputMessage(role="user", content=body.input)]
 
+        if self.config.system_prompt_suffix is not None:
+            instructions = self.config.system_prompt_suffix.replace("{max_steps}", str(self.config.max_steps))
+            position = 0
+            while position < len(body.input):
+                message = body.input[position]
+                role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+                if role != "system":
+                    break
+                position += 1
+            body.input.insert(position, NeMoGymEasyInputMessage(role="system", content=instructions))
+
         new_outputs = []
         usage = None
         step = 0
@@ -154,9 +171,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
         while True:
             step += 1
             new_body = body.model_copy(update={"input": body.input + new_outputs})
-            final_answer_turn = bool(
-                self.config.final_answer_after_max_steps and step > self.config.max_steps
-            )
+            final_answer_turn = bool(self.config.final_answer_after_max_steps and step > self.config.max_steps)
             if final_answer_turn:
                 # Keep the offered tools: they render into the prompt, and the
                 # final turn must extend the same context. Only forbid calls.
@@ -252,7 +267,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 except (_UnpresentedToolError, _FinalAnswerToolError) as e:
                     tool_output = json.dumps({"error": str(e)})
                     if collect_trajectory:
-                        error_type = "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
+                        error_type = (
+                            "final_answer_tool_call" if isinstance(e, _FinalAnswerToolError) else "unpresented_tool"
+                        )
                         tool_status = "failed"
                 except (json.JSONDecodeError, TypeError) as e:
                     tool_output = json.dumps({"error": f"Invalid tool call arguments: {e!r}"})
@@ -266,7 +283,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                         url_path=f"/{output_function_call.name}",
                         json=parsed_arguments,
                         headers={
-                            FAILURE_ROLLOUT_HEADER: failure_log_metadata(current_rollout_id() or (rollout_id if rollout_id != "unscoped" else None)),
+                            FAILURE_ROLLOUT_HEADER: failure_log_metadata(
+                                current_rollout_id() or (rollout_id if rollout_id != "unscoped" else None)
+                            ),
                             FAILURE_TOOL_CALL_HEADER: failure_log_metadata(output_function_call.call_id),
                         },
                         cookies=resources_server_cookies,

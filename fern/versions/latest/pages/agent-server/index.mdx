@@ -53,3 +53,19 @@ See [Integrate Existing Agents](/agent-server/integrate-existing-agents) to use 
 [Agent Server Fields](/reference/configuration#agent-server-fields) for server configuration syntax and fields.
 
 </Note>
+
+
+## Simple Agent System Instructions
+
+The simple agent supports an optional `system_prompt_suffix`. It inserts a
+system message after existing leading system messages and before the user
+message, preserving the original task instructions. The default adds no message.
+The `{max_steps}` placeholder renders the configured positive `max_steps`.
+
+```yaml
+max_steps: 50
+system_prompt_suffix: "You have at most {max_steps} assistant turns to complete this task. Do not ask clarifying questions."
+```
+
+The suffix does not change native stop or final-answer behavior. Select it only
+for the agent configurations that need the additional instruction.
