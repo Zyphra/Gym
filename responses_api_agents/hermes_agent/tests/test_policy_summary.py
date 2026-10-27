@@ -3,10 +3,12 @@
 
 import asyncio
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
+import pytest
 from omegaconf import OmegaConf
 
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
@@ -373,3 +375,26 @@ def test_summary_request_without_template_kwargs_matches_policy_turns(monkeypatc
 
     assert "chat_template_kwargs" not in summary_body and "chat_template_kwargs" not in main_body
     assert summary_body["temperature"] == 0.3
+
+
+@pytest.mark.parametrize("target_ratio, expected", [(None, 0.20), (0.10, 0.10)])
+def test_compression_target_ratio_reaches_hermes_compressor(monkeypatch, tmp_path, target_ratio, expected):
+    import yaml
+
+    native_agents: list = []
+    summary = {
+        "status": 200,
+        "choice": {"message": {"role": "assistant", "content": SUMMARY_TEXT}, "finish_reason": "stop"},
+    }
+    with _PolicyFixture(summary) as policy:
+        extra = {} if target_ratio is None else {"compression_target_ratio": target_ratio}
+        app = _agent(tmp_path, monkeypatch, policy.server.server_port, native_agents, **extra)
+        config = yaml.safe_load((Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text())
+        assert config["compression"].get("target_ratio") == target_ratio
+        try:
+            _run(app, "rollout-ratio")
+        finally:
+            _close(native_agents)
+    compressor = native_agents[0].context_compressor
+    assert compressor.summary_target_ratio == expected
+    assert compressor.tail_token_budget == int(compressor.threshold_tokens * expected)
