@@ -40,7 +40,6 @@ from tqdm.auto import tqdm
 
 from nemo_gym import PARENT_DIR, _resolve_under_cwd_or_install, component_search_roots
 from nemo_gym.cli.setup_command import get_venv_path, run_command, setup_env_command
-from nemo_gym.runtime_workdir import component_launch_command
 from nemo_gym.cli.utils import (
     exit_cleanly_on_config_error,
     exit_unknown_component,
@@ -78,6 +77,7 @@ from nemo_gym.registry import (
     read_environment_details,
     resolve_catalog_entry,
 )
+from nemo_gym.runtime_workdir import component_launch_command
 from nemo_gym.server_status import StatusCommand
 from nemo_gym.server_utils import (
     HEAD_SERVER_KEY_NAME,
@@ -447,14 +447,18 @@ class RunHelper:  # pragma: no cover
 
             command = component_launch_command(
                 setup_env_command(dir_path, global_config_dict, top_level_path),
-                dir_path, entrypoint_fpath,
+                dir_path,
+                entrypoint_fpath,
                 runtime_root=self._runtime_workdir_root,
                 server_name=top_level_path,
                 environment={NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME: top_level_path},
             )
 
             process = run_command(
-                command, dir_path, server_name=top_level_path, start_new_session=True,
+                command,
+                dir_path,
+                server_name=top_level_path,
+                start_new_session=True,
                 global_config_file=global_config_file,
             )
             self._processes[top_level_path] = process

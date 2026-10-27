@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Copied FD seeds and native reference worlds share one payout contract."""
+
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -33,11 +34,18 @@ def seeded(configured_engine):
     for payout in ["monthly", "quarterly", "cumulative"]:
         deposit_id = "FD_SEED_" + payout
         customer["deposits"][deposit_id] = {
-            "deposit_id": deposit_id, "kind": "FD", "principal": 20000,
-            "rate": 6.8, "tenure_months": 12, "payout_type": payout,
+            "deposit_id": deposit_id,
+            "kind": "FD",
+            "principal": 20000,
+            "rate": 6.8,
+            "tenure_months": 12,
+            "payout_type": payout,
             "maturity_amount": json.loads(banking_tools.calculate_fd_maturity(20000, 6.8, 12))["maturity_amount"],
-            "status": "ACTIVE", "start_date": "2025-07-16", "maturity_date": "2026-07-16",
-            "maturity_instruction": "no_renewal", "payout_account": "SB0000000001",
+            "status": "ACTIVE",
+            "start_date": "2025-07-16",
+            "maturity_date": "2026-07-16",
+            "maturity_instruction": "no_renewal",
+            "payout_account": "SB0000000001",
         }
         customer["login_context"]["linked_products"].append(deposit_id)
     customer["deposits"]["RD_UNCHANGED"] = {"kind": "RD", "maturity_amount": 23456}
@@ -56,9 +64,11 @@ def test_only_periodic_contract_maturity_changes_in_independent_seed(seeded, ena
     if enabled:
         for payout in ["monthly", "quarterly"]:
             record = expected["customers"][CUSTOMER]["deposits"]["FD_SEED_" + payout]
-            record["maturity_amount"] = json.loads(banking_tools.calculate_fd_maturity(
-                record["principal"], record["rate"], record["tenure_months"], payout
-            ))["maturity_amount"]
+            record["maturity_amount"] = json.loads(
+                banking_tools.calculate_fd_maturity(
+                    record["principal"], record["rate"], record["tenure_months"], payout
+                )
+            )["maturity_amount"]
     assert episode["db"] == expected
     assert episode["fd_payout_consistency"] is enabled
     assert engine.get_base_db() == original
@@ -81,10 +91,20 @@ def test_native_matured_payout_and_gold_keep_seed_flag_after_reconfigure(seeded,
     assert account["available_balance"] == 70000
     assert account["transactions"][:-1] == original["customers"][CUSTOMER]["accounts"]["SB0000000001"]["transactions"]
     assert account["transactions"][-1]["amount"] == 20000
-    task = {"customer": CUSTOMER, "evaluation_criteria": {
-        "reward_basis": ["ACTION", "DB"], "actions": [{"name": "close_deposit", "arguments": arguments}]}}
-    store = {reward_mod.WORLD_KEY: episode, reward_mod.TASK_KEY: task,
-             "nl_history": [{"role": "assistant", "content": f"Deposit {deposit_id} is closed; INR 20000 was paid to SB0000000001."}]}
+    task = {
+        "customer": CUSTOMER,
+        "evaluation_criteria": {
+            "reward_basis": ["ACTION", "DB"],
+            "actions": [{"name": "close_deposit", "arguments": arguments}],
+        },
+    }
+    store = {
+        reward_mod.WORLD_KEY: episode,
+        reward_mod.TASK_KEY: task,
+        "nl_history": [
+            {"role": "assistant", "content": f"Deposit {deposit_id} is closed; INR 20000 was paid to SB0000000001."}
+        ],
+    }
     assert reward_mod.score_trajectory(store)["strict"] == 1
     noop = engine.seed_world(CUSTOMER, fd_payout_consistency=True)
     assert reward_mod.score_trajectory(store | {reward_mod.WORLD_KEY: noop})["strict"] == 0
@@ -128,9 +148,11 @@ def test_empty_gold_db_reference_uses_episode_seed_not_later_global(seeded, enab
     path, source_bytes, original = seeded
     episode = engine.seed_world(CUSTOMER, fd_payout_consistency=enabled)
     engine.configure(db_path=str(path), kb_path=engine._KB_PATH, fd_payout_consistency=not enabled)
-    store = {reward_mod.WORLD_KEY: episode, reward_mod.TASK_KEY: {
-        "customer": CUSTOMER, "evaluation_criteria": {"reward_basis": ["DB"], "actions": []}},
-        "nl_history": [{"role": "assistant", "content": "No deposit changes were made."}]}
+    store = {
+        reward_mod.WORLD_KEY: episode,
+        reward_mod.TASK_KEY: {"customer": CUSTOMER, "evaluation_criteria": {"reward_basis": ["DB"], "actions": []}},
+        "nl_history": [{"role": "assistant", "content": "No deposit changes were made."}],
+    }
     assert reward_mod.score_trajectory(store)["strict"] == 1
     assert engine.get_base_db() == original
     assert path.read_bytes() == source_bytes

@@ -603,8 +603,11 @@ async def _request_with_retries(
         deadline = _GLOBAL_AIOHTTP_MODEL_REQUEST_TIMEOUT_S
         total = min(existing.total, deadline) if existing.total and existing.total > 0 else deadline
         kwargs["timeout"] = ClientTimeout(
-            total=total, connect=existing.connect, sock_read=existing.sock_read,
-            sock_connect=existing.sock_connect, ceil_threshold=existing.ceil_threshold,
+            total=total,
+            connect=existing.connect,
+            sock_read=existing.sock_read,
+            sock_connect=existing.sock_connect,
+            ceil_threshold=existing.ceil_threshold,
         )
     # A transport failure cannot tell us whether a stateful operation committed.
     # Only reads or operations explicitly declared repeat-safe may be replayed;
@@ -815,8 +818,10 @@ class ServerClient(BaseModel):
         observability_enabled = self.global_config_dict.get(OBSERVABILITY_ENABLED_KEY_NAME, False)
         server_entry = self.global_config_dict.get(server_name)
         model_path = url_path.partition("?")[0].rstrip("/")
-        if server_entry is not None and "responses_api_models" in server_entry and model_path.endswith(
-            ("/responses", "/chat/completions", "/completions", "/messages")
+        if (
+            server_entry is not None
+            and "responses_api_models" in server_entry
+            and model_path.endswith(("/responses", "/chat/completions", "/completions", "/messages"))
         ):
             kwargs["_model_request"] = True
         rollout_id = current_rollout_id()

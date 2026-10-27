@@ -47,11 +47,6 @@ from typing import Any, Literal, Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict
-from resources_servers.over_refusal_detection.util import (
-    NEMOTRON_SAFETY_TAXONOMY,
-    extract_last_assistant_text,
-    extract_safe_prompt,
-)
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -65,6 +60,11 @@ from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
+)
+from resources_servers.over_refusal_detection.util import (
+    NEMOTRON_SAFETY_TAXONOMY,
+    extract_last_assistant_text,
+    extract_safe_prompt,
 )
 
 

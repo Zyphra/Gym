@@ -648,8 +648,11 @@ class StructuredOutputsResourcesServer(SimpleResourcesServer):
         if "array" in types:
             items = schema.get("items", {})
             return [self.csv_record(dict(zip(header, r)), items) for r in body]
-        if len(header) >= 2 and header[-1].lower() in ("value", "values") and len(body) >= 1 and not (
-            set(header) & set((schema.get("properties") or {}).keys())
+        if (
+            len(header) >= 2
+            and header[-1].lower() in ("value", "values")
+            and len(body) >= 1
+            and not (set(header) & set((schema.get("properties") or {}).keys()))
         ):
             obj: Dict[str, Any] = {}
             for r in body:

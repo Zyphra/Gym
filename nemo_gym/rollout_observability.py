@@ -263,7 +263,9 @@ def harness_response_error(
         and any(record.parent_invocation_id is None and record.status == "failed" for record in invocations)
         and not any(record.model_calls for record in invocations)
     ):
-        return response.error or ResponseError(code="server_error", message="Harness failed without any recorded model call")
+        return response.error or ResponseError(
+            code="server_error", message="Harness failed without any recorded model call"
+        )
     return None
 
 

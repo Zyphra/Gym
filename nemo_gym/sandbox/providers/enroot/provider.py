@@ -23,7 +23,6 @@ liveness, ``#``-registry URIs, pinned ``ENROOT_*`` paths).
 """
 
 import asyncio
-from nemo_gym.sandbox.providers.base import notify_exec_timeout
 import contextlib
 import hashlib
 import logging
@@ -48,6 +47,7 @@ from nemo_gym.sandbox.providers.base import (
     SandboxResources,
     SandboxSpec,
     SandboxStatus,
+    notify_exec_timeout,
 )
 from nemo_gym.sandbox.providers.utils import coerce_config as _coerce_config
 from nemo_gym.sandbox.providers.utils import path_under_mount as _path_under_mount
@@ -392,9 +392,13 @@ class EnrootProvider:
             return_code = proc.returncode if proc.returncode is not None else SANDBOX_RUNTIME_RETURN_CODE
             if capture_facts is not None:
                 limit = self._exec_config.max_output_bytes
-                capture_facts.update(stdout_bytes=len(stdout_b), stderr_bytes=len(stderr_b),
-                                     stdout_truncated=len(stdout_b) > limit,
-                                     stderr_truncated=len(stderr_b) > limit, capture_complete=True)
+                capture_facts.update(
+                    stdout_bytes=len(stdout_b),
+                    stderr_bytes=len(stderr_b),
+                    stdout_truncated=len(stdout_b) > limit,
+                    stderr_truncated=len(stderr_b) > limit,
+                    capture_complete=True,
+                )
                 stdout_b, stderr_b = stdout_b[:limit], stderr_b[:limit]
             return return_code, stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace")
 
@@ -770,8 +774,9 @@ class EnrootProvider:
 
         capture_facts: dict[str, int | bool] = {}
         try:
-            code, out, err = await self._run(argv, timeout_s=effective_timeout, stdin=stdin,
-                                             capture_facts=capture_facts, environment=merged_env)
+            code, out, err = await self._run(
+                argv, timeout_s=effective_timeout, stdin=stdin, capture_facts=capture_facts, environment=merged_env
+            )
         except TimeoutError as e:
             return SandboxExecResult(
                 stdout=None,
@@ -787,8 +792,7 @@ class EnrootProvider:
                 return_code=SANDBOX_RUNTIME_RETURN_CODE,
                 error_type="sandbox",
             )
-        return SandboxExecResult(stdout=out, stderr=err, return_code=code, error_type=None,
-                                 **capture_facts)
+        return SandboxExecResult(stdout=out, stderr=err, return_code=code, error_type=None, **capture_facts)
 
     async def upload_file(self, handle: SandboxHandle, source_path: Path, target_path: str) -> None:
         """Upload one host file into the sandbox.

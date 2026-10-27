@@ -144,12 +144,16 @@ from typing_extensions import TypedDict
 
 from nemo_gym.server_utils import (
     _GLOBAL_AIOHTTP_CLIENT_REQUEST_DEBUG,
-    RATE_LIMIT_ERROR_CODES as RATE_LIMIT_ERROR_CODES,
-    RETRY_ERROR_CODES as RETRY_ERROR_CODES,
     ClientResponse,
     get_response_json,
     raise_for_status,
     request,
+)
+from nemo_gym.server_utils import (
+    RATE_LIMIT_ERROR_CODES as RATE_LIMIT_ERROR_CODES,
+)
+from nemo_gym.server_utils import (
+    RETRY_ERROR_CODES as RETRY_ERROR_CODES,
 )
 
 
@@ -1225,6 +1229,7 @@ class NeMoGymChatCompletionCreateParamsNonStreaming(BaseModel):
 # Clients
 ########################################
 
+
 class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
     """This is just a stub class that wraps around aiohttp"""
 
@@ -1252,9 +1257,9 @@ class NeMoGymAsyncOpenAI(BaseModel):  # pragma: no cover
     async def _request(self, **request_kwargs: Dict) -> ClientResponse:
         from nemo_gym.rollout_correlation import current_rollout_id
 
-        if request_kwargs.get("method", "").upper() == "POST" and urlsplit(
-            request_kwargs["url"]
-        ).path.rstrip("/").endswith(("/responses", "/chat/completions", "/completions", "/messages")):
+        if request_kwargs.get("method", "").upper() == "POST" and urlsplit(request_kwargs["url"]).path.rstrip(
+            "/"
+        ).endswith(("/responses", "/chat/completions", "/completions", "/messages")):
             request_kwargs["_model_request"] = True
 
         request_headers = request_kwargs.pop("headers", {})

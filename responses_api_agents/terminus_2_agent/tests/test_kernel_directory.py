@@ -13,16 +13,16 @@ import pytest
 import uvloop
 from aiohttp import web
 from omegaconf import OmegaConf
+
+from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.server_utils import ServerClient
 from responses_api_agents.terminus_2_agent.app import (
     LocalEnvironment,
     Terminus2Agent,
     Terminus2AgentConfig,
     _require_directory,
 )
-
-from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
-from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.server_utils import ServerClient
 
 
 @pytest.mark.parametrize("loop_factory", [asyncio.new_event_loop, uvloop.new_event_loop])

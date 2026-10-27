@@ -365,10 +365,15 @@ class TestRunHelperShutdownReap:
     @staticmethod
     def _interrupt_ignoring_child() -> Popen:
         process = Popen(
-            [sys.executable, "-u", "-c",
-             "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
-             "print('ready', flush=True); time.sleep(30)"],
-            stdout=PIPE, stderr=PIPE,
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(30)",
+            ],
+            stdout=PIPE,
+            stderr=PIPE,
         )
         try:
             assert process.stdout is not None and process.stdout.readline() == b"ready\n"
@@ -417,18 +422,30 @@ signal.pause()
         )
         ready = tmp_path / "ready"
         stopped = tmp_path / "stopped"
-        config = OmegaConf.create({
-            "uv_cache_dir": str(tmp_path / "cache"),
-            "nemo_gym_log_dir": str(tmp_path / "logs"),
-        })
-        command = " ".join(shlex.quote(part) for part in (
-            sys.executable, "-u", str(app), str(ready), str(stopped),
-            "1" if ignores_interrupt else "0",
-        ))
+        config = OmegaConf.create(
+            {
+                "uv_cache_dir": str(tmp_path / "cache"),
+                "nemo_gym_log_dir": str(tmp_path / "logs"),
+            }
+        )
+        command = " ".join(
+            shlex.quote(part)
+            for part in (
+                sys.executable,
+                "-u",
+                str(app),
+                str(ready),
+                str(stopped),
+                "1" if ignores_interrupt else "0",
+            )
+        )
         sibling = Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         process = run_command(
-            command, tmp_path, server_name="owned_server",
-            global_config_dict=config, start_new_session=True,
+            command,
+            tmp_path,
+            server_name="owned_server",
+            global_config_dict=config,
+            start_new_session=True,
         )
         try:
             deadline = monotonic() + 5
@@ -539,9 +556,9 @@ print("ready", flush=True)
 signal.pause()
 """
         process = Popen(
-            [sys.executable, "-u", "-c", child,
-             "ignore" if child_status is None else str(child_status)],
-            stdout=PIPE, stderr=PIPE,
+            [sys.executable, "-u", "-c", child, "ignore" if child_status is None else str(child_status)],
+            stdout=PIPE,
+            stderr=PIPE,
         )
         try:
             assert process.stdout is not None and process.stdout.readline() == b"ready\n"
@@ -553,7 +570,7 @@ signal.pause()
             output = capsys.readouterr().out
             assert (
                 f'[gym-child-exit] name="server" pid={process.pid} returncode={raw} '
-                f'forced_kill={str(child_status is None).lower()} reaped=true'
+                f"forced_kill={str(child_status is None).lower()} reaped=true"
             ) in output
             assert runner._processes == {}
             assert not Path(f"/proc/{process.pid}").exists()

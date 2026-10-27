@@ -348,7 +348,6 @@ class TestStandaloneTerminus2:
             await agent._handle_llm_interaction()
         assert agent.finished_naturally is False
 
-
     @pytest.mark.asyncio
     async def test_swallowed_agent_error_is_named(self) -> None:
         agent = object.__new__(StandaloneTerminus2)
@@ -483,7 +482,11 @@ class TestResponses:
         assert response.metadata["agent_error"] == "RuntimeError"
 
         response_json = response.model_dump(mode="json")
-        verify_json = {"responses_create_params": body.model_dump(mode="json"), "response": response_json, "reward": 0.0}
+        verify_json = {
+            "responses_create_params": body.model_dump(mode="json"),
+            "response": response_json,
+            "reward": 0.0,
+        }
         agent.server_client.post = AsyncMock(return_value=MagicMock(cookies={}))
         with (
             patch("responses_api_agents.terminus_2_agent.app.raise_for_status", new=AsyncMock()),
@@ -514,7 +517,9 @@ class TestResponses:
 
         with patch.object(Terminus2, "run", new=AsyncMock(return_value=None)):
             await agent.run("task", MagicMock(), AgentContext())
-        agent.logger.warning.assert_called_once_with("Model client close failed: %s: %s", "OSError", llm.aclose.side_effect)
+        agent.logger.warning.assert_called_once_with(
+            "Model client close failed: %s: %s", "OSError", llm.aclose.side_effect
+        )
 
     @pytest.mark.asyncio
     async def test_direct_response_waits_for_concurrency_slot(self) -> None:
@@ -581,7 +586,9 @@ def _setup_agent(logs_dir: Path) -> StandaloneTerminus2:
 
 def _path_without_tmux() -> str:
     return os.pathsep.join(
-        entry for entry in os.environ.get("PATH", "").split(os.pathsep) if entry and not (Path(entry) / "tmux").exists()
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and not (Path(entry) / "tmux").exists()
     )
 
 

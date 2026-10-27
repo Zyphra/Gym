@@ -341,8 +341,10 @@ def _bind_policy_summary(agent) -> None:
         choice = response.choices[0]
         content = choice.message.content
         if (
-            choice.finish_reason != "stop" or choice.message.tool_calls
-            or not isinstance(content, str) or not content.strip()
+            choice.finish_reason != "stop"
+            or choice.message.tool_calls
+            or not isinstance(content, str)
+            or not content.strip()
         ):
             raise RuntimeError("Hermes policy summary was empty, truncated, or emitted tool calls")
         return content

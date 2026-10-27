@@ -1204,6 +1204,7 @@ async def test_exec_removes_empty_leaf_from_sandbox_owner(
     assert not leaf.path.exists()
     assert handle.raw.cgroup.exec_leaves == {}
 
+
 async def test_bounded_exec_capture_drains_oversized_first_chunk_on_both_streams(fake_binary: str) -> None:
     provider = apptainer_provider.ApptainerProvider(exec={"max_output_bytes": 8})
     facts: dict[str, int | bool] = {}
@@ -1217,16 +1218,16 @@ async def test_bounded_exec_capture_drains_oversized_first_chunk_on_both_streams
     )
     assert code == 0 and stdout == "A" * 8 and stderr == "B" * 8
     assert facts == {
-        "stdout_bytes": 131072, "stderr_bytes": 131073,
-        "stdout_truncated": True, "stderr_truncated": True,
+        "stdout_bytes": 131072,
+        "stderr_bytes": 131073,
+        "stdout_truncated": True,
+        "stderr_truncated": True,
         "capture_complete": True,
     }
 
 
 async def test_bounded_exec_capture_retains_partial_output_on_timeout(fake_binary: str) -> None:
-    provider = apptainer_provider.ApptainerProvider(
-        exec={"max_output_bytes": 8, "timeout_grace_s": 0}
-    )
+    provider = apptainer_provider.ApptainerProvider(exec={"max_output_bytes": 8, "timeout_grace_s": 0})
     facts: dict[str, int | bool] = {}
     script = (
         "import sys,time; "
@@ -1234,21 +1235,20 @@ async def test_bounded_exec_capture_retains_partial_output_on_timeout(fake_binar
         "sys.stderr.write('detail'); sys.stderr.flush(); time.sleep(30)"
     )
     with pytest.raises(apptainer_provider._CapturedTimeout) as raised:
-        await provider._run([shutil.which("python3"), "-c", script],
-                            timeout_s=0.2, capture_facts=facts)
+        await provider._run([shutil.which("python3"), "-c", script], timeout_s=0.2, capture_facts=facts)
     assert raised.value.stdout == "head" and raised.value.stderr == "detail"
     assert facts == {
-        "stdout_bytes": 4, "stderr_bytes": 6,
-        "stdout_truncated": False, "stderr_truncated": False,
+        "stdout_bytes": 4,
+        "stderr_bytes": 6,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
         "capture_complete": True,
     }
 
 
 async def test_default_exec_capture_keeps_full_output_and_old_result_shape(fake_binary: str) -> None:
     provider = apptainer_provider.ApptainerProvider()
-    code, stdout, stderr = await provider._run(
-        [shutil.which("python3"), "-c", "print('X' * 50000)"], timeout_s=5
-    )
+    code, stdout, stderr = await provider._run([shutil.which("python3"), "-c", "print('X' * 50000)"], timeout_s=5)
     assert code == 0 and stdout == "X" * 50000 + "\n" and stderr == ""
     result = SandboxExecResult(stdout=stdout, stderr=stderr, return_code=code)
     assert result.stdout_bytes is None and result.stderr_bytes is None
@@ -1260,12 +1260,9 @@ def test_bounded_exec_capture_rejects_nonpositive_limit() -> None:
     with pytest.raises(ValueError, match="max_output_bytes"):
         apptainer_provider.ApptainerExecConfig(max_output_bytes=0)
 
-async def test_bounded_timeout_with_descendant_held_pipes_returns_incomplete(
-    fake_binary: str, tmp_path: Path
-) -> None:
-    provider = apptainer_provider.ApptainerProvider(
-        exec={"max_output_bytes": 8, "timeout_grace_s": 0}
-    )
+
+async def test_bounded_timeout_with_descendant_held_pipes_returns_incomplete(fake_binary: str, tmp_path: Path) -> None:
+    provider = apptainer_provider.ApptainerProvider(exec={"max_output_bytes": 8, "timeout_grace_s": 0})
     facts: dict[str, int | bool] = {}
     child_pid = tmp_path / "escaped-child.pid"
     script = (
@@ -1279,8 +1276,7 @@ async def test_bounded_timeout_with_descendant_held_pipes_returns_incomplete(
     started = asyncio.get_running_loop().time()
     try:
         with pytest.raises(apptainer_provider._CapturedTimeout) as raised:
-            await provider._run([shutil.which("python3"), "-c", script],
-                                timeout_s=0.1, capture_facts=facts)
+            await provider._run([shutil.which("python3"), "-c", script], timeout_s=0.1, capture_facts=facts)
     finally:
         if child_pid.exists():
             with contextlib.suppress(ProcessLookupError):
@@ -1294,8 +1290,7 @@ async def test_bounded_timeout_with_descendant_held_pipes_returns_incomplete(
 
 async def test_bounded_provider_exec_returns_typed_counts(fake_binary: str, monkeypatch, tmp_path: Path) -> None:
     binary = tmp_path / "apptainer"
-    binary.write_text("#!/usr/bin/env python3\nimport sys\n"
-                      "sys.stdout.write('A' * 100)\nsys.stderr.write('B' * 101)\n")
+    binary.write_text("#!/usr/bin/env python3\nimport sys\nsys.stdout.write('A' * 100)\nsys.stderr.write('B' * 101)\n")
     binary.chmod(0o755)
     monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: str(binary))
     provider = apptainer_provider.ApptainerProvider(exec={"max_output_bytes": 8})
@@ -1306,6 +1301,7 @@ async def test_bounded_provider_exec_returns_typed_counts(fake_binary: str, monk
     assert result.stdout_bytes == 100 and result.stderr_bytes == 101
     assert result.stdout_truncated and result.stderr_truncated and result.capture_complete
 
+
 async def test_bounded_provider_timeout_returns_typed_partial_streams(monkeypatch, tmp_path: Path) -> None:
     binary = tmp_path / "apptainer"
     binary.write_text(
@@ -1315,9 +1311,7 @@ async def test_bounded_provider_timeout_returns_typed_partial_streams(monkeypatc
     )
     binary.chmod(0o755)
     monkeypatch.setattr(apptainer_provider, "_require_apptainer", lambda _bin_path=None: str(binary))
-    provider = apptainer_provider.ApptainerProvider(
-        exec={"max_output_bytes": 8, "timeout_grace_s": 0}
-    )
+    provider = apptainer_provider.ApptainerProvider(exec={"max_output_bytes": 8, "timeout_grace_s": 0})
     result = await provider.exec(_make_handle(tmp_path), "ignored", timeout_s=0.2)
     assert result.error_type == "timeout"
     assert result.stdout == "early\n" and result.stderr == "detail\n"

@@ -406,7 +406,8 @@ class TuringVIFResourcesServer(SimpleResourcesServer):
                 or result.get("incomplete_details") is not None
                 or any(
                     item.get("status") != "completed"
-                    for item in result.get("output", []) if item.get("type") == "message"
+                    for item in result.get("output", [])
+                    if item.get("type") == "message"
                 )
             ):
                 raise JudgeError("VerifIF judge Responses reply is incomplete or failed")

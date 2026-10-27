@@ -42,7 +42,9 @@ def configure_seed_root(root: Path | None) -> None:
 
 
 @lru_cache(maxsize=None)
-def _parsed(reader, path: str, dtype: Optional[type], no_header: bool, names: Optional[Tuple[str, ...]]) -> pd.DataFrame:
+def _parsed(
+    reader, path: str, dtype: Optional[type], no_header: bool, names: Optional[Tuple[str, ...]]
+) -> pd.DataFrame:
     kwargs = {"dtype": dtype}
     if no_header:
         kwargs["header"] = None

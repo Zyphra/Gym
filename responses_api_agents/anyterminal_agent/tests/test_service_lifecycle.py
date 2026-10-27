@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in benchmark lifecycle projections on real provider/config objects."""
+
 import hashlib
 
 import pytest
@@ -19,8 +20,10 @@ def test_task_pid_namespace_is_owned_by_selected_instance(tmp_path, monkeypatch,
     monkeypatch.setattr(apptainer, "_require_apptainer", lambda _path=None: "/usr/bin/apptainer")
     cfg = AnyTerminalInstanceConfig.model_construct(
         problem_info={"task_name": "example", "cpus": 1, "memory_mb": 512},
-        persistent_dir=tmp_path / "episode", verifier_dir=tmp_path / "verifier",
-        nemo_gym_root=tmp_path / "gym", agent_deps_dir=tmp_path / "runtime",
+        persistent_dir=tmp_path / "episode",
+        verifier_dir=tmp_path / "verifier",
+        nemo_gym_root=tmp_path / "gym",
+        agent_deps_dir=tmp_path / "runtime",
         sandbox_provider={"apptainer": {"exec": {"extra_exec_args": ["--pid"]}}},
         apptainer_shared_pid_namespace=shared,
     )
@@ -51,7 +54,8 @@ def test_config_network_descriptor_keeps_original_profile_resources(tmp_path, mo
     selected = TaskNetwork(tools_root=root, tools_sha256=hashlib.sha256(manifest).hexdigest())
     monkeypatch.setenv("NEMO_GYM_SANDBOX_PIDS", "128")
     cfg = AnyTerminalInstanceConfig.model_construct(
-        problem_info={"cpus": 1, "memory_mb": 512}, task_network=selected,
+        problem_info={"cpus": 1, "memory_mb": 512},
+        task_network=selected,
     )
     resources = _episode_sandbox_resources(cfg)
     assert (resources.cpu, resources.memory_mib, resources.pids) == (1, 2560, 128)

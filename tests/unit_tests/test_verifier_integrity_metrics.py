@@ -19,8 +19,9 @@ def test_default_off_wire_omits_guard_metrics(model):
 @pytest.mark.parametrize("model", [SWEBenchMetrics, TerminalBenchMetrics])
 @pytest.mark.parametrize("hack,violations", [(0, 0), (1, 3)])
 def test_active_metrics_survive_json_and_preserve_infra_mask(model, hack, violations):
-    metrics = model(resolved=False, mask_sample=True, reward_hack_detected=hack,
-                    verifier_integrity_violations=violations)
+    metrics = model(
+        resolved=False, mask_sample=True, reward_hack_detected=hack, verifier_integrity_violations=violations
+    )
     restored = model.model_validate_json(metrics.model_dump_json())
     assert restored.reward_hack_detected == hack
     assert restored.verifier_integrity_violations == violations

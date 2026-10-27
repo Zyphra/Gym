@@ -26,14 +26,19 @@ def network(tmp_path):
 
 
 def params(tmp_path, **overrides):
-    return AnyTerminalInstanceConfig.model_construct(**({
-        "problem_info": {"cpus": 1, "memory_mb": 4096},
-        "persistent_dir": tmp_path / "episode",
-        "verifier_dir": tmp_path / "verifier",
-        "agent_deps_dir": tmp_path / "agent",
-        "nemo_gym_root": tmp_path / "gym",
-        "sandbox_provider": {"apptainer": {}},
-    } | overrides))
+    return AnyTerminalInstanceConfig.model_construct(
+        **(
+            {
+                "problem_info": {"cpus": 1, "memory_mb": 4096},
+                "persistent_dir": tmp_path / "episode",
+                "verifier_dir": tmp_path / "verifier",
+                "agent_deps_dir": tmp_path / "agent",
+                "nemo_gym_root": tmp_path / "gym",
+                "sandbox_provider": {"apptainer": {}},
+            }
+            | overrides
+        )
+    )
 
 
 @pytest.mark.parametrize("change", ["relative", "symlink", "missing", "digest", "mode", "unknown"])
@@ -84,9 +89,11 @@ def test_factory_preserves_instance_mounts_and_default_provider(tmp_path, monkey
     actual = _build_provider(cfg)
     assert isinstance(actual, ObservedApptainer)
     assert actual.selection == (str(selected.tools_root), selected.tools_sha256, True)
-    for directory, target in ((cfg.persistent_dir, "/trajectories_mount"),
-                              (cfg.verifier_dir, "/logs/verifier"),
-                              (cfg.agent_deps_dir, "/agent_deps_mount:ro")):
+    for directory, target in (
+        (cfg.persistent_dir, "/trajectories_mount"),
+        (cfg.verifier_dir, "/logs/verifier"),
+        (cfg.agent_deps_dir, "/agent_deps_mount:ro"),
+    ):
         assert f"{directory}:{target}" in actual._exec_config.default_binds
     assert type(_build_provider(params(tmp_path))) is ApptainerProvider
 

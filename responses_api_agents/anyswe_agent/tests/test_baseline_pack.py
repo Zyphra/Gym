@@ -14,6 +14,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pytest
+
 from responses_api_agents.anyswe_agent.agent_runner import (
     _extract_patch,
     _snapshot_repo,
@@ -37,8 +38,13 @@ def test_baseline_export_crosses_filesystems_and_survives_metadata_deletion(tmp_
 
     def git(repo, *args, **kwargs):
         return subprocess.run(
-            ["git", *args], cwd=repo, capture_output=True, text=True, check=True,
-            timeout=30, **kwargs,
+            ["git", *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+            **kwargs,
         )
 
     with TemporaryDirectory(prefix="anyswe-pack-regression-", dir=source_mount) as source:
@@ -64,7 +70,11 @@ def test_baseline_export_crosses_filesystems_and_survives_metadata_deletion(tmp_
         tree = git(repo, "rev-parse", "HEAD^{tree}").stdout
         original = subprocess.run(
             ["git", "pack-objects", "--revs", str(old_pack_dir / "pack")],
-            cwd=repo, input=tree, capture_output=True, text=True, timeout=30,
+            cwd=repo,
+            input=tree,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         assert original.returncode == 128, original.stderr
         assert "unable to rename" in original.stderr, original.stderr
@@ -97,7 +107,10 @@ def test_baseline_export_crosses_filesystems_and_survives_metadata_deletion(tmp_
         # The private archive must carry every object without the source store.
         archive_env = {**os.environ, "GIT_DIR": str(archive)}
         kinds = git(
-            grader, "cat-file", "--batch-all-objects", "--batch-check=%(objecttype)",
+            grader,
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objecttype)",
             env=archive_env,
         ).stdout.splitlines()
         assert set(kinds) == {"tree", "blob"}

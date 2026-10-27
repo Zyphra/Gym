@@ -98,9 +98,13 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
                 body = next((arg for arg in args if isinstance(arg, BaseRunRequest)), None)
             from nemo_gym.sandbox.episode import sandbox_episode_control
 
-            with rollout_context(self.rollout_id_from_run(body)), sandbox_episode_control(
-                getattr(body, "episode_control", None), getattr(body, "capture_rollout_id", None),
-                getattr(body, "episode_excluded_node_ids", ()),
+            with (
+                rollout_context(self.rollout_id_from_run(body)),
+                sandbox_episode_control(
+                    getattr(body, "episode_control", None),
+                    getattr(body, "capture_rollout_id", None),
+                    getattr(body, "episode_excluded_node_ids", ()),
+                ),
             ):
                 return await run(*args, **kwargs)
 

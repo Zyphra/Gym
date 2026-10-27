@@ -91,10 +91,14 @@ class BaseRunRequest(BaseModel):
 
     responses_create_params: NeMoGymResponseCreateParamsNonStreaming
     episode_control: Optional[str] = Field(
-        default=None, alias="_ng_episode_control", exclude=True,
+        default=None,
+        alias="_ng_episode_control",
+        exclude=True,
     )
     episode_excluded_node_ids: tuple[str, ...] = Field(
-        default=(), alias="_ng_episode_excluded_node_ids", exclude=True,
+        default=(),
+        alias="_ng_episode_excluded_node_ids",
+        exclude=True,
     )
     capture_rollout_id: Optional[str] = Field(
         default=None,

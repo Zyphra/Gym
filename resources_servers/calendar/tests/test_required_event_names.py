@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in event-name presence, using the real Calendar verifier and clients."""
+
 import asyncio
 import json
 
@@ -21,16 +22,48 @@ STATE = {"0": {"event_id": 0, "duration": 30, "constraint": None, "min_time": "1
 
 
 def grade(event, enabled):
-    client = ServerClient(head_server_config=BaseServerConfig(host="127.0.0.1", port=0),
-                          global_config_dict=OmegaConf.create({}))
-    srv = CalendarResourcesServer(config=CalendarResourcesServerConfig(host="127.0.0.1", port=0,
-                                  entrypoint="app.py", name="calendar", require_event_names=enabled), server_client=client)
-    response = NeMoGymResponse.model_validate({"id": "control", "created_at": 0, "model": "fixture", "object": "response",
-        "status": "completed", "parallel_tool_calls": False, "tool_choice": "none", "tools": [],
-        "output": [{"id": "answer", "type": "message", "role": "assistant", "status": "completed",
-                    "content": [{"type": "output_text", "text": json.dumps(event if isinstance(event, list) else [event]), "annotations": [], "logprobs": []}]}]})
-    body = CalendarVerifyRequest(responses_create_params={"input": [{"role": "user", "content": "Schedule event 0, Coding workshop."}]},
-                                 exp_cal_state=STATE, response=response)
+    client = ServerClient(
+        head_server_config=BaseServerConfig(host="127.0.0.1", port=0), global_config_dict=OmegaConf.create({})
+    )
+    srv = CalendarResourcesServer(
+        config=CalendarResourcesServerConfig(
+            host="127.0.0.1", port=0, entrypoint="app.py", name="calendar", require_event_names=enabled
+        ),
+        server_client=client,
+    )
+    response = NeMoGymResponse.model_validate(
+        {
+            "id": "control",
+            "created_at": 0,
+            "model": "fixture",
+            "object": "response",
+            "status": "completed",
+            "parallel_tool_calls": False,
+            "tool_choice": "none",
+            "tools": [],
+            "output": [
+                {
+                    "id": "answer",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps(event if isinstance(event, list) else [event]),
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    body = CalendarVerifyRequest(
+        responses_create_params={"input": [{"role": "user", "content": "Schedule event 0, Coding workshop."}]},
+        exp_cal_state=STATE,
+        response=response,
+    )
     return asyncio.run(srv.verify(body)).reward
 
 

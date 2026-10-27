@@ -41,18 +41,28 @@ def test_empty_model_stop_is_not_a_zero_call_harness_failure(status: str, calls:
     raw = json.loads((Path(__file__).parent / "fixtures/sandbox-harness-failures.json").read_text())[0]["response"]
     raw.pop("_ng_agent_observations")
     response = NeMoGymResponse.model_validate(raw)
-    observations = AgentObservationBundle(source="test", records=[AgentInvocation(
-        invocation_id="root", status=status, model_calls=calls,
-    )])
+    observations = AgentObservationBundle(
+        source="test",
+        records=[
+            AgentInvocation(
+                invocation_id="root",
+                status=status,
+                model_calls=calls,
+            )
+        ],
+    )
     assert harness_response_error(response, observations) is None
     assert harness_response_error(response) is None  # Missing evidence is not a zero-call receipt.
 
 
-@pytest.mark.parametrize("message", [
-    "Model used all output tokens on reasoning with none left for the response. Try lowering reasoning effort or increasing max_tokens.",
-    "Model generated invalid tool call: finish",
-    "Context length exceeded: max compression attempts (3) reached.",
-])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Model used all output tokens on reasoning with none left for the response. Try lowering reasoning effort or increasing max_tokens.",
+        "Model generated invalid tool call: finish",
+        "Context length exceeded: max compression attempts (3) reached.",
+    ],
+)
 def test_policy_errors_remain_scored_outcomes(message: str) -> None:
     raw = json.loads((Path(__file__).parent / "fixtures/sandbox-harness-failures.json").read_text())[1]["response"]
     observations = AgentObservationBundle.model_validate(raw.pop("_ng_agent_observations"))

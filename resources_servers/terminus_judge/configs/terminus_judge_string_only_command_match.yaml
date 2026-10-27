@@ -17,3 +17,4 @@ terminus_judge_string_only_resources_server:
       json_extraction: terminus_2
       command_scoring: command_match
       command_match_max_extra_commands: 2
+      verified: false

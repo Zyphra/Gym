@@ -18,10 +18,10 @@ import socket
 from concurrent.futures import ProcessPoolExecutor
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
 from aiohttp import ClientOSError, ClientResponseError, RequestInfo
 from multidict import CIMultiDict, CIMultiDictProxy
 from omegaconf import OmegaConf
-import pytest
 from pytest import CaptureFixture, MonkeyPatch, raises
 from yarl import URL
 
@@ -829,7 +829,10 @@ class TestServerUtils:
         assert "[upstream_request_failed]" in captured
         assert "ValueError: actionable inner failure" in captured
 
-    @pytest.mark.parametrize(("inner", "outer"), [(400, 400), (413, 413), (429, 429), (500, 500), (501, 500), (502, 502), (503, 503), (504, 504)])
+    @pytest.mark.parametrize(
+        ("inner", "outer"),
+        [(400, 400), (413, 413), (429, 429), (500, 500), (501, 500), (502, 502), (503, 503), (504, 504)],
+    )
     async def test_exception_middleware_keeps_inner_client_error_status(
         self, monkeypatch: MonkeyPatch, inner: int, outer: int
     ) -> None:
