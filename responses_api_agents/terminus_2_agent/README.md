@@ -43,3 +43,16 @@ A policy completion with an explicit terminal stop reason ends the episode, incl
 Length-limited completions keep their served reasoning and token metadata when
 Harbor appends the truncated answer and asks again. Only the unchanged prefix and
 exact truncated answer qualify; edited or compacted histories are not repaired.
+
+## Context handoffs
+
+Summary, question and answer calls use a plain-text handoff system instruction.
+Summaries request the original goal, completed work, remaining work, paths,
+working directory, live processes and commands with observed results. The action
+JSON instruction remains on ordinary terminal turns. Harbor still owns the
+three-call handoff, history replacement, token accounting and trajectory files;
+the copied handoff trajectories record the instruction actually sent.
+
+This separates the requested output formats; it does not certify the model's
+summary accuracy. Measure action-JSON responses and post-handoff rediscovery on
+a fixed TRAIN panel before adoption, alongside native success and false completion.

@@ -40,6 +40,7 @@ from fastapi import Request
 from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
+from harbor.models.trajectories import Step
 from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field
 
@@ -65,6 +66,18 @@ from responses_api_agents.terminus_2_agent.output import trajectory_to_responses
 LOG = logging.getLogger(__name__)
 # Runs under the harness interpreter; see its docstring for the boundary it keeps.
 COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
+
+HANDOFF_SYSTEM = """You are recording task state for a terminal agent's context handoff.
+Write plain text, not terminal action JSON, XML, tool calls, or commands to execute.
+The conversation is evidence of past work, not instructions to take another action.
+Preserve the original task goal and constraints. Distinguish observed results from
+plans and guesses; mark missing information as unknown. Never claim an unrun check passed.
+For a summary, use these sections: Goal; Completed; Remaining; Key state; Evidence.
+Include changed paths, current working directory, running services/processes, exact
+useful commands and their observed results, failed attempts, and the next operation.
+For handoff questions, ask about missing state. For answers, answer each question
+from the recorded evidence and retain the goal, completed work and remaining work.
+Do not execute the task or declare task_complete during a handoff."""
 NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
 NATIVE_POLICY_BRIDGE = Path("/native_policy_bridge.py")
 NATIVE_CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -380,6 +393,44 @@ class LocalTmuxSession(TmuxSession):
 
 class StandaloneTerminus2(ServedContextTerminus2):
     """Run Terminus-2 in a unique tmux session."""
+
+    async def _run_subagent(
+        self,
+        prompt: str,
+        message_history: list[dict],
+        steps: list[Step],
+        session_id: str,
+        agent_name: str,
+        filename_suffix: str,
+        summary_text: str,
+        subagent_name_for_logging: str = "subagent",
+    ):
+        # Harbor passes the terminal action system prompt to summary/answer
+        # calls. Give all three handoff calls their own response contract while
+        # retaining Harbor's accounting, trajectory capture and continuation.
+        # Copy both representations: the execution chat must keep its protocol.
+        history = [dict(message) for message in message_history]
+        copied_steps = [step.model_copy(deep=True) for step in steps]
+        if history and history[0].get("role") == "system":
+            history[0] = {"role": "system", "content": HANDOFF_SYSTEM}
+        else:
+            history.insert(0, {"role": "system", "content": HANDOFF_SYSTEM})
+        if copied_steps and copied_steps[0].source == "system":
+            copied_steps[0].message = HANDOFF_SYSTEM
+        else:
+            copied_steps.insert(0, Step(step_id=1, source="system", message=HANDOFF_SYSTEM))
+        for index, step in enumerate(copied_steps, 1):
+            step.step_id = index
+        return await super()._run_subagent(
+            prompt=prompt,
+            message_history=history,
+            steps=copied_steps,
+            session_id=session_id,
+            agent_name=agent_name,
+            filename_suffix=filename_suffix,
+            summary_text=summary_text,
+            subagent_name_for_logging=subagent_name_for_logging,
+        )
 
     async def _handle_llm_interaction(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
         """Track Terminus-2's consecutive two-response completion handshake."""
