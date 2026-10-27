@@ -66,7 +66,11 @@ async def test_handoff_contract_history_and_native_accounting(tmp_path, phase):
     assert response.reasoning_content == "recorded reasoning"
     assert llm.payload["messages"][0] == {"role": "system", "content": HANDOFF_SYSTEM}
     if history:
-        assert llm.payload["messages"][1:-1] == history[1:]
+        transcript = llm.payload["messages"][1]
+        assert transcript["role"] == "user"
+        assert all(m["content"] in transcript["content"] for m in history)
+        assert "Need regression test." in transcript["content"]
+        assert not any(m["role"] == "assistant" for m in llm.payload["messages"])
     assert history == original_history
     assert [s.model_dump() for s in steps] == original_steps
     assert agent._subagent_metrics.total_prompt_tokens == 41
