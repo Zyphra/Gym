@@ -19,7 +19,7 @@ from responses_api_agents.hermes_agent.app import HermesAgent, HermesAgentConfig
 
 SUMMARY_TEXT = "## Goal\nVerified fixture summary."
 MAIN_TEXT = "Main fixture response."
-CONTEXT_WINDOW = 32768
+CONTEXT_WINDOW = 131072
 
 
 def _is_summary_request(body: dict) -> bool:
@@ -86,13 +86,13 @@ class _PolicyFixture:
 
 
 def _long_history_input() -> list[NeMoGymEasyInputMessage]:
-    # 26 earlier messages of ~2,800 characters each: above Hermes' preflight
-    # compression threshold (half of the 32,768-token window) and above the
+    # 26 earlier messages of ~13,800 characters each: above Hermes' preflight
+    # compression threshold (half of the 131,072-token window) and above the
     # protected head and tail, so the run compresses before its first request.
     items = [
         NeMoGymEasyInputMessage(
             role="user" if index % 2 == 0 else "assistant",
-            content=f"history message {index}: " + "observed fixture state. " * 115,
+            content=f"history message {index}: " + "observed fixture state. " * 575,
         )
         for index in range(26)
     ]
@@ -188,12 +188,12 @@ def test_stock_summary_request_goes_to_each_rollouts_own_policy(monkeypatch, rec
     assert sorted(path for path, _ in mains) == sorted(path for path, _ in summaries)
     for _, body in summaries:
         # Hermes' stock compression request: one user message, no tools, Hermes'
-        # own budget (2 x the 2,000-token floor here) and temperature.
+        # configured total-output budget and temperature.
         assert body["model"] == "fixture-policy"
         assert [message["role"] for message in body["messages"]] == ["user"]
         assert "TURNS TO SUMMARIZE:\n[ASSISTANT]: history message 3: " in body["messages"][0]["content"]
         assert "tools" not in body and "tool_choice" not in body
-        assert body["max_tokens"] == 4000
+        assert body["max_tokens"] == 32768
         assert body["temperature"] == 0.3
     from agent.context_compressor import SUMMARY_PREFIX
 
@@ -222,7 +222,7 @@ def test_summary_temperature_override_is_the_only_request_change(monkeypatch, tm
         ((_, body),) = policy.summaries()
 
     assert body["temperature"] == 1.0
-    assert body["max_tokens"] == 4000 and "tools" not in body
+    assert body["max_tokens"] == 32768 and "tools" not in body
 
 
 def test_empty_summary_leaves_only_the_compaction_marker_and_the_run_continues(monkeypatch, tmp_path):
@@ -346,7 +346,7 @@ def test_summary_request_carries_the_policy_turns_request_fields(monkeypatch, tm
     assert summary_body["model"] == main_body["model"] == "fixture-policy"
     assert summary_body["temperature"] == main_body["temperature"] == 1.0
     assert "tools" not in summary_body and "tool_choice" not in summary_body
-    assert summary_body["max_tokens"] == 4000 and main_body["max_tokens"] == 8192
+    assert summary_body["max_tokens"] == 32768 and main_body["max_tokens"] == 8192
     assert [message["role"] for message in summary_body["messages"]] == ["user"]
     # Nothing else differs: token IDs and logprobs are sampled by the serving endpoint, not requested here.
     ignored = {"messages", "max_tokens", "tools", "tool_choice"}
@@ -398,3 +398,38 @@ def test_compression_target_ratio_reaches_hermes_compressor(monkeypatch, tmp_pat
     compressor = native_agents[0].context_compressor
     assert compressor.summary_target_ratio == expected
     assert compressor.tail_token_budget == int(compressor.threshold_tokens * expected)
+
+
+@pytest.mark.parametrize("budget", [None, 16384, 49152])
+def test_summary_output_budget_reaches_compressor_request(monkeypatch, tmp_path, budget):
+    import yaml
+
+    native_agents: list = []
+    summary = {
+        "status": 200,
+        "choice": {"message": {"role": "assistant", "content": SUMMARY_TEXT}, "finish_reason": "stop"},
+    }
+    expected = 32768 if budget is None else budget
+    with _PolicyFixture(summary) as policy:
+        extra = {} if budget is None else {"compression_summary_max_output_tokens": budget}
+        app = _agent(tmp_path, monkeypatch, policy.server.server_port, native_agents, **extra)
+        generated = yaml.safe_load(app._build_config())
+        written = yaml.safe_load((Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text())
+        assert written == generated
+        assert generated["compression"]["summary_max_output_tokens"] == expected
+        try:
+            (response,) = _run(app, "rollout-budget")
+        finally:
+            _close(native_agents)
+        ((_, body),) = policy.summaries()
+        ((_, main),) = policy.mains()
+    assert response.status == "completed"
+    compressor = native_agents[0].context_compressor
+    assert compressor.summary_max_output_tokens == expected
+    assert body["max_tokens"] == expected
+    assert "Target ~" in body["messages"][0]["content"]
+    assert f"Target ~{expected} tokens" not in body["messages"][0]["content"]
+    assert body["chat_template_kwargs"]["enable_thinking"] is True
+    assert body["chat_template_kwargs"] == main["chat_template_kwargs"]
+    assert compressor.tail_token_budget == int(compressor.threshold_tokens * 0.20)
+    assert any(SUMMARY_TEXT in (message.get("content") or "") for message in main["messages"])

@@ -370,6 +370,8 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # Hermes' compression.target_ratio: the kept recent tail as a fraction of the threshold.
     # None keeps Hermes' default (0.20); Hermes clamps it to [0.10, 0.80].
     compression_target_ratio: float | None = Field(default=None, ge=0.10, le=0.80, allow_inf_nan=False)
+    # Total summary completion allowance, including reasoning; independent of tail retention.
+    compression_summary_max_output_tokens: int = Field(default=32768, gt=0)
     chat_template_kwargs_enabled: bool = True
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
@@ -499,6 +501,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             "compression": {
                 "enabled": self.config.compression_enabled,
                 "threshold": self.config.compression_threshold,
+                "summary_max_output_tokens": self.config.compression_summary_max_output_tokens,
                 **(
                     {"target_ratio": self.config.compression_target_ratio}
                     if self.config.compression_target_ratio is not None
