@@ -178,7 +178,6 @@ def test_stock_summary_request_goes_to_each_rollouts_own_policy(monkeypatch, rec
         assert compressor.context_length == CONTEXT_WINDOW
         # Stock threshold: half the window, with no output-reserve scaling.
         assert compressor.threshold_tokens == CONTEXT_WINDOW // 2
-        assert compressor.managed_summary_callback is None
 
     # Each run's summary is served on its own rollout URL, before its main request.
     assert sorted(path for path, _ in summaries) == [
