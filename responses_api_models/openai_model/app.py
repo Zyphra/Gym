@@ -31,6 +31,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
 )
+from responses_api_models.openai_model.request_admission import RequestAdmission, RequestRateLimit
 
 
 class SimpleModelServerConfig(BaseResponsesAPIModelConfig):
@@ -41,6 +42,14 @@ class SimpleModelServerConfig(BaseResponsesAPIModelConfig):
     extra_body: Dict[str, Any] = Field(default_factory=dict)
     openai_default_headers: Dict[str, str] = Field(default_factory=dict)
     max_http_attempts: int = Field(default=MAX_NUM_TRIES, ge=1)
+    request_rate_limit: Optional[RequestRateLimit] = Field(
+        default=None,
+        description=(
+            "Opt-in per-process request and token reservations before each upstream attempt. "
+            "Budget shares belong to the caller; None preserves unrestricted admission. "
+            "Retries remain owned by the existing HTTP transport."
+        ),
+    )
 
     max_concurrent_requests: Optional[int] = Field(
         default=None,
@@ -78,6 +87,12 @@ class SimpleModelServer(SimpleResponsesAPIModel):
             if self.config.max_concurrent_requests is not None
             else nullcontext()
         )
+
+        self._request_admission = (
+            RequestAdmission(self.config.request_rate_limit) if self.config.request_rate_limit is not None else None
+        )
+        if self._request_admission is not None:
+            self._client.set_request_attempt_admission(self._request_admission.acquire)
 
         return super().model_post_init(context)
 
