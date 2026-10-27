@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Real-Git regression, ready to fold into AnySWE's existing test_app.py.
 
 Run with the hydrated Gym source on PYTHONPATH. The source filesystem must
