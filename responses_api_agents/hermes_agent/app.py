@@ -283,6 +283,67 @@ def _offer_finish_tool(agent: Any) -> Callable[[], bool]:
     return lambda: message is not None
 
 
+def _endpoint_stop(response: Any) -> bool:
+    """The serving endpoint's episode stop: a stop reason with no sampled tokens.
+
+    The endpoint answers its turn cap, an episode guard or an exhausted context
+    with an empty assistant message, which Hermes takes as a final answer.
+    Terminus-2 reads the same contract (``terminus_2_agent/llm.py``).
+    """
+    choices = getattr(response, "choices", None) or []
+    stop_reason = getattr(choices[0], "stop_reason", None) if choices else None
+    return bool(stop_reason) and getattr(getattr(response, "usage", None), "completion_tokens", None) == 0
+
+
+def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
+    """Record whether the latest main-loop model response was the endpoint's episode stop."""
+    api_call = getattr(agent, "_interruptible_api_call", None)
+    if api_call is None:
+        # An unobservable stop counts as the endpoint's, so completion is never claimed.
+        return lambda: True
+    stopped = False
+
+    def call_then_observe(*args, **kwargs):
+        nonlocal stopped
+        stopped = False
+        response = api_call(*args, **kwargs)
+        stopped = _endpoint_stop(response)
+        return response
+
+    agent._interruptible_api_call = call_then_observe
+    return lambda: stopped
+
+
+def _finished_naturally(
+    result: dict,
+    *,
+    finished_by_tool: bool,
+    ended_by_endpoint: bool,
+    interrupted: bool,
+    failed: bool,
+) -> bool:
+    """Whether the policy itself ended the run: a final answer, or the offered `finish` tool.
+
+    Hermes' ``completed`` also covers the endpoint's empty episode stop and the
+    synthetic error reply it appends near its turn limit. Only a final assistant
+    message Hermes built from a policy response carries ``finish_reason``; that
+    error reply and its iteration-limit summary do not.
+    """
+    if interrupted or failed or ended_by_endpoint or result.get("partial"):
+        return False
+    if finished_by_tool:
+        return True
+    messages = result.get("messages") or []
+    last = messages[-1] if messages else None
+    return bool(
+        result.get("completed")
+        and isinstance(last, dict)
+        and last.get("role") == "assistant"
+        and "finish_reason" in last
+        and not last.get("tool_calls")
+    )
+
+
 class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: ResourcesServerRef
     model_server: ModelServerRef
@@ -490,6 +551,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             _bind_policy_summary(agent)
         _execute_every_tool_call(agent)
         _limit_tool_results(agent)
+        ended_by_endpoint = _observe_endpoint_stop(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         observer = None
         if observation_collector is not None:
@@ -602,8 +664,17 @@ class HermesAgent(SimpleResponsesAPIAgent):
             and harness_error.endswith("Cannot compress further.")
         )
         agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not context_exhausted
+        finished_naturally = _finished_naturally(
+            result,
+            finished_by_tool=finished_by_tool is not None and finished_by_tool(),
+            ended_by_endpoint=ended_by_endpoint(),
+            interrupted=was_interrupted,
+            failed=agent_failed or context_exhausted,
+        )
         metadata: dict[str, str] = {
             "interrupted": "true" if was_interrupted else "false",
+            # Harness-neutral label a wrapping agent (anyterminal) carries.
+            "finished_naturally": "true" if finished_naturally else "false",
             # `failed` = the underlying run flagged an API/provider failure (bad response shape,
             # rate limit, unrecoverable truncation) — the clean signal for an infra failure vs a
             # legitimate stop. `partial` = the response was truncated at the output-token limit.
@@ -746,8 +817,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 for item in gym_resp.output
                 if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "assistant"
             )
-            last = gym_resp.output[-1] if gym_resp.output else None
-            naturally = getattr(last, "type", None) == "message" and getattr(last, "role", None) == "assistant"
+            naturally = (gym_resp.metadata or {}).get("finished_naturally") == "true"
 
             result = verify_json | {"turns_used": turns, "finished_naturally": naturally}
             if observations is not None:

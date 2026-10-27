@@ -132,6 +132,9 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     agent_exit_nonzero: bool = False
     agent_failed: bool = False
     agent_error: Optional[str] = None
+    # The inner harness reports the agent itself ended the run (its own
+    # completion), not a turn cap, timeout, failure or endpoint stop.
+    finished_naturally: bool = False
     verifier_reward_unreadable: bool = False
     verifier_integrity_refused: bool = False
     verifier_integrity_problem: Optional[str] = None
@@ -1102,6 +1105,7 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
     output_items, tools = [], []
     agent_stop_reason = None
     agent_error = None
+    finished_naturally = False
     saved = None
     harness_error = None
     if response_path.exists():
@@ -1118,6 +1122,7 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
             # The inner harness's own failure label (hermes status/error,
             # terminus metadata agent_error) is kept, not dropped.
             agent_error = (saved.metadata or {}).get("agent_error")
+            finished_naturally = (saved.metadata or {}).get("finished_naturally") == "true"
             if saved.status == "failed" and not agent_error:
                 agent_error = (saved.error.code if saved.error else None) or "failed"
         except (json.JSONDecodeError, ValueError) as e:
@@ -1136,6 +1141,7 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
         "mask_sample": mask_sample or harness_error is not None,
         # A timeout or sandbox error is already masked; a plain nonzero exit is a harness crash.
         "agent_exit_nonzero": agent_result.get("error_type") is None and exit_code not in (None, 0),
+        "finished_naturally": finished_naturally,
     }
     update_metrics(params.metrics_fpath, labels, params.task_name)
 

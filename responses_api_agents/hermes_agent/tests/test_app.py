@@ -632,20 +632,30 @@ class _ScriptedChatServer:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 server.requests.append(body)
                 message = server.turns.pop(0) if server.turns else {"role": "assistant", "content": "unscripted"}
+                choice = {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
+                }
+                usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                if isinstance(message.get("stop_reason"), str):
+                    # The serving endpoint's episode stop: an empty message, a stop
+                    # reason and no sampled tokens.
+                    choice = {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop",
+                        "stop_reason": message["stop_reason"],
+                    }
+                    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 payload = json.dumps(
                     {
                         "id": f"chatcmpl-{len(server.requests)}",
                         "object": "chat.completion",
                         "created": 0,
                         "model": body.get("model", "model"),
-                        "choices": [
-                            {
-                                "index": 0,
-                                "message": message,
-                                "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
-                            }
-                        ],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                        "choices": [choice],
+                        "usage": usage,
                     }
                 ).encode()
                 self.send_response(200)
@@ -761,6 +771,10 @@ class TestFinishTool:
         assert len(requests) == 1
         assert episode.response.status == "completed"
 
+    def test_finish_is_the_agents_own_completion(self, monkeypatch, tmp_path) -> None:
+        episode, _ = self._run(monkeypatch, tmp_path, [_tool_turn(("finish", {"message": "done"}))], finish_tool=True)
+        assert episode.response.metadata["finished_naturally"] == "true"
+
     def test_runs_without_finish_keep_hermes_completion(self, monkeypatch, tmp_path) -> None:
         episode, requests = self._run(
             monkeypatch, tmp_path, [{"role": "assistant", "content": "all done"}], finish_tool=True
@@ -769,3 +783,76 @@ class TestFinishTool:
         assert "finish" in self._offered(requests[0])
         assert episode.response.output[-1].content[0].text == "all done"
         assert episode.response.status == "completed"
+
+
+class TestFinishedNaturally:
+    """Which real Hermes endings are the agent's own completion."""
+
+    _run = TestFinishTool._run
+
+    def test_final_answer_is_the_agents_own_completion(self, monkeypatch, tmp_path) -> None:
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [_tool_turn(("terminal", {"command": "echo ok > out.txt"})), {"role": "assistant", "content": "Done."}],
+        )
+        assert len(requests) == 2
+        assert episode.response.status == "completed"
+        assert episode.response.metadata["finished_naturally"] == "true"
+
+    @pytest.mark.parametrize("reason", ["turn_limit", "context_exhausted", "identical_call", "rumination"])
+    def test_endpoint_stop_is_not_the_agents_completion(self, monkeypatch, tmp_path, reason) -> None:
+        # Hermes takes the endpoint's empty stop message as a final answer and
+        # reports the run completed; the agent did not choose to end it.
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [_tool_turn(("terminal", {"command": "echo ok > out.txt"})), {"stop_reason": reason}],
+        )
+        assert len(requests) == 2
+        assert episode.response.status == "completed"
+        assert episode.response.metadata["finished_naturally"] == "false"
+
+    def test_turn_cap_summary_is_not_the_agents_completion(self, monkeypatch, tmp_path) -> None:
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [_tool_turn(("terminal", {"command": "echo ok > out.txt"})), {"role": "assistant", "content": "summary"}],
+            max_turns=1,
+        )
+        assert episode.response.output[-1].content[0].text == "summary"
+        assert episode.response.metadata["finished_naturally"] == "false"
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {"completed": True, "error": "API request failed"},  # harness failure
+            {"completed": True, "failed": True},
+            {"completed": True, "partial": True},
+            {"completed": True, "interrupted": True},  # SIGTERM / timeout
+            {"completed": False},
+        ],
+    )
+    def test_failed_or_interrupted_run_is_not_the_agents_completion(self, result) -> None:
+        from responses_api_agents.hermes_agent.app import _finished_naturally
+
+        final = {"role": "assistant", "content": "Done.", "finish_reason": "stop"}
+        result = {"messages": [final], **result}
+        interrupted = bool(result.get("interrupted"))
+        failed = bool(result.get("error") or result.get("failed"))
+        assert not _finished_naturally(
+            result, finished_by_tool=False, ended_by_endpoint=False, interrupted=interrupted, failed=failed
+        )
+        clean = {"messages": [final], "completed": True}
+        assert _finished_naturally(
+            clean, finished_by_tool=False, ended_by_endpoint=False, interrupted=False, failed=False
+        )
+
+    def test_synthetic_error_reply_is_not_the_agents_completion(self) -> None:
+        from responses_api_agents.hermes_agent.app import _finished_naturally
+
+        # Hermes appends this reply itself, without finish_reason, near its turn limit.
+        result = {"completed": True, "messages": [{"role": "assistant", "content": "I apologize, but I encountered"}]}
+        assert not _finished_naturally(
+            result, finished_by_tool=False, ended_by_endpoint=False, interrupted=False, failed=False
+        )
