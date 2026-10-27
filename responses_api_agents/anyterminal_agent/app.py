@@ -16,6 +16,7 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -38,12 +39,18 @@ from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body,
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.rollout_observability import AgentObservationBundle, harness_response_error
+from nemo_gym.rollout_observability import (
+    AgentObservationBundle,
+    bounded_error_text,
+    endpoint_stop_reason,
+    harness_response_error,
+)
 from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.episode import (
     SandboxMemoryEvents,
     harness_memory_kill,
+    memory_kill_origin,
     run_sandbox_episode,
     sandbox_memory_events,
     verifier_memory_kill,
@@ -127,9 +134,15 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     container_timed_out: bool = False
     sandbox_failed: bool = False
     mask_sample: bool = False
-    # Labels only, never a mask: a harness or verifier failure that still
-    # scores is named, so it is not indistinguishable from a policy miss.
+    # ``error_kind`` is "harness" only for a failure with an external cause (see ``harness_response_error``).
+    # The rest are labels, never a mask: a harness crash whose cause is not proven still scores, and is named
+    # (exit status, exception class) so it is not indistinguishable from a policy miss.
+    error_kind: Optional[str] = None
     agent_exit_nonzero: bool = False
+    agent_return_code: Optional[int] = None
+    agent_exception: Optional[str] = None
+    agent_error_text: Optional[str] = None
+    agent_stop_reason: Optional[str] = None
     agent_failed: bool = False
     agent_error: Optional[str] = None
     verifier_reward_unreadable: bool = False
@@ -1048,8 +1061,22 @@ class RunTerminalAgent(BaseModel):
         agent_phase_kill = harness_memory_kill(agent_return_code, getattr(self, "_agent_phase_memory_events", {}))
         if verifier_kill is not None and verifier_phase_kill is None:
             verifier_kill = "verifier SIGKILL with sandbox OOM history; execution phase UNKNOWN"
-        if memory_kill is not None and agent_phase_kill is None:
-            memory_kill = "agent harness SIGKILL with sandbox OOM history; execution phase UNKNOWN"
+        # A harness the sandbox's own memory limit killed is the policy's outcome and scores (generous limits
+        # let normal solutions pass; an inefficient or broken one crashes). Only a kill the limit did not
+        # cause, when its counters show the limit never fired, is infrastructure.
+        agent_memory_limit = None
+        if memory_kill is not None:
+            phase_known = agent_phase_kill is not None
+            origin = memory_kill_origin(
+                getattr(self, "_agent_phase_memory_events", {}) if phase_known else memory_events
+            )
+            if not phase_known:
+                memory_kill = "agent harness SIGKILL with sandbox OOM history; execution phase UNKNOWN"
+            if origin == "outside_sandbox_limit":
+                memory_kill += "; the sandbox's own memory limit never fired"
+            else:
+                agent_memory_limit = f"{memory_kill}; scored (sandbox memory limit: {origin})"
+                memory_kill = None
         sandbox_failed = sandbox_failed or memory_kill is not None or verifier_kill is not None
 
         reward_path = cfg.verifier_dir / "reward.txt"
@@ -1080,16 +1107,39 @@ class RunTerminalAgent(BaseModel):
             agent_run_time=agent_run_time,
             eval_run_time=eval_run_time,
             total_run_time=total_run_time,
-            error_detail=memory_kill or verifier_kill,
+            error_kind="agent_memory_limit" if agent_memory_limit and not sandbox_failed else None,
+            error_detail=memory_kill or verifier_kill or agent_memory_limit,
             verifier_phase_memory_events=verifier_phase_events or None,
             memory_failure_phase="verifier" if verifier_phase_kill else (
-                "agent_harness" if agent_phase_kill else "unknown" if memory_kill or verifier_kill else None
+                "agent_harness" if agent_phase_kill else "unknown"
+                if memory_kill or verifier_kill or agent_memory_limit
+                else None
             ),
             **memory_events,
         )
         metrics.apply_timeout_policy(agent_timeout_is_failure=cfg.agent_timeout_is_failure)
         update_metrics(cfg.metrics_fpath, metrics.model_dump(), cfg.task_name)
         return bool(metrics.resolved)
+
+
+_TRACEBACK_LAST_LINE = re.compile(r"([A-Za-z_][\w.]*)(?::|$)")
+
+
+def _exception_class(stderr: Any) -> Optional[str]:
+    """The class name ending a Python traceback on stderr, or None; never its message."""
+    if not isinstance(stderr, str) or "Traceback (most recent call last):" not in stderr:
+        return None
+    lines = [line for line in stderr.splitlines() if line.strip()]
+    match = _TRACEBACK_LAST_LINE.match(lines[-1]) if lines else None
+    return match[1].rsplit(".", 1)[-1][:64] if match else None
+
+
+def _traceback_message(stderr: Any) -> Optional[str]:
+    """The message ending a Python traceback on stderr, or None."""
+    if not isinstance(stderr, str) or "Traceback (most recent call last):" not in stderr:
+        return None
+    lines = [line for line in stderr.splitlines() if line.strip()]
+    return lines[-1].partition(":")[2] if lines and ":" in lines[-1] else None
 
 
 def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
@@ -1102,6 +1152,7 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
     output_items, tools = [], []
     agent_stop_reason = None
     agent_error = None
+    error_texts: list[Any] = []
     saved = None
     harness_error = None
     if response_path.exists():
@@ -1118,6 +1169,10 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
             # The inner harness's own failure label (hermes status/error,
             # terminus metadata agent_error) is kept, not dropped.
             agent_error = (saved.metadata or {}).get("agent_error")
+            error_texts = [
+                (saved.metadata or {}).get("hermes_error"),
+                saved.error.message if saved.error else None,
+            ]
             if saved.status == "failed" and not agent_error:
                 agent_error = (saved.error.code if saved.error else None) or "failed"
         except (json.JSONDecodeError, ValueError) as e:
@@ -1130,12 +1185,31 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
     except (OSError, ValueError):
         agent_result = {}
     exit_code = agent_result.get("return_code")
+    # A timeout or sandbox error is already typed; a plain nonzero exit is the harness process dying. Its
+    # cause is not decided here: an exception the policy's output raised (an empty compaction summary), a
+    # kill the model sent its own process and a runtime fault look the same. It keeps scoring and is named,
+    # so it can be classified from the record. The causes that are proven external (an unreachable
+    # endpoint, a failed setup, a sandbox error, a memory-limit kill with evidence) are masked above.
+    agent_exit_nonzero = agent_result.get("error_type") is None and exit_code not in (None, 0)
+    stderr = agent_result.get("stderr")
+    # The harness's own error text, and the endpoint's refusal when it had already ended the episode: a harness
+    # refused after a guard or turn stop reports that as a failed request, not as a crash.
+    crash_message = _traceback_message(stderr) if agent_exit_nonzero else None
+    error_text = next((text for text in map(bounded_error_text, [*error_texts, crash_message]) if text), None)
+    stop_reason = endpoint_stop_reason(*error_texts)
+    if stop_reason is None and isinstance(agent_stop_reason, str):
+        stop_reason = agent_stop_reason
     labels = {
         "agent_failed": agent_error is not None,
         "agent_error": agent_error,
         "mask_sample": mask_sample or harness_error is not None,
-        # A timeout or sandbox error is already masked; a plain nonzero exit is a harness crash.
-        "agent_exit_nonzero": agent_result.get("error_type") is None and exit_code not in (None, 0),
+        "agent_exit_nonzero": agent_exit_nonzero,
+        "agent_return_code": exit_code if agent_exit_nonzero else None,
+        "agent_exception": _exception_class(stderr) if agent_exit_nonzero else None,
+        "agent_error_text": error_text if (agent_error is not None or agent_exit_nonzero) else None,
+        "agent_stop_reason": stop_reason,
+        "error_kind": "harness" if harness_error is not None else None,
+        "error_detail": (persisted.error_detail or harness_error.message[:512]) if harness_error is not None else None,
     }
     update_metrics(params.metrics_fpath, labels, params.task_name)
 

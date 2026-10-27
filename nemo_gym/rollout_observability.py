@@ -244,11 +244,49 @@ class AgentObservationBundle(ObservationModel):
         return self
 
 
+# The error code of the episode endpoint's HTTP 400 once it has ended the episode (a guard, degeneration or turn
+# stop). A harness that is refused afterwards reports it as a failed request, not as a crash of its own.
+EPISODE_TERMINATED_CODE = "episode_terminated"
+_SECRET_FIELD = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|bearer|token|secret|password|cookie)\b[=:\s\"']*(?:(?:bearer|basic)\s+)?[^\s,;\"']+"
+)
+
+
+def bounded_error_text(value: Any, limit: int = 300) -> Optional[str]:
+    """A harness error message as a record field: secrets redacted, whitespace folded, at most ``limit`` characters."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(_SECRET_FIELD.sub(lambda match: f"{match[1]}=[redacted]", value).split())
+    text = "".join(char for char in text if char.isprintable())
+    return text[:limit] or None
+
+
+def endpoint_stop_reason(*texts: Any) -> Optional[str]:
+    """``episode_terminated`` when an error text carries the episode endpoint's refusal code, else None."""
+    return EPISODE_TERMINATED_CODE if any(isinstance(t, str) and EPISODE_TERMINATED_CODE in t for t in texts) else None
+
+
+# A harness labels a failure before any policy action ``setup_failed:<cause>`` (Terminus-2: tmux unavailable).
+_SETUP_FAILURE_PREFIX = "setup_failed:"
+# The OpenAI SDK's own message for a request that never got an HTTP response; Hermes reports it verbatim.
+_CONNECTION_FAILED = re.compile(r"Connection error\.?")
+
+
 def harness_response_error(
     response: NeMoGymResponse, observations: Optional[AgentObservationBundle] = None
 ) -> Optional[ResponseError]:
-    """Separate endpoint/no-call failures from the harness's policy-stop labels."""
+    """Separate endpoint/sandbox/no-call failures from the harness's policy-stop labels.
+
+    Only a cause outside the policy counts: a model endpoint that was unreachable or answered with a
+    gateway or auth error, a sandbox that could not start the harness, or a harness that made no model
+    call. A harness exception, a nonzero exit or a kill with no such evidence is not decided here.
+    """
     if response.error is not None and (response.metadata or {}).get("model_transport_error") == "true":
+        return response.error
+    setup_failure = (response.metadata or {}).get("agent_error")
+    if isinstance(setup_failure, str) and setup_failure.startswith(_SETUP_FAILURE_PREFIX):
+        return response.error or ResponseError(code="server_error", message=setup_failure)
+    if response.error is not None and _CONNECTION_FAILED.fullmatch(response.error.message.strip()):
         return response.error
     if response.error is not None and re.match(
         r"Error code: (?:401|403|404|408|429|5[0-9]{2})\b", response.error.message

@@ -79,6 +79,25 @@ gym eval run --no-serve \
 Each rollout row contains `reward` (0.0 or 1.0), the full agent trajectory, and
 `mask_sample` (set when a timeout made the reward unreliable).
 
+A harness failure is masked only when its cause is outside the policy: an unreachable model
+endpoint, a failed harness setup, a sandbox error, or an OOM kill while the sandbox's own memory limit
+never fired (an ancestor cgroup or the host).
+Such a row carries `error_kind: "harness"` (or `sandbox_failed`) and `mask_sample=true`. A harness
+that exits nonzero with no such evidence keeps scoring, because the policy's own output (an empty
+compaction summary) or its own commands can end the process; the row names it with
+`agent_exit_nonzero`, `agent_return_code` and `agent_exception` (the traceback's class name).
+
+Every failed row also carries `agent_error`, `agent_error_text` (the harness's message, redacted and
+cut to 300 characters) and `agent_stop_reason`. A harness the episode endpoint refused after it had
+ended the episode (a guard, degeneration or turn stop) reports that HTTP 400 as an API failure of its
+own; its `agent_stop_reason` is `episode_terminated`, and it stays a scored outcome of the policy.
+
+A harness the sandbox's own memory limit killed (exit 137 or -9 beside `sandbox_oom_kill` while the
+sandbox `oom` or `max` counter moved) scores 0 and is typed `error_kind: "agent_memory_limit"`, not masked:
+limits are meant to be generous enough for normal solutions and to stop inefficient or broken ones. When the
+counters do not say whose limit fired, it also scores and the detail says so; only a kill with both counters
+present and zero is masked as a sandbox failure.
+
 ## Agent wiring
 
 Swap the agent by changing three fields in the YAML (or overriding on the CLI):

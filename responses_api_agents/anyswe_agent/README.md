@@ -112,5 +112,15 @@ Resolved patches receive reward `1`; other completed attempts receive `0`.
 Agent timeouts, evaluation timeouts, sandbox failures, and accidental successes
 after max-iteration or context-window termination set `mask_sample=true`.
 
+An exception out of the agent runner that is not model-transport-shaped keeps scoring (the
+policy's own output can raise it, and the cause is otherwise unproven): `error_kind` is `agent` and
+`agent_exception` names the exception class. A harness the sandbox memory limit killed likewise
+scores 0 as `agent_memory_limit`, as in anyterminal; only a kill while the sandbox's own limit never fired
+(`oom` and `max` counters present and zero) is a masked `sandbox` failure. `agent_error_text` carries the exception's redacted message,
+and a runner refused after the episode endpoint ended the episode (an HTTP 400 with the
+`episode_terminated` code) has `agent_stop_reason: "episode_terminated"`. A task image without git
+cannot be snapshotted or diffed: the runner reports `setup_failed:git_unavailable` before any policy
+action, which is a masked harness failure.
+
 Each rollout includes the trajectory, patch, reward, grading fields, and
 `mask_sample`.

@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -255,6 +256,7 @@ def _exception_response(exc: Exception, body):
     from openai import APIConnectionError
 
     from nemo_gym.openai_utils import NeMoGymResponse
+    from nemo_gym.rollout_observability import bounded_error_text, endpoint_stop_reason
 
     cause = exc
     seen = set()
@@ -277,12 +279,39 @@ def _exception_response(exc: Exception, body):
     message = f"Harness exception: {type(cause).__name__}"
     if isinstance(status, int):
         message = f"Error code: {status}; {message}"
+    # An HTTP 400 carrying the endpoint's episode_terminated code is the refusal after a guard or turn stop.
+    stop_reason = endpoint_stop_reason(*(str(candidate) for candidate in chain)) if status == 400 else None
     return NeMoGymResponse(
         id="anyswe-runner-exception", created_at=0, model=body.model, object="response", output=[],
         tool_choice=body.tool_choice, tools=body.tools, parallel_tool_calls=body.parallel_tool_calls,
         status="failed", error={"code": "server_error", "message": message},
-        metadata={"runner_exception": "true", "model_transport_error": "true" if transport else "false"},
+        metadata={
+            "runner_exception": "true",
+            "model_transport_error": "true" if transport else "false",
+            "exception_class": type(cause).__name__[:64],
+            **({"exception_text": text} if (text := bounded_error_text(str(cause))) else {}),
+            **({"stop_reason": stop_reason} if stop_reason else {}),
+        },
     )
+
+
+def _setup_failure_response(model: str, cause: str):
+    """The failed response of a runner that could not start for a reason in the task image, before any policy action."""
+    from nemo_gym.openai_utils import NeMoGymResponse
+
+    label = f"setup_failed:{cause}"
+    return NeMoGymResponse(
+        id="anyswe-setup-failure", created_at=0, model=model, object="response", output=[],
+        tool_choice="auto", tools=[], parallel_tool_calls=True,
+        status="failed", error={"code": "server_error", "message": label}, metadata={"agent_error": label},
+    )
+
+
+def _git_unavailable_response(repo: Path | None, model: str):
+    """A setup failure when the task has a repository but its image has no git to snapshot and diff it."""
+    if repo is not None and shutil.which("git") is None:
+        return _setup_failure_response(model, "git_unavailable")
+    return None
 
 
 def _run_and_capture(agent, request, body, repo, index_path, baseline_tree, output_dir: Path) -> None:
@@ -291,6 +320,8 @@ def _run_and_capture(agent, request, body, repo, index_path, baseline_tree, outp
         try:
             response = asyncio.run(agent.responses(request=request, body=body))
         except Exception as exc:
+            # The response carries the class and a bounded message; the traceback is for the sandbox log.
+            traceback.print_exc()
             response = _exception_response(exc, body)
         (output_dir / "response.json").write_text(response.model_dump_json())
         print(f"agent finished: {len(response.output)} output items", flush=True)
@@ -350,6 +381,11 @@ def main() -> None:
     # does not mutate the repository index the agent sees.
     repo = _find_repo(task_cwd)
     index_path = Path("/trajectories_mount/anyswe-baseline.index")
+    unavailable = _git_unavailable_response(repo, model_name)
+    if unavailable is not None:
+        Path("/trajectories_mount/response.json").write_text(unavailable.model_dump_json())
+        print("setup failed: the task image has no git", flush=True)
+        return
     baseline_tree = _snapshot_repo(repo, index_path) if repo else None
 
     body = NeMoGymResponseCreateParamsNonStreaming(

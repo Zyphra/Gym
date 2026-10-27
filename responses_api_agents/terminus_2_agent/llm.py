@@ -32,6 +32,7 @@ from tenacity import (
 )
 
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.rollout_observability import EPISODE_TERMINATED_CODE
 from responses_api_agents.terminus_2_agent.context_budget import record_served_context
 
 
@@ -297,6 +298,11 @@ class NemoGymLLM(BaseLLM):
             if any(phrase in error_text for phrase in _CONTEXT_LENGTH_ERROR_PHRASES):
                 self.context_length_exceeded = True
                 raise ContextLengthExceededError(f"Model {self._model_name} context length exceeded: {response.text}")
+            if response.status_code == 400 and EPISODE_TERMINATED_CODE in error_text:
+                # The episode endpoint ended the episode (a guard or turn stop) and refuses what follows; the
+                # trajectory so far is the policy's, as for a terminal stop reason served in a response.
+                self.terminal_stop_reason = EPISODE_TERMINATED_CODE
+                raise EpisodeTerminatedError(EPISODE_TERMINATED_CODE)
             if response.status_code in {401, 403, 404, 408, 429} or 500 <= response.status_code < 600:
                 self.model_transport_error = f"Model endpoint HTTP {response.status_code}"
             response.raise_for_status()

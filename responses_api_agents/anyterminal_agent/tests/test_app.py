@@ -1196,6 +1196,167 @@ class TestTerminalResponseLabels:
             "agent_failed": False, "agent_error": None, "agent_exit_nonzero": False, "mask_sample": False,
         }
 
+    def _outcome(self, cfg: AnyTerminalInstanceConfig) -> dict:
+        """The /run result the training loop reads, built from the persisted metrics as ``run`` does."""
+        response = app._terminal_response(cfg)
+        metrics = app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"])
+        return app.AnyTerminalVerifyResponse(
+            responses_create_params={"input": []},
+            response=response,
+            reward=1.0 if metrics.resolved else 0.0,
+            instance_config={},
+            **metrics.model_dump(),
+        ).model_dump(mode="json")
+
+    @pytest.mark.parametrize("exit_code", [1, 137, 143, -9, -15])
+    @pytest.mark.parametrize(
+        "stderr,exception,message",
+        [
+            (
+                "Traceback (most recent call last):\n  File \"agent_runner.py\", line 321, in <module>\n"
+                "harness_fixture.errors.CompactionFailed: summary fixture was empty",
+                "CompactionFailed",
+                "summary fixture was empty",
+            ),
+            (
+                "Traceback (most recent call last):\n  File \"x.py\", line 1\nRuntimeError: runtime fault",
+                "RuntimeError",
+                "runtime fault",
+            ),
+            ("Killed", None, None),
+            ("", None, None),
+        ],
+        ids=["named-exception", "runtime-error", "killed", "silent"],
+    )
+    def test_a_harness_crash_of_unproven_cause_keeps_scoring_and_is_named(
+        self, tmp_path: Path, exit_code: int, stderr: str, exception: str | None, message: str | None
+    ) -> None:
+        cfg = _make_instance_config(tmp_path)
+        update_metrics(cfg.metrics_fpath, {"resolved": False})
+        (cfg.persistent_dir / "agent_result.json").write_text(
+            json.dumps({"return_code": exit_code, "error_type": None, "stderr": stderr})
+        )
+        outcome = self._outcome(cfg)
+        assert outcome["mask_sample"] is False and outcome["error_kind"] is None
+        assert outcome["agent_exit_nonzero"] is True and outcome["agent_return_code"] == exit_code
+        assert outcome["agent_exception"] == exception
+        assert outcome["reward"] == 0.0 and outcome["resolved"] is False
+        # The harness's own message is exported, bounded, so the cause can be read from the record.
+        assert outcome["agent_error_text"] == message
+
+    def test_model_failure_stays_a_scored_zero_with_no_crash_label(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        update_metrics(cfg.metrics_fpath, {"resolved": False})
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(status="completed")))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        outcome = self._outcome(cfg)
+        assert outcome["mask_sample"] is False and outcome["error_kind"] is None
+        assert outcome["agent_exit_nonzero"] is False
+        assert outcome["agent_return_code"] is None and outcome["agent_exception"] is None
+        assert outcome["reward"] == 0.0
+
+    def test_exit_labels_ignore_a_timeout(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        update_metrics(cfg.metrics_fpath, {"resolved": True, "agent_timed_out": True})
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": -9, "error_type": "timeout"}))
+        outcome = self._outcome(cfg)
+        assert outcome["agent_exit_nonzero"] is False and outcome["agent_return_code"] is None
+
+    @pytest.mark.parametrize("exit_code", [137, -9])
+    def test_memory_killed_harness_keeps_its_sandbox_mask(self, tmp_path: Path, exit_code: int) -> None:
+        # process_single_datapoint marks a harness the memory limit killed, with kernel evidence, sandbox_failed.
+        cfg = _make_instance_config(tmp_path)
+        update_metrics(cfg.metrics_fpath, {
+            "sandbox_failed": True, "mask_sample": True, "sandbox_oom_kill": 2,
+            "error_detail": "agent harness killed by the sandbox memory limit (exit 137, oom_kill 2)",
+        })
+        (cfg.persistent_dir / "agent_result.json").write_text(
+            json.dumps({"return_code": exit_code, "error_type": None})
+        )
+        outcome = self._outcome(cfg)
+        assert (outcome["sandbox_failed"], outcome["mask_sample"], outcome["error_kind"]) == (True, True, None)
+        assert outcome["agent_exit_nonzero"] is True and "sandbox memory limit" in outcome["error_detail"]
+
+    @pytest.mark.parametrize("exit_code", [0, 1])
+    def test_an_unreachable_policy_endpoint_is_a_masked_harness_failure(self, tmp_path: Path, exit_code: int) -> None:
+        # Hermes retried, then reported the OpenAI SDK's own message for a request with no HTTP response.
+        cfg = _make_instance_config(tmp_path)
+        error = {"code": "server_error", "message": "Connection error."}
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(
+            status="failed", error=error, metadata={"hermes_error": "Connection error.", "failed": "true"},
+        )))
+        (cfg.persistent_dir / "agent_result.json").write_text(
+            json.dumps({"return_code": exit_code, "error_type": None})
+        )
+        outcome = self._outcome(cfg)
+        assert (outcome["error_kind"], outcome["mask_sample"]) == ("harness", True)
+        assert outcome["error_detail"] == "Connection error."
+        assert outcome["response"]["status"] == "failed"
+
+    def test_a_failed_setup_is_a_masked_harness_failure(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(
+            status="completed", metadata={"agent_error": "setup_failed:tmux_unavailable"},
+        )))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        outcome = self._outcome(cfg)
+        assert (outcome["error_kind"], outcome["mask_sample"]) == ("harness", True)
+        assert outcome["agent_error"] == "setup_failed:tmux_unavailable"
+
+    @pytest.mark.parametrize("exit_code", [0, 1])
+    def test_a_refusal_after_the_endpoint_ended_the_episode_is_labelled_a_stop_not_a_crash(
+        self, tmp_path: Path, exit_code: int
+    ) -> None:
+        # Hermes reports the endpoint's HTTP 400 after a guard stop as an API failure of its own.
+        refusal = (
+            "HTTP 400: Error code: 400 - Hit an exception in VLLMModel___policy_model calling an inner server: "
+            "b'{\"error\":{\"message\":\"This episode has ended (empty_turns); no further turns are served.\","
+            "\"code\":\"episode_terminated\"}}'"
+        )
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(
+            status="failed", error={"code": "server_error", "message": refusal},
+            metadata={"hermes_error": refusal, "failed": "true"},
+        )))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": exit_code, "error_type": None}))
+        outcome = self._outcome(cfg)
+        assert (outcome["error_kind"], outcome["mask_sample"]) == (None, False)
+        assert outcome["agent_stop_reason"] == "episode_terminated"
+        assert outcome["agent_failed"] is True and outcome["agent_error"] == "server_error"
+        assert "This episode has ended (empty_turns)" in outcome["agent_error_text"]
+        assert len(outcome["agent_error_text"]) <= 300
+
+    def test_a_terminus_stop_reason_and_a_crash_message_are_exported(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(
+            status="completed", metadata={"stop_reason": "episode_terminated"},
+        )))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        assert self._outcome(cfg)["agent_stop_reason"] == "episode_terminated"
+        crashed = _make_instance_config(tmp_path / "crashed")
+        (crashed.persistent_dir / "agent_result.json").write_text(json.dumps({
+            "return_code": 1, "error_type": None,
+            "stderr": "Traceback (most recent call last):\n  File \"x\"\nKeyError: 'api_key=sk-abc123 missing'",
+        }))
+        outcome = self._outcome(crashed)
+        assert outcome["agent_exception"] == "KeyError"
+        assert "sk-abc123" not in outcome["agent_error_text"] and "[redacted]" in outcome["agent_error_text"]
+
+    @pytest.mark.parametrize("message", [
+        "Model generated invalid tool call: finish",
+        "Context length exceeded: max compression attempts (3) reached.",
+        "Connection error while reading the policy's file",
+    ])
+    def test_a_policy_error_with_a_failed_status_stays_scored(self, tmp_path: Path, message: str) -> None:
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(
+            status="failed", error={"code": "server_error", "message": message},
+        )))
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        outcome = self._outcome(cfg)
+        assert (outcome["error_kind"], outcome["mask_sample"]) == (None, False)
+        assert outcome["agent_failed"] is True
+
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("fault", [None, "container_timed_out", "sandbox_failed", "mask_sample"])
@@ -1219,12 +1380,9 @@ def test_timeout_policy_is_strict_and_default_off(tmp_path):
         _make_instance_config(tmp_path, agent_timeout_is_failure="true")
 
 
-@pytest.mark.parametrize("harness_exit,oom_kills,infra", [(137, 1, True), (137, 0, False), (0, 1, False)])
-def test_harness_oom_requires_both_process_exit_and_kernel_event(harness_exit, oom_kills, infra):
-    problem = harness_memory_kill(harness_exit, {"sandbox_oom_kill": oom_kills})
-    metrics = app.TerminalBenchMetrics(resolved=False, sandbox_failed=problem is not None)
-    metrics.apply_timeout_policy(agent_timeout_is_failure=True)
-    assert metrics.mask_sample is infra
+@pytest.mark.parametrize("harness_exit,oom_kills,killed", [(137, 1, True), (137, 0, False), (0, 1, False)])
+def test_harness_oom_requires_both_process_exit_and_kernel_event(harness_exit, oom_kills, killed):
+    assert (harness_memory_kill(harness_exit, {"sandbox_oom_kill": oom_kills}) is not None) is killed
 
 
 class TestProcessSingleDatapoint:
@@ -1335,14 +1493,27 @@ class TestProcessSingleDatapoint:
         assert "without a readable reward.txt: ValueError" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
-        "agent_return_code,oom_kill,infrastructure",
-        [(0, 1, False), (137, 2, True)],
-        ids=["tool-killed-agent-finished", "agent-killed-by-limit"],
+        "agent_return_code,oom_kill,limit_fired,masked,kind",
+        [
+            (0, 1, True, False, None),
+            (137, 2, True, False, "agent_memory_limit"),
+            (137, 2, False, True, None),
+            (137, 0, True, False, None),
+            (1, 0, True, False, None),
+        ],
+        ids=[
+            "tool-killed-agent-finished",
+            "agent-killed-by-its-own-limit-is-scored",
+            "agent-killed-outside-its-limit-is-masked",
+            "agent-killed-without-oom-evidence",
+            "agent-raised",
+        ],
     )
-    async def test_sandbox_memory_kills_are_counted_and_only_a_killed_harness_is_infrastructure(
-        self, tmp_path: Path, agent_return_code: int, oom_kill: int, infrastructure: bool
+    async def test_a_harness_the_sandbox_limit_killed_scores_and_only_a_kill_outside_the_limit_is_infrastructure(
+        self, tmp_path: Path, agent_return_code: int, oom_kill: int, limit_fired: bool, masked: bool, kind: str | None
     ) -> None:
         cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+        oom, high_water = (oom_kill, 9) if limit_fired else (0, 0)
 
         class RetainedEventsProvider:
             """A provider whose sandbox cgroup kept memory.events at close, as the Apptainer provider does."""
@@ -1367,11 +1538,12 @@ class TestProcessSingleDatapoint:
                 pass
 
             def memory_events(self, handle):
-                return {"max": 9 if self.seen_oom else 0, "oom": self.seen_oom, "oom_kill": self.seen_oom}
+                moved = bool(self.seen_oom)
+                return {"max": high_water if moved else 0, "oom": oom if moved else 0, "oom_kill": self.seen_oom}
 
             def retained_memory_events(self, handle):
                 assert self.closed, "events are read after the sandbox is stopped"
-                return {"low": 0, "high": 0, "max": 9, "oom": oom_kill, "oom_kill": oom_kill}
+                return {"low": 0, "high": 0, "max": high_water, "oom": oom, "oom_kill": oom_kill}
 
         with patch(
             "responses_api_agents.anyterminal_agent.app.AsyncSandbox",
@@ -1382,14 +1554,24 @@ class TestProcessSingleDatapoint:
 
         metrics = json.loads(cfg.metrics_fpath.read_text())
         assert (metrics["sandbox_oom"], metrics["sandbox_oom_kill"], metrics["sandbox_memory_max_events"]) == (
+            oom,
             oom_kill,
-            oom_kill,
-            9,
+            high_water,
         )
         assert resolved is True
-        assert metrics["sandbox_failed"] is infrastructure
-        assert metrics["mask_sample"] is infrastructure
-        assert ("sandbox memory limit (exit 137, oom_kill 2)" in metrics.get("error_detail", "")) is infrastructure
+        assert metrics["sandbox_failed"] is masked
+        assert metrics["mask_sample"] is masked
+        assert metrics.get("error_kind") == kind
+        killed = agent_return_code == 137 and oom_kill > 0
+        assert ("sandbox memory limit (exit 137, oom_kill 2)" in metrics.get("error_detail", "")) is killed
+        assert ("never fired" in metrics.get("error_detail", "")) is masked
+        assert ("; scored (sandbox memory limit: sandbox_limit)" in metrics.get("error_detail", "")) is (kind is not None)
+        # Any other nonzero exit has no proven cause: it keeps scoring and is named.
+        labelled = json.loads(app._terminal_response(cfg).metadata["metrics"])
+        assert labelled["mask_sample"] is masked
+        assert labelled.get("error_kind") == kind
+        assert labelled["agent_exit_nonzero"] is bool(agent_return_code)
+        assert labelled.get("agent_return_code") == (agent_return_code or None)
 
     @pytest.mark.parametrize(
         "verifier_return_code,reward,oom_kill,infrastructure",
@@ -1715,3 +1897,20 @@ def test_apptainer_preserves_existing_mount_exclusions(tmp_path, monkeypatch, ar
     actual = provider._create_config.extra_start_args
     assert any("bind-paths,home,tmp" in value for value in actual)
     assert args in (["--no-mount", "bind-paths"], ["--no-mount=bind-paths"])
+
+
+@pytest.mark.parametrize(
+    "events,origin",
+    [
+        ({"sandbox_oom": 0, "sandbox_memory_max_events": 0, "sandbox_oom_kill": 2}, "outside_sandbox_limit"),
+        ({"sandbox_oom": 1, "sandbox_memory_max_events": 0, "sandbox_oom_kill": 2}, "sandbox_limit"),
+        ({"sandbox_oom": 0, "sandbox_memory_max_events": 7, "sandbox_oom_kill": 2}, "sandbox_limit"),
+        ({"sandbox_oom_kill": 2}, "unresolved"),
+        ({"sandbox_oom": 0, "sandbox_oom_kill": 2}, "unresolved"),
+        ({}, "unresolved"),
+    ],
+)
+def test_memory_kill_origin_masks_only_a_kill_the_sandbox_limit_did_not_cause(events, origin):
+    from nemo_gym.sandbox.episode import memory_kill_origin
+
+    assert memory_kill_origin(events) == origin
