@@ -102,3 +102,12 @@ hermes_agent:
 The model-server url is resolved at request time and passed to `AIAgent(base_url=..., api_key="gym")`. <!-- pragma: allowlist secret -->
 
 `context_window` binds the native compressor to the served model window; model-name fallback metadata must not override a configured training window. `compression_threshold` (default `0.50`, Hermes' `compression.threshold` default) is the fraction of that window at which Hermes compresses. `compression_summary_temperature` (default `null`) replaces the temperature of the compression request; `null` keeps Hermes' own `0.3`.
+
+### Summary output budget
+
+`compression_summary_max_output_tokens` defaults to `32768` and projects to
+Hermes' `compression.summary_max_output_tokens`. It includes reasoning and visible
+summary tokens. Thinking and the visible-summary target remain unchanged;
+`compression_target_ratio` only controls recent-tail retention. Choose an output
+budget that fits the policy model's context window together with the summary input.
+Requires the Hermes runtime's summary-output-budget configuration support.
