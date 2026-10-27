@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1048,6 +1049,7 @@ class TestSandboxAPI:
             rollout_id="rollout-1",
             sandbox_model_base_url=None,
             agent_overlay_files={},
+            agent_environment={},
         )
         env = AnySweAgent._sandbox_agent_env(params)
         kwargs = json.loads(base64.b64decode(env["NGSWE_AGENT_KWARGS_B64"]))
@@ -1058,6 +1060,31 @@ class TestSandboxAPI:
 
         params.agent_overlay_files = {"/trajectories_mount/agent_overlay/tools/example.py": "pass"}
         assert AnySweAgent._sandbox_agent_env(params)["PYTHONPATH"] == "/trajectories_mount/agent_overlay"
+
+    def test_agent_environment_reaches_the_harness_process_before_it_imports(self, tmp_path) -> None:
+        """A setting the harness reads at import time (Hermes' HERMES_REDACT_SECRETS) takes effect."""
+        params = SimpleNamespace(
+            body=SimpleNamespace(model="model", temperature=1.0, top_p=1.0, max_output_tokens=None),
+            agent_kwargs={}, model_server_url="http://model-host:8000/v1", agent_server_module="example.agent",
+            agent_server_class="ExampleAgent", agent_config_class="ExampleAgentConfig", rollout_id=None,
+            sandbox_model_base_url=None, agent_overlay_files={},
+            agent_environment={"HERMES_REDACT_SECRETS": "false"},
+        )
+        env = AnySweAgent._sandbox_agent_env(params)
+        assert env["HERMES_REDACT_SECRETS"] == "false"
+        # A redaction module snapshotting the switch at import, as Hermes' agent/redact.py does.
+        (tmp_path / "redact.py").write_text(
+            "import os\n"
+            "_ENABLED = os.getenv('HERMES_REDACT_SECRETS', '').lower() not in ('0', 'false', 'no', 'off')\n"
+            "def redact(text):\n    return text.replace('token=abc', 'token=***') if _ENABLED else text\n"
+        )
+        probe = "import redact; print(redact.redact('token=abc'))"
+        shown = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(tmp_path)!r}); {probe}"],
+                               env={"PATH": os.environ["PATH"], **env}, capture_output=True, text=True, check=True)
+        assert shown.stdout.strip() == "token=abc"
+        params.agent_environment = {"NGSWE_MODEL_URL": "http://elsewhere"}
+        with pytest.raises(ValueError, match="runner variables"):
+            AnySweAgent._sandbox_agent_env(params)
 
     def test_agent_error_classification_matches_swe_agents(self) -> None:
         assert _classify_agent_error("maximum iteration reached") == "max_iteration"
