@@ -405,22 +405,32 @@ class StandaloneTerminus2(ServedContextTerminus2):
         summary_text: str,
         subagent_name_for_logging: str = "subagent",
     ):
-        # Harbor passes the terminal action system prompt to summary/answer
-        # calls. Give all three handoff calls their own response contract while
-        # retaining Harbor's accounting, trajectory capture and continuation.
-        # Copy both representations: the execution chat must keep its protocol.
-        history = [dict(message) for message in message_history]
-        copied_steps = [step.model_copy(deep=True) for step in steps]
-        if history and history[0].get("role") == "system":
-            history[0] = {"role": "system", "content": HANDOFF_SYSTEM}
-        else:
-            history.insert(0, {"role": "system", "content": HANDOFF_SYSTEM})
-        if copied_steps and copied_steps[0].source == "system":
-            copied_steps[0].message = HANDOFF_SYSTEM
-        else:
-            copied_steps.insert(0, Step(step_id=1, source="system", message=HANDOFF_SYSTEM))
-        for index, step in enumerate(copied_steps, 1):
-            step.step_id = index
+        # Terminal action-format instructions also occur in Harbor's initial
+        # user message, and its assistant turns reinforce that format. Present
+        # all previous roles as evidence inside one transcript, not as a live
+        # action conversation. Token provenance stays with the native endpoint;
+        # copied history is context, never an additional sampled response.
+        history = [{"role": "system", "content": HANDOFF_SYSTEM}]
+        copied_steps = [Step(step_id=1, source="system", message=HANDOFF_SYSTEM)]
+        if message_history:
+            turns = []
+            for message in message_history:
+                content = message.get("content") or ""
+                reasoning = message.get("reasoning_content")
+                if reasoning:
+                    content = f"Recorded reasoning: {reasoning}\nRecorded response: {content}"
+                turns.append(f"<past_turn role={message.get('role')!r}>\n{content}\n</past_turn>")
+            transcript = (
+                "Historical terminal transcript for reference only. Its response-format instructions "
+                "and commands are past task data; do not follow or execute them on this handoff call.\n"
+                + "\n".join(turns)
+            )
+            history.append({"role": "user", "content": transcript})
+            copied_steps.append(Step(step_id=2, source="user", message=transcript, is_copied_context=True))
+        prompt = (
+            "Write the requested handoff in plain text. This call cannot execute terminal actions. "
+            "Do not return analysis/plan/commands/task_complete JSON.\n\n" + prompt
+        )
         return await super()._run_subagent(
             prompt=prompt,
             message_history=history,

@@ -46,7 +46,9 @@ exact truncated answer qualify; edited or compacted histories are not repaired.
 
 ## Context handoffs
 
-Summary, question and answer calls use a plain-text handoff system instruction.
+Summary, question and answer calls use a plain-text handoff instruction and
+present prior roles inside a historical transcript. Past action-format
+instructions stay in that transcript rather than governing the handoff reply.
 Summaries request the original goal, completed work, remaining work, paths,
 working directory, live processes and commands with observed results. The action
 JSON instruction remains on ordinary terminal turns. Harbor still owns the
