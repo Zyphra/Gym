@@ -110,6 +110,11 @@ def test_native_summary_reuses_the_main_client_model_and_rollout_url(monkeypatch
         assert [body["model"] for _, body in requests] == ["fixture-policy"] * 2
         assert requests[1][1]["tool_choice"] == "none"
         assert requests[1][1]["max_tokens"] <= 8192
+        # The handoff is requested as visible text; the task turn and later task turns keep thinking on.
+        assert requests[1][1]["chat_template_kwargs"] == {"enable_thinking": False, "truncate_history_thinking": False}
+        assert requests[0][1]["chat_template_kwargs"] == {"enable_thinking": True, "truncate_history_thinking": False}
+        later = native_agents[0]._build_api_kwargs([{"role": "user", "content": "next task turn"}])
+        assert later["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
         record_property("native_runtime", str(Path(run_agent.__file__).resolve()))
         record_property(
             "captured_routes", json.dumps([{"path": path, "model": body["model"]} for path, body in requests])
@@ -128,3 +133,45 @@ def test_older_native_compressor_refuses_before_any_policy_call():
 
     with pytest.raises(RuntimeError, match="managed summary callback"):
         _bind_policy_summary(SimpleNamespace(context_compressor=SimpleNamespace()))
+
+
+def _summary_callback(build_api_kwargs):
+    from types import SimpleNamespace
+
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs)
+        message = SimpleNamespace(content="Visible handoff.", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
+
+    agent = SimpleNamespace(
+        context_compressor=SimpleNamespace(managed_summary_callback=None),
+        model="fixture-policy",
+        _build_api_kwargs=build_api_kwargs,
+        client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create))),
+    )
+    _bind_policy_summary(agent)
+    return agent.context_compressor.managed_summary_callback, sent
+
+
+def test_summary_request_closes_thinking_without_touching_the_shared_task_settings():
+    shared = {"enable_thinking": True, "truncate_history_thinking": False}
+
+    def build(messages):
+        return {"messages": messages, "extra_body": {"chat_template_kwargs": shared, "top_k": 20}}
+
+    summary, sent = _summary_callback(build)
+    assert summary([{"role": "user", "content": "compress"}], 4000) == "Visible handoff."
+    assert sent[0]["max_tokens"] == 4000 and sent[0]["tool_choice"] == "none"
+    assert sent[0]["extra_body"] == {
+        "chat_template_kwargs": {"enable_thinking": False, "truncate_history_thinking": False},
+        "top_k": 20,
+    }
+    assert shared == {"enable_thinking": True, "truncate_history_thinking": False}
+
+
+def test_summary_request_adds_no_template_kwargs_when_the_run_disabled_them():
+    summary, sent = _summary_callback(lambda messages: {"messages": messages})
+    summary([{"role": "user", "content": "compress"}], 4000)
+    assert "extra_body" not in sent[0]
