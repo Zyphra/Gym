@@ -360,17 +360,20 @@ def _route_compression_calls() -> None:
 
 
 def _policy_compression_route(agent, summary_temperature: float | None) -> Callable[..., Any]:
-    """Send a compression request the way Hermes' custom-endpoint client does.
+    """Send a compression request through the run's own policy request builder.
 
-    ``summary_temperature`` replaces the temperature Hermes asks for when set.
+    ``agent._build_api_kwargs`` (the run's patched builder) supplies the model,
+    timeout and ``extra_body`` (the thinking mode included) that the run's policy
+    turns carry; the request then takes the compression messages only, with no
+    tools, Hermes' summary ``max_tokens`` and its temperature, which
+    ``summary_temperature`` replaces when set.
     """
 
     def complete(*, messages, temperature=None, max_tokens=None, tools=None, extra_body=None, **_):
-        request: dict[str, Any] = {
-            "model": agent.model,
-            "messages": messages,
-            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
-        }
+        request: dict[str, Any] = agent._build_api_kwargs(messages)
+        request["messages"] = messages
+        for key in ("tools", "tool_choice", "max_tokens", "max_completion_tokens", "temperature"):
+            request.pop(key, None)
         temperature = summary_temperature if summary_temperature is not None else temperature
         if temperature is not None:
             request["temperature"] = temperature
@@ -379,7 +382,7 @@ def _policy_compression_route(agent, summary_temperature: float | None) -> Calla
         if tools:
             request["tools"] = tools
         if extra_body:
-            request["extra_body"] = extra_body
+            request["extra_body"] = {**request.get("extra_body", {}), **extra_body}
         return agent.client.chat.completions.create(**request)
 
     return complete

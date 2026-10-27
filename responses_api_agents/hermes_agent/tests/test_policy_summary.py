@@ -190,7 +190,7 @@ def test_stock_summary_request_goes_to_each_rollouts_own_policy(monkeypatch, rec
         assert body["model"] == "fixture-policy"
         assert [message["role"] for message in body["messages"]] == ["user"]
         assert "TURNS TO SUMMARIZE:\n[ASSISTANT]: history message 3: " in body["messages"][0]["content"]
-        assert "tools" not in body and "tool_choice" not in body and "chat_template_kwargs" not in body
+        assert "tools" not in body and "tool_choice" not in body
         assert body["max_tokens"] == 4000
         assert body["temperature"] == 0.3
     from agent.context_compressor import SUMMARY_PREFIX
@@ -307,3 +307,69 @@ def test_compression_outside_a_run_keeps_hermes_resolution(monkeypatch, tmp_path
     assert response.choices[0].message.content == SUMMARY_TEXT
     assert path == "/configured/v1/chat/completions"
     assert body["model"] == "configured-summary-model"
+
+
+def test_summary_request_carries_the_policy_turns_request_fields(monkeypatch, tmp_path):
+    """The captured summary request carries every field a policy turn sends except tools and the turn's budget."""
+    summary = {
+        "status": 200,
+        "choice": {"message": {"role": "assistant", "content": SUMMARY_TEXT}, "finish_reason": "stop"},
+    }
+    native_agents: list = []
+    with _PolicyFixture(summary) as policy:
+        app = _agent(
+            tmp_path,
+            monkeypatch,
+            policy.server.server_port,
+            native_agents,
+            temperature=1.0,
+            compression_summary_temperature=1.0,
+        )
+        try:
+            _run(app, "rollout-fields")
+        finally:
+            _close(native_agents)
+        ((summary_path, summary_body),) = policy.summaries()
+        ((main_path, main_body),) = policy.mains()
+
+    assert summary_path == main_path == "/ng-rollout/rollout-fields/v1/chat/completions"
+    assert (
+        summary_body["chat_template_kwargs"]
+        == main_body["chat_template_kwargs"]
+        == {
+            "enable_thinking": True,
+            "truncate_history_thinking": False,
+        }
+    )
+    assert summary_body["model"] == main_body["model"] == "fixture-policy"
+    assert summary_body["temperature"] == main_body["temperature"] == 1.0
+    assert "tools" not in summary_body and "tool_choice" not in summary_body
+    assert summary_body["max_tokens"] == 4000 and main_body["max_tokens"] == 8192
+    assert [message["role"] for message in summary_body["messages"]] == ["user"]
+    # Nothing else differs: token IDs and logprobs are sampled by the serving endpoint, not requested here.
+    ignored = {"messages", "max_tokens", "tools", "tool_choice"}
+    assert {k: v for k, v in summary_body.items() if k not in ignored} == {
+        k: v for k, v in main_body.items() if k not in ignored
+    }
+
+
+def test_summary_request_without_template_kwargs_matches_policy_turns(monkeypatch, tmp_path):
+    """With chat_template_kwargs disabled, neither the policy turn nor the summary sends them."""
+    summary = {
+        "status": 200,
+        "choice": {"message": {"role": "assistant", "content": SUMMARY_TEXT}, "finish_reason": "stop"},
+    }
+    native_agents: list = []
+    with _PolicyFixture(summary) as policy:
+        app = _agent(
+            tmp_path, monkeypatch, policy.server.server_port, native_agents, chat_template_kwargs_enabled=False
+        )
+        try:
+            _run(app, "rollout-plain")
+        finally:
+            _close(native_agents)
+        ((_, summary_body),) = policy.summaries()
+        ((_, main_body),) = policy.mains()
+
+    assert "chat_template_kwargs" not in summary_body and "chat_template_kwargs" not in main_body
+    assert summary_body["temperature"] == 0.3
