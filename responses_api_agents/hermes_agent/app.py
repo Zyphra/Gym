@@ -337,12 +337,6 @@ def _bind_policy_summary(agent) -> None:
         kwargs = agent._build_api_kwargs(messages)
         kwargs.pop("max_completion_tokens", None)
         kwargs.update(model=agent.model, max_tokens=max_tokens, tool_choice="none")
-        # The handoff is visible output: close this request's reasoning prefill, or the budget is spent
-        # inside <think>. Copy before changing; task turns and prior reasoning keep their exact settings.
-        extra_body = dict(kwargs.get("extra_body") or {})
-        if extra_body.get("chat_template_kwargs") is not None:
-            extra_body["chat_template_kwargs"] = {**extra_body["chat_template_kwargs"], "enable_thinking": False}
-            kwargs["extra_body"] = extra_body
         response = agent.client.chat.completions.create(**kwargs)
         choice = response.choices[0]
         content = choice.message.content
