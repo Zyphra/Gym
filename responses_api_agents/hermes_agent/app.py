@@ -22,6 +22,7 @@ import sys
 import tempfile
 from asyncio import Semaphore
 from collections.abc import Mapping
+from contextvars import ContextVar
 from time import time
 from typing import Any, Callable, Optional
 from uuid import uuid4
@@ -299,7 +300,12 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     api_timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     system_prompt: Optional[str] = None
     compression_enabled: bool = True
-    compression_threshold: float = 0.85
+    # Stock Hermes compresses at this fraction of the model context
+    # (hermes_cli/config.py DEFAULT_CONFIG compression.threshold).
+    compression_threshold: float = Field(default=0.50, gt=0, le=1)
+    # Temperature of the compression summary request. None keeps Hermes' own
+    # value (context_compressor.py sends 0.3).
+    compression_summary_temperature: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     chat_template_kwargs_enabled: bool = True
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
@@ -322,34 +328,61 @@ class HermesAgentVerifyResponse(BaseVerifyResponse):
     )
 
 
-def _bind_policy_summary(agent) -> None:
-    """Use Hermes' existing summary callback with this run's policy client.
+_COMPRESSION_ROUTE: ContextVar[Optional[Callable[..., Any]]] = ContextVar("hermes_compression_route", default=None)
 
-    A process-global auxiliary provider cannot carry concurrent rollout URLs.
-    The admitted native compressor exposes this per-instance callback; older
-    runtimes must be replaced rather than silently making untracked summaries.
+
+def _route_compression_calls() -> None:
+    """Answer Hermes' own compression call from the calling run's policy client.
+
+    Stock Hermes summarizes through ``call_llm(task="compression")``
+    (``agent/context_compressor.py`` ``_generate_summary``); with no auxiliary
+    provider configured, a self-hosted deployment resolves it to the main
+    endpoint and model. A process-wide endpoint cannot carry concurrent rollout
+    URLs, so compression calls made inside a run go to the route bound for that
+    run. Everything else in the stock path is unchanged: the request, its
+    max_tokens, an empty summary leaving only the compaction marker, and a
+    failed call dropping the middle turns. Other calls keep Hermes' resolution.
     """
-    compressor = getattr(agent, "context_compressor", None)
-    if compressor is None or not hasattr(compressor, "managed_summary_callback"):
-        raise RuntimeError("Hermes compression requires the native managed summary callback")
+    import agent.context_compressor as context_compressor  # pyright: ignore[reportMissingImports]
 
-    def summary(messages, max_tokens):
-        kwargs = agent._build_api_kwargs(messages)
-        kwargs.pop("max_completion_tokens", None)
-        kwargs.update(model=agent.model, max_tokens=max_tokens, tool_choice="none")
-        response = agent.client.chat.completions.create(**kwargs)
-        choice = response.choices[0]
-        content = choice.message.content
-        if (
-            choice.finish_reason != "stop"
-            or choice.message.tool_calls
-            or not isinstance(content, str)
-            or not content.strip()
-        ):
-            raise RuntimeError("Hermes policy summary was empty, truncated, or emitted tool calls")
-        return content
+    native_call_llm = context_compressor.call_llm
+    if getattr(native_call_llm, "routes_compression", False):
+        return
 
-    compressor.managed_summary_callback = summary
+    def call_llm(task=None, **kwargs):
+        route = _COMPRESSION_ROUTE.get()
+        if task != "compression" or route is None:
+            return native_call_llm(task, **kwargs)
+        return route(**kwargs)
+
+    call_llm.routes_compression = True
+    context_compressor.call_llm = call_llm
+
+
+def _policy_compression_route(agent, summary_temperature: float | None) -> Callable[..., Any]:
+    """Send a compression request the way Hermes' custom-endpoint client does.
+
+    ``summary_temperature`` replaces the temperature Hermes asks for when set.
+    """
+
+    def complete(*, messages, temperature=None, max_tokens=None, tools=None, extra_body=None, **_):
+        request: dict[str, Any] = {
+            "model": agent.model,
+            "messages": messages,
+            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
+        }
+        temperature = summary_temperature if summary_temperature is not None else temperature
+        if temperature is not None:
+            request["temperature"] = temperature
+        if max_tokens is not None:
+            request["max_tokens"] = max_tokens
+        if tools:
+            request["tools"] = tools
+        if extra_body:
+            request["extra_body"] = extra_body
+        return agent.client.chat.completions.create(**request)
+
+    return complete
 
 
 class HermesAgent(SimpleResponsesAPIAgent):
@@ -416,7 +449,6 @@ class HermesAgent(SimpleResponsesAPIAgent):
             reserve = self.config.max_tokens or 0
             if reserve >= self.config.context_window:
                 raise ValueError("Hermes output reserve must be smaller than its context window")
-            config["compression"]["threshold"] *= 1 - reserve / self.config.context_window
         return yaml.dump(config, default_flow_style=False)
 
     def model_post_init(self, __context: Any) -> None:
@@ -488,8 +520,10 @@ class HermesAgent(SimpleResponsesAPIAgent):
             return kw
 
         agent._build_api_kwargs = _patched_build_api_kwargs
+        compression_route = None
         if self.config.compression_enabled:
-            _bind_policy_summary(agent)
+            _route_compression_calls()
+            compression_route = _policy_compression_route(agent, self.config.compression_summary_temperature)
         _execute_every_tool_call(agent)
         _limit_tool_results(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
@@ -510,7 +544,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
         result = None
         agent_error: Optional[BaseException] = None
         interrupted_by_dispatch = False
+        route_token = _COMPRESSION_ROUTE.set(compression_route)
         try:
+            # to_thread copies this context, so the run's compression calls reach its own route.
             result = await asyncio.to_thread(
                 agent.run_conversation,
                 user_message,
@@ -524,6 +560,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             agent_error = exc
             raise
         finally:
+            _COMPRESSION_ROUTE.reset(route_token)
             self.active_agents.discard(agent)
             interrupted_by_dispatch = agent_id in self.interrupted_agents
             self.interrupted_agents.discard(agent_id)
