@@ -692,6 +692,16 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 ).model_dump()
             ]
 
+        # The agent itself ended the run with its confirmed task_complete, not a
+        # timeout, a failure or an endpoint stop (turn cap, guard, context).
+        finished_naturally = bool(
+            finished_naturally
+            and not timed_out
+            and not flags.get("agent_error")
+            and not flags.get("model_transport_error")
+            and not flags.get("stop_reason")
+            and not flags.get("context_length_exceeded")
+        )
         final_metrics = trajectory.get("final_metrics", {})
         input_tokens = final_metrics.get("total_prompt_tokens", 0)
         output_tokens = final_metrics.get("total_completion_tokens", 0)
@@ -741,8 +751,9 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 ),
                 **({"model_transport_error": "true"} if flags.get("model_transport_error") else {}),
                 **({"stop_reason": flags["stop_reason"]} if flags.get("stop_reason") else {}),
-                # Harness-neutral label a wrapping agent (anyterminal) carries.
+                # Harness-neutral labels a wrapping agent (anyterminal) carries.
                 **({"agent_error": flags["agent_error"]} if flags.get("agent_error") else {}),
+                "finished_naturally": "true" if finished_naturally else "false",
             },
         )
 
@@ -789,13 +800,12 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             terminus_metadata = {}
         flags = terminus_metadata.get("agent_error_flags", {})
         timed_out = bool(terminus_metadata.get("timed_out"))
-        naturally = bool(terminus_metadata.get("finished_naturally"))
 
         return Terminus2AgentVerifyResponse.model_validate(
             verify_json
             | {
                 "turns_used": turns,
-                "finished_naturally": naturally and not timed_out,
+                "finished_naturally": (gym_response.metadata or {}).get("finished_naturally") == "true",
                 "agent_timeout_error": int(timed_out),
                 "context_length_exceeded_error": int(flags.get("context_length_exceeded", False)),
                 "agent_failed": bool(flags.get("agent_error")),
