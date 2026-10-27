@@ -34,7 +34,7 @@ from pydantic import ValidationError
 
 from nemo_gym import PARENT_DIR
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxHandle
+from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxHandle, task_shell
 from nemo_gym.sandbox.episode import (
     EPISODE_MEMORY_HEADROOM_MIB,
     harness_memory_kill,
@@ -1059,6 +1059,8 @@ class TestGetRunCommand:
         assert "HermesAgent" in runner
         assert "HermesAgentConfig" in runner
         assert cmd == "/agent_deps_mount/bin/python /trajectories_mount/agent_runner.py"
+        # Task shells start through this helper beside the runner (nemo_gym/sandbox/task_shell.py).
+        assert (persistent_dir / "task_shell.py").read_text() == Path(task_shell.__file__).read_text()
 
 
 # ── RunTerminalAgent ──────────────────────────────────────────────────────────────

@@ -28,6 +28,14 @@ from fastapi import Request
 sys.path.insert(0, "/nemo_gym_mount")
 agent_deps_dir = os.environ.get("NGSWE_AGENT_DEPS_DIR", "/agent_deps_mount")
 os.environ["PATH"] = os.environ.get("PATH", "") + f":{agent_deps_dir}/bin"
+# Task shells the harness starts through bash run without the harness mounts.
+if Path("/trajectories_mount/task_shell.py").is_file():
+    import runpy
+
+    _task_shell = runpy.run_path("/trajectories_mount/task_shell.py", run_name="task_shell")
+    _task_shell["activate"](
+        "/trajectories_mount/task_shell.py", tuple(dict.fromkeys((*_task_shell["HARNESS_MOUNTS"], agent_deps_dir)))
+    )
 
 _REPO_CANDIDATES = ("/testbed", "/workspace/repo", "/app", "/root/repo")
 

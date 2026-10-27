@@ -39,7 +39,7 @@ from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.rollout_observability import AgentObservationBundle, harness_response_error
-from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec
+from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec, task_shell
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.episode import (
     SandboxMemoryEvents,
@@ -54,6 +54,9 @@ from nemo_gym.sandbox.providers.registry import create_provider
 from nemo_gym.server_utils import apply_rollout_prefix
 from nemo_gym.setup_timeout import setup_timeout_seconds
 from responses_api_agents.anyterminal_agent.task_network import TaskNetwork
+
+
+TASK_SHELL = Path(task_shell.__file__)
 
 
 def _format_container(
@@ -271,6 +274,10 @@ sys.path.insert(0, "/nemo_gym_mount")
 # Append (not prepend) agent-deps bin so the task's own python/pip win — else the agent's
 # builds/installs land in a Python the verifier can't see. Harness CLIs stay findable as a fallback.
 os.environ["PATH"] = os.environ.get("PATH", os.defpath) + os.pathsep + "/agent_deps_mount/bin"
+# Task shells the harness starts through bash run without the harness mounts.
+if Path("/trajectories_mount/task_shell.py").is_file():
+    import runpy
+    runpy.run_path("/trajectories_mount/task_shell.py", run_name="task_shell")["activate"]("/trajectories_mount/task_shell.py")
 
 MODEL_URL    = os.environ.get("NGTB_MODEL_URL", "")
 MODEL_NAME   = os.environ["NGTB_MODEL_NAME"]
@@ -388,6 +395,7 @@ class GymAgentHarnessProcessor(BaseModel):
             agent_class_lower=cfg.agent_server_class.lower(),
         )
         (cfg.persistent_dir / "agent_runner.py").write_text(runner)
+        shutil.copyfile(TASK_SHELL, cfg.persistent_dir / "task_shell.py")
         return "/agent_deps_mount/bin/python /trajectories_mount/agent_runner.py"
 
 
@@ -698,6 +706,7 @@ class RunTerminalAgent(BaseModel):
             raise RuntimeError(result.stderr or "failed to create sandbox runtime directories")
         await sandbox.upload(cfg.persistent_dir / "instruction.txt", "/trajectories_mount/instruction.txt")
         await sandbox.upload(cfg.persistent_dir / "agent_runner.py", "/trajectories_mount/agent_runner.py")
+        await sandbox.upload(cfg.persistent_dir / "task_shell.py", "/trajectories_mount/task_shell.py")
         external_runtime = cfg.agent_deps_archive is not None or cfg.agent_deps_url is not None
         if cfg.agent_deps_archive is not None:
             await sandbox.upload(cfg.agent_deps_archive, "/tmp/anyterminal-agent-deps.tar.gz")

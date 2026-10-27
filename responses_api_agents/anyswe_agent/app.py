@@ -39,7 +39,14 @@ from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.rollout_observability import AgentObservationBundle, harness_response_error
-from nemo_gym.sandbox import AsyncSandbox, SandboxCreateError, SandboxExecResult, SandboxResources, SandboxSpec
+from nemo_gym.sandbox import (
+    AsyncSandbox,
+    SandboxCreateError,
+    SandboxExecResult,
+    SandboxResources,
+    SandboxSpec,
+    task_shell,
+)
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.episode import (
     SandboxMemoryEvents,
@@ -51,6 +58,7 @@ from nemo_gym.setup_timeout import setup_timeout_seconds
 
 
 AGENT_OVERLAY_DIR = "/trajectories_mount/agent_overlay"
+TASK_SHELL = Path(task_shell.__file__)
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
 
 
@@ -862,6 +870,7 @@ class AnySweSandboxRunner:
         files = {
             "/trajectories_mount/instruction.txt": (params.persistent_dir / "instruction.txt").read_text(),
             "/trajectories_mount/agent_runner.py": (params.persistent_dir / "agent_runner.py").read_text(),
+            "/trajectories_mount/task_shell.py": TASK_SHELL.read_text(),
             **params.agent_overlay_files,
         }
         setup_plan = None
