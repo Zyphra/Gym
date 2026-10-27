@@ -60,13 +60,13 @@ from nemo_gym.server_utils import get_response_json, raise_for_status
 from responses_api_agents.terminus_2_agent.context_budget import ServedContextTerminus2
 from responses_api_agents.terminus_2_agent.llm import EpisodeTerminatedError, NemoGymLLM
 from responses_api_agents.terminus_2_agent.output import trajectory_to_responses
-from responses_api_agents.terminus_2_agent.task_shell import HARNESS_MOUNTS
 
 
 LOG = logging.getLogger(__name__)
 # Runs under the harness interpreter; see its docstring for the boundary it keeps.
 COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
-TASK_SHELL = Path(__file__).with_name("task_shell.py")
+# nemo_gym/sandbox/task_shell.py BIN_VARIABLE: the runner's task-shell bash directory.
+TASK_SHELL_BIN = "NEMO_GYM_TASK_SHELL_BIN"
 NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
 NATIVE_POLICY_BRIDGE = Path("/native_policy_bridge.py")
 NATIVE_CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -208,6 +208,12 @@ class LocalEnvironment:
         process_env = os.environ.copy()
         if env:
             process_env.update({str(key): str(value) for key, value in env.items()})
+        # These are the harness's own (tmux control) shells; only the pane is a task shell.
+        task_shell_bin = process_env.pop(TASK_SHELL_BIN, None)
+        if task_shell_bin:
+            process_env["PATH"] = os.pathsep.join(
+                entry for entry in process_env.get("PATH", "").split(os.pathsep) if entry != task_shell_bin
+            )
         process_env.pop("TMUX", None)
         process_env.pop("TMUX_PANE", None)
         process_env["TMUX_TMPDIR"] = self._tmux_directory.name
@@ -358,26 +364,16 @@ class LocalTmuxSession(TmuxSession):
             raise RuntimeError(f"Terminus-2 tmux socket is outside its private directory: {socket}")
         self._logger.info("Terminus-2 tmux session=%s socket=%s", self._session_name, socket)
 
-    def _hidden_harness_start(self, upstream: str) -> str:
-        """Harbor's start command with its pane shell started by ``task_shell.py``.
-
-        The tmux server keeps the harness mounts (it runs from the harness runtime
-        and writes the pane log); the shell the agent types into does not. The
-        helper runs from an executable copy in the session's private directory, so
-        no interpreter name enters the tmux server's command line, where a
-        ``pkill -f python`` typed by the agent would match it.
-        """
+    @staticmethod
+    def _task_pane(upstream: str) -> str:
+        """Harbor's start command with its pane shell started as a task shell, when the runner provides one."""
+        directory = os.environ.get(TASK_SHELL_BIN)
+        if not directory:
+            return upstream
         pane = "'bash --login'"
-        launcher = Path(self.environment._tmux_directory.name) / "task-shell"
-        launcher.write_text(f"#!{sys.executable} -I\n" + TASK_SHELL.read_text())
-        launcher.chmod(0o755)
-        words = [str(launcher)]
-        for root in HARNESS_MOUNTS:
-            words += ["--hide", root]
-        words += ["--", "bash", "--login"]
-        if upstream.count(pane) != 1 or any(not word or set(word) & set("'\" \\$`") for word in words):
+        if upstream.count(pane) != 1:
             raise RuntimeError("Terminus-2 tmux start does not have the expected login shell")
-        return upstream.replace(pane, "'" + " ".join(words) + "'")
+        return upstream.replace(pane, shlex.quote(f"{shlex.quote(os.path.join(directory, 'bash'))} --login"))
 
     @property
     def _tmux_start_session(self) -> str:
@@ -387,7 +383,7 @@ class LocalTmuxSession(TmuxSession):
             # kill commands and the task's memory use cannot end this harness.
             return (
                 f"{shlex.quote(sys.executable)} -I {shlex.quote(str(COMMAND_NAMESPACE))} "
-                f"bash -c {shlex.quote(self._hidden_harness_start(super()._tmux_start_session))}"
+                f"bash -c {shlex.quote(self._task_pane(super()._tmux_start_session))}"
             )
 
         session_name = shlex.quote(self._session_name)

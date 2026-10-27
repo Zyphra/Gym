@@ -56,7 +56,7 @@ from nemo_gym.rollout_observability import (
     AgentObservationBundle,
     ToolCallObservation,
 )
-from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxHandle
+from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxHandle, task_shell
 from nemo_gym.sandbox.episode import EPISODE_MEMORY_HEADROOM_MIB
 
 
@@ -438,6 +438,8 @@ async def test_private_setup_stages_only_planned_inputs(tmp_path, monkeypatch) -
     assert agent_calls
     assert agent_calls[0][1]["cwd"] == "/workspace/repo"
     assert sandbox.spec.files["/sandbox/public-setup.txt"] == "public setup"
+    # The runner starts task shells through this helper (nemo_gym/sandbox/task_shell.py).
+    assert sandbox.spec.files["/trajectories_mount/task_shell.py"] == Path(task_shell.__file__).read_text()
     assert gold not in json.dumps(sandbox.spec.files)
     assert (params.persistent_dir / "setup.stdout").read_text() == "setup complete\n"
     assert (params.persistent_dir / "setup.stderr").read_text() == ""

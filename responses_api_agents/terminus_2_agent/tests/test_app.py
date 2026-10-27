@@ -24,9 +24,7 @@ from nemo_gym.openai_utils import NeMoGymEasyInputMessage, NeMoGymResponseCreate
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.terminus_2_agent.app import (
     COMMAND_NAMESPACE,
-    HARNESS_MOUNTS,
     SETUP_FAILED_TMUX_UNAVAILABLE,
-    TASK_SHELL,
     LocalEnvironment,
     LocalTmuxSession,
     StandaloneTerminus2,
@@ -213,11 +211,9 @@ class TestLocalTmuxSession:
         assert "tmux new-session" in command
 
     def test_linux_launcher_runs_upstream_start_in_the_command_namespace(self, tmp_path: Path) -> None:
-        environment = MagicMock()
-        environment._tmux_directory.name = str(tmp_path)
         session = LocalTmuxSession(
             session_name="terminus-test",
-            environment=environment,
+            environment=MagicMock(),
             logging_path=tmp_path / "pane.log",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
@@ -225,14 +221,7 @@ class TestLocalTmuxSession:
         with patch("responses_api_agents.terminus_2_agent.app.sys.platform", "linux"):
             command = session._tmux_start_session
         upstream = Terminus2SessionBase._tmux_start_session.fget(session)
-        hidden = " ".join(f"--hide {root}" for root in HARNESS_MOUNTS)
-        launcher = tmp_path / "task-shell"
-        pane = f"'{launcher} {hidden} -- bash --login'"
-        assert launcher.read_text().startswith(f"#!{sys.executable} -I\n") and os.access(launcher, os.X_OK)
-        assert "python" not in pane.replace(str(tmp_path), "")
-        assert shlex.split(command) == [
-            sys.executable, "-I", str(COMMAND_NAMESPACE), "bash", "-c", upstream.replace("'bash --login'", pane)
-        ]
+        assert shlex.split(command) == [sys.executable, "-I", str(COMMAND_NAMESPACE), "bash", "-c", upstream]
         assert "script -qc" in upstream
 
 
@@ -763,74 +752,45 @@ async def test_model_failure_custody_survives_standalone_exception_handler():
     assert agent.model_transport_error == "ReadTimeout: model request expired"
 
 
-class TestTaskShell:
-    """The agent's task shell cannot read the harness's mounts or run its interpreter."""
+@pytest.mark.asyncio
+async def test_the_pane_shell_starts_through_the_task_shell_on_path(tmp_path: Path, monkeypatch) -> None:
+    """The runner leads PATH with task_shell's bash; Harbor's pane shell is started through it."""
+    from nemo_gym.sandbox import task_shell
 
-    def test_detached_bind_mount_and_harness_python_are_unreachable(self, tmp_path: Path) -> None:
-        harness, mounted = tmp_path / "harness", tmp_path / "agent_deps_mount"
-        (harness / "bin").mkdir(parents=True)
-        mounted.mkdir()
-        (harness / "secret.py").write_text("harness source\n")
-        (harness / "bin" / "python3.13").symlink_to(sys.executable)
-        probe = (
-            f"cat {mounted}/secret.py; ls -A {mounted}; command -v python3.13 || echo no-harness-python; "
-            "echo PATH=$PATH"
+    assert shutil.which("tmux"), "real tmux is required for this regression"
+    hidden = tmp_path / "trajectories_mount"
+    hidden.mkdir()
+    (hidden / "instruction.txt").write_text("run files\n")
+    helper = hidden / "task_shell.py"
+    shutil.copyfile(task_shell.__file__, helper)
+    monkeypatch.setenv("PATH", os.environ["PATH"])
+    monkeypatch.setenv(task_shell.BIN_VARIABLE, "")
+    task_shell.activate(str(helper), (str(hidden),))
+    environment = LocalEnvironment(tmp_path, command_timeout_sec=30)
+    session = LocalTmuxSession(
+        session_name=f"hidden-{os.getpid()}",
+        environment=environment,
+        logging_path=tmp_path / "pane.log",
+        local_asciinema_recording_path=None,
+        remote_asciinema_recording_path=None,
+    )
+    try:
+        await session.start()
+        await session.send_keys(
+            [f"cat {hidden}/instruction.txt > out.txt 2>&1; readlink /proc/self/ns/mnt >> out.txt; echo done >> out.txt",
+             "Enter"],
+            min_timeout_sec=0.5,
         )
-        # A sandbox root bind-mounts the runtime; the task shell is started from inside it.
-        script = (
-            f"mount --bind {harness} {mounted} && cat {mounted}/secret.py && "
-            f"PATH={mounted}/bin:/usr/bin:/bin {sys.executable} -I {TASK_SHELL} --hide {mounted} -- "
-            f"sh -c {shlex.quote(probe)}; echo harness-after: $(cat {mounted}/secret.py)"
-        )
-        result = subprocess.run(
-            ["unshare", "-r", "-m", "sh", "-c", script], capture_output=True, text=True, timeout=30
-        )
-        assert result.returncode == 0, result.stderr
-        lines = result.stdout.splitlines()
-        assert lines[0] == "harness source"  # the harness sees its runtime
-        assert "harness source" not in lines[1:-1] and "No such file" in result.stderr
-        assert "no-harness-python" in lines and "PATH=/usr/bin:/bin" in lines
-        assert lines[-1] == "harness-after: harness source"  # and still does afterwards
 
-    def test_plain_directory_is_covered_and_environment_entries_dropped(self, tmp_path: Path) -> None:
-        hidden = tmp_path / "trajectories_mount"
-        hidden.mkdir()
-        (hidden / "instruction.txt").write_text("run files\n")
-        environment = {**os.environ, "PATH": f"{hidden}:/usr/bin:/bin", "HARNESS_HOME": str(hidden / "x")}
-        result = subprocess.run(
-            [sys.executable, "-I", str(TASK_SHELL), "--hide", str(hidden), "--",
-             "sh", "-c", f"ls -A {hidden}; cat {hidden}/instruction.txt; echo PATH=$PATH HOME2=${{HARNESS_HOME:-unset}}"],
-            capture_output=True, text=True, timeout=30, env=environment,
-        )
-        assert result.returncode == 0, result.stderr
-        assert "run files" not in result.stdout
-        assert "PATH=/usr/bin:/bin HOME2=unset" in result.stdout
+        async def written() -> bool:
+            return (tmp_path / "out.txt").exists() and "done" in (tmp_path / "out.txt").read_text()
+
+        await _wait_for(written)
+        pane = (tmp_path / "out.txt").read_text()
+        assert "run files" not in pane
+        assert os.readlink("/proc/self/ns/mnt") not in pane
+        # The harness's own tmux control still works from outside the task namespace.
+        assert await session.is_session_alive()
         assert (hidden / "instruction.txt").read_text() == "run files\n"
-
-    async def test_real_tmux_pane_cannot_read_a_hidden_harness_path(self, tmp_path: Path, monkeypatch) -> None:
-        assert shutil.which("tmux"), "real tmux is required for this regression"
-        hidden = tmp_path / "nemo_gym_mount"
-        hidden.mkdir()
-        (hidden / "secret.txt").write_text("gym tree\n")
-        out = tmp_path / "pane-out.txt"
-        monkeypatch.setattr("responses_api_agents.terminus_2_agent.app.HARNESS_MOUNTS", (str(hidden),))
-        environment = LocalEnvironment(tmp_path, command_timeout_sec=30)
-        session = LocalTmuxSession(
-            session_name="terminus-hidden",
-            environment=environment,
-            logging_path=tmp_path / "pane.log",
-            local_asciinema_recording_path=None,
-            remote_asciinema_recording_path=None,
-        )
-        try:
-            await session.start()
-            await session.send_keys([f"cat {hidden}/secret.txt > {out} 2>&1; echo done >> {out}", "Enter"])
-
-            async def written() -> bool:
-                return out.exists() and "done" in out.read_text()
-
-            await _wait_for(written)
-            assert "gym tree" not in out.read_text()
-            assert (hidden / "secret.txt").read_text() == "gym tree\n"
-        finally:
-            await environment.close()
+    finally:
+        await environment.close()
