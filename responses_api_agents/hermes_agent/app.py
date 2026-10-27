@@ -184,6 +184,38 @@ def _keep_tool_calls(tool_calls: list) -> list:
     return tool_calls
 
 
+MAX_TOOL_RESULT_CHARS = 20_000
+
+
+def _limit_tool_results(agent: Any) -> None:
+    """Bound each new tool observation before Hermes sends its next request.
+
+    The pinned Hermes executor has a larger, hardcoded result limit and no
+    setting for it. Wrap its common dispatcher so both execution branches keep
+    their ordering, errors and tool identities. Never rewrite earlier history.
+    """
+    execute_tool_calls = agent._execute_tool_calls
+
+    def execute_then_limit(assistant_message, messages, *args, **kwargs):
+        first_new_message = len(messages)
+        try:
+            return execute_tool_calls(assistant_message, messages, *args, **kwargs)
+        finally:
+            for message in messages[first_new_message:]:
+                content = message.get("content")
+                if message.get("role") != "tool" or not isinstance(content, str):
+                    continue
+                if len(content) > MAX_TOOL_RESULT_CHARS:
+                    note = (
+                        f"\n\n[Truncated: tool result was {len(content):,} characters; "
+                        f"limit {MAX_TOOL_RESULT_CHARS:,} characters including this note. "
+                        "Use a narrower search or read range.]"
+                    )
+                    message["content"] = content[: MAX_TOOL_RESULT_CHARS - len(note)] + note
+
+    agent._execute_tool_calls = execute_then_limit
+
+
 # OpenHands' built-in `finish` schema (openhands/sdk/tool/builtins/finish.py), so a
 # harness mix offers one completion contract.
 FINISH_TOOL_SCHEMA = {
@@ -258,6 +290,7 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     concurrency: int = 32
     max_turns: int = 90
     max_tokens: Optional[int] = None
+    context_window: int | None = Field(default=None, gt=0)
     enabled_toolsets: Optional[list[str]] = None
     disabled_toolsets: Optional[list[str]] = None
     temperature: float | None = None
@@ -378,6 +411,12 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 "enabled": self.config.checkpoints_enabled,
             },
         }
+        if self.config.context_window is not None:
+            config["model"] = {"default": self._model_name(), "context_length": self.config.context_window}
+            reserve = self.config.max_tokens or 0
+            if reserve >= self.config.context_window:
+                raise ValueError("Hermes output reserve must be smaller than its context window")
+            config["compression"]["threshold"] *= 1 - reserve / self.config.context_window
         return yaml.dump(config, default_flow_style=False)
 
     def model_post_init(self, __context: Any) -> None:
@@ -452,6 +491,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
         if self.config.compression_enabled:
             _bind_policy_summary(agent)
         _execute_every_tool_call(agent)
+        _limit_tool_results(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         observer = None
         if observation_collector is not None:

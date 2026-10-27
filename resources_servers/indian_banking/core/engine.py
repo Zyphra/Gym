@@ -161,18 +161,18 @@ def _fresh_db() -> dict[str, Any]:
     return pickle.loads(_BASE_DB_PICKLE)
 
 
-def seed_world(
-    active_customer: Optional[str], *, fd_payout_consistency: bool | None = None
-) -> dict[str, Any]:
+def seed_world(active_customer: Optional[str], *, fd_payout_consistency: bool | None = None) -> dict[str, Any]:
     enabled = _FD_PAYOUT_CONSISTENCY if fd_payout_consistency is None else fd_payout_consistency
     db = _fresh_db()
     if enabled:
         for customer in db["customers"].values():
             for deposit in customer.get("deposits", {}).values():
                 if deposit.get("kind") == "FD" and deposit.get("payout_type") in {"monthly", "quarterly"}:
-                    deposit["maturity_amount"] = json.loads(banking_tools.calculate_fd_maturity(
-                        deposit["principal"], deposit["rate"], deposit["tenure_months"], deposit["payout_type"]
-                    ))["maturity_amount"]
+                    deposit["maturity_amount"] = json.loads(
+                        banking_tools.calculate_fd_maturity(
+                            deposit["principal"], deposit["rate"], deposit["tenure_months"], deposit["payout_type"]
+                        )
+                    )["maturity_amount"]
     db["active_customer"] = active_customer
     return {
         "db": db,

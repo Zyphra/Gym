@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import inspect
 from unittest.mock import AsyncMock, patch
 
@@ -24,18 +26,30 @@ async def test_served_usage_drives_real_harbor_compaction_and_resets_on_rewrite(
 
     def complete(request):
         prompt, completion = next(totals)
-        return httpx.Response(200, json={
-            "choices": [{"message": {"content": "", "reasoning_content": "hidden reasoning"},
-                         "finish_reason": "length" if prompt == 500 else "stop"}],
-            "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
-        })
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": "", "reasoning_content": "hidden reasoning"},
+                        "finish_reason": "length" if prompt == 500 else "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": prompt, "completion_tokens": completion},
+            },
+        )
 
-    llm = llm_type(model_name="gpt-4", api_base="http://model", model_info={
-        "max_input_tokens": 131072, "max_output_tokens": 32768, "max_context_tokens": 131072,
-    })
+    llm = llm_type(
+        model_name="gpt-4",
+        api_base="http://model",
+        model_info={
+            "max_input_tokens": 131072,
+            "max_output_tokens": 32768,
+            "max_context_tokens": 131072,
+        },
+    )
     llm._http_client = httpx.AsyncClient(transport=httpx.MockTransport(complete))
-    agent = ServedContextTerminus2(logs_dir=tmp_path, model_name="gpt-4", llm=llm,
-                                  record_terminal_session=False)
+    agent = ServedContextTerminus2(logs_dir=tmp_path, model_name="gpt-4", llm=llm, record_terminal_session=False)
     chat = Chat(llm)
     chat.messages.append({"role": "system", "content": "task system prompt"})
     try:
@@ -56,8 +70,7 @@ async def test_served_usage_drives_real_harbor_compaction_and_resets_on_rewrite(
         with pytest.raises(OutputLengthExceededError):
             await chat.chat("length stop")
         # Harbor appends truncated replies itself after the exception.
-        chat.messages.extend([{"role": "user", "content": "length stop"},
-                              {"role": "assistant", "content": ""}])
+        chat.messages.extend([{"role": "user", "content": "length stop"}, {"role": "assistant", "content": ""}])
         assert await count_tokens(agent, chat) == 510
     finally:
         await llm.aclose()
@@ -65,20 +78,30 @@ async def test_served_usage_drives_real_harbor_compaction_and_resets_on_rewrite(
 
 @pytest.mark.parametrize("llm_type", [NemoGymLLM, HarborLLM])
 def test_legacy_input_limit_without_explicit_joint_budget(llm_type):
-    llm = llm_type(model_name="gpt-4", api_base="http://model", model_info={
-        "max_input_tokens": 131072, "max_output_tokens": 32768,
-    })
+    llm = llm_type(
+        model_name="gpt-4",
+        api_base="http://model",
+        model_info={
+            "max_input_tokens": 131072,
+            "max_output_tokens": 32768,
+        },
+    )
     assert llm.get_model_context_limit() == 131072
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("llm_type", [NemoGymLLM, HarborLLM])
 async def test_cached_counter_matches_real_harbor_await_contract(tmp_path, llm_type):
-    llm = llm_type(model_name="gpt-4", api_base="http://127.0.0.1:1", model_info={
-        "max_input_tokens": 131072, "max_output_tokens": 32768, "max_context_tokens": 131072,
-    })
-    agent = ServedContextTerminus2(logs_dir=tmp_path, model_name="gpt-4", llm=llm,
-                                  record_terminal_session=False)
+    llm = llm_type(
+        model_name="gpt-4",
+        api_base="http://127.0.0.1:1",
+        model_info={
+            "max_input_tokens": 131072,
+            "max_output_tokens": 32768,
+            "max_context_tokens": 131072,
+        },
+    )
+    agent = ServedContextTerminus2(logs_dir=tmp_path, model_name="gpt-4", llm=llm, record_terminal_session=False)
     chat = Chat(llm)
     chat.messages.append({"role": "system", "content": "bounded counter diagnostic"})
     llm._served_context_tokens[history_key(chat.messages)] = 100

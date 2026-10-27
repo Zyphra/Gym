@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
 import http.client
 import socket
@@ -17,8 +19,7 @@ from nemo_gym.server_utils import HEAD_SERVER_HTTP_PROTOCOL, PollSafeHttpToolsPr
 
 def _post(sock: socket.socket, path: str) -> tuple[int, bytes]:
     request = (
-        f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-        "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        f"POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
     ).encode()
     sock.sendall(request)
     response = http.client.HTTPResponse(sock)

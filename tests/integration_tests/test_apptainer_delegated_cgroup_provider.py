@@ -124,9 +124,7 @@ async def test_real_apptainer_aggregate_containment_and_cleanup() -> None:
             await placement_task
         assert not placement_leaf.exists()
 
-        timed = asyncio.create_task(
-            provider.exec(primary, "sh -c 'sleep 300 & wait'", timeout_s=2)
-        )
+        timed = asyncio.create_task(provider.exec(primary, "sh -c 'sleep 300 & wait'", timeout_s=2))
         timeout_leaf = await _wait_for_exec_leaf(primary)
         timeout_result = await timed
         assert timeout_result.error_type == "timeout"

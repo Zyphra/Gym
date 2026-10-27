@@ -347,9 +347,7 @@ def _parse_answer_with_custom_regexes(
         return _parse_answer_with_custom_regex(text, regex_patterns, allowed_letters, options, flags=flags)
 
     for regex_pattern in regex_patterns:
-        pred = _parse_answer_with_custom_regex(
-            text, regex_pattern, allowed_letters, options, flags=flags
-        )
+        pred = _parse_answer_with_custom_regex(text, regex_pattern, allowed_letters, options, flags=flags)
         if pred is not None:
             return pred
     return None

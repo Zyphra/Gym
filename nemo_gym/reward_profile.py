@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import orjson
 from pydantic import Field
 
+
 # pandas, scipy and wandb cost every importer of base_resources_server (each Gym
 # server and each placed episode worker) ~3 s of CPU and ~150 MB of RSS, and only
 # the aggregate-metrics paths below use them. Import them where they are used.

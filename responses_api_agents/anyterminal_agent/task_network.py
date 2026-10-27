@@ -1,4 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Immutable private-network capability admitted by a task artifact."""
+
 import hashlib
 from pathlib import Path
 from typing import Literal
@@ -15,8 +18,13 @@ class TaskNetwork(BaseModel):
     @model_validator(mode="after")
     def validate_manifest(self):
         root = self.tools_root
-        if (not root.is_absolute() or root.resolve() != root or root.is_symlink()
-                or not root.is_dir() or any(c in str(root) for c in (":", "\n", "\r", ","))):
+        if (
+            not root.is_absolute()
+            or root.resolve() != root
+            or root.is_symlink()
+            or not root.is_dir()
+            or any(c in str(root) for c in (":", "\n", "\r", ","))
+        ):
             raise ValueError("network tools require a canonical bindable directory")
         manifest = root / "manifest.json"
         if manifest.is_symlink() or not manifest.is_file():

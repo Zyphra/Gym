@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Native configuration directives without model or service dependencies."""
+
 from copy import deepcopy
 from typing import List
 
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
+
 
 INHERIT_FROM_KEY_NAME = "_inherit_from"
 COPY_KEY_NAME = "_copy"
@@ -143,4 +145,3 @@ class _ConfigKeyComposer:
             dict_config = dict_config[k]
 
         return dict_config
-

@@ -120,11 +120,18 @@ def _snapshot_repo(repo: Path, index_path: Path) -> str:
         subprocess.run(
             ["git", "pack-objects", "--revs", "--stdout"],
             input=(baseline_tree + "\n").encode(),
-            stdout=stream, stderr=subprocess.PIPE, check=True, cwd=repo, env=env,
+            stdout=stream,
+            stderr=subprocess.PIPE,
+            check=True,
+            cwd=repo,
+            env=env,
         )
     subprocess.run(
         ["git", "index-pack", "-o", str(pack_path.with_suffix(".idx")), str(pack_path)],
-        capture_output=True, check=True, cwd=repo, env=env,
+        capture_output=True,
+        check=True,
+        cwd=repo,
+        env=env,
     )
     return baseline_tree
 
@@ -266,8 +273,10 @@ def _exception_response(exc: Exception, body):
         if not isinstance(nested, Exception):
             break
         cause = nested
-    status = next((candidate.status_code for candidate in chain
-                   if isinstance(getattr(candidate, "status_code", None), int)), None)
+    status = next(
+        (candidate.status_code for candidate in chain if isinstance(getattr(candidate, "status_code", None), int)),
+        None,
+    )
     transport = any(
         isinstance(getattr(candidate, "status_code", None), int)
         and (candidate.status_code in (401, 403, 404, 408, 429) or 500 <= candidate.status_code < 600)
@@ -278,9 +287,16 @@ def _exception_response(exc: Exception, body):
     if isinstance(status, int):
         message = f"Error code: {status}; {message}"
     return NeMoGymResponse(
-        id="anyswe-runner-exception", created_at=0, model=body.model, object="response", output=[],
-        tool_choice=body.tool_choice, tools=body.tools, parallel_tool_calls=body.parallel_tool_calls,
-        status="failed", error={"code": "server_error", "message": message},
+        id="anyswe-runner-exception",
+        created_at=0,
+        model=body.model,
+        object="response",
+        output=[],
+        tool_choice=body.tool_choice,
+        tools=body.tools,
+        parallel_tool_calls=body.parallel_tool_calls,
+        status="failed",
+        error={"code": "server_error", "message": message},
         metadata={"runner_exception": "true", "model_transport_error": "true" if transport else "false"},
     )
 

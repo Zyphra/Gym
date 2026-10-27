@@ -175,22 +175,39 @@ def test_native_responses_honors_per_request_thinking_metadata(monkeypatch):
         global_config_dict_parser_config=GlobalConfigDictParserConfig(dotenv_path=None, skip_load_from_cli=True)
     )
     payload = {
-        "id": "resp-judge", "created_at": 0.0, "model": "judge", "object": "response",
-        "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
-        "output": [{
-            "id": "msg-judge", "type": "message", "role": "assistant", "status": "completed",
-            "content": [{"type": "output_text", "text": "EQUIVALENT", "annotations": []}],
-        }],
+        "id": "resp-judge",
+        "created_at": 0.0,
+        "model": "judge",
+        "object": "response",
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+        "output": [
+            {
+                "id": "msg-judge",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "EQUIVALENT", "annotations": []}],
+            }
+        ],
     }
     backend = AsyncMock()
     backend.create_response.return_value = payload
     monkeypatch.setattr(VLLMModel, "_resolve_client", lambda self, request: backend)
     server = VLLMModel(
         config=VLLMModelConfig(
-            host="127.0.0.1", port=19000, name="judge_model", entrypoint="app.py",
-            base_url="http://127.0.0.1:19001/v1", api_key="EMPTY", model="judge",
-            is_responses_native=True, return_token_id_information=False,
-            uses_reasoning_parser=True, uses_interleaved_reasoning=False,
+            host="127.0.0.1",
+            port=19000,
+            name="judge_model",
+            entrypoint="app.py",
+            base_url="http://127.0.0.1:19001/v1",
+            api_key="EMPTY",
+            model="judge",
+            is_responses_native=True,
+            return_token_id_information=False,
+            uses_reasoning_parser=True,
+            uses_interleaved_reasoning=False,
             chat_template_kwargs={"enable_thinking": True, "preserve_other_option": True},
         ),
         server_client=ServerClient.model_construct(global_config_dict={}),
@@ -199,10 +216,11 @@ def test_native_responses_honors_per_request_thinking_metadata(monkeypatch):
     async def exercise():
         for thinking in (False, True, None):
             body = NeMoGymResponseCreateParamsNonStreaming(
-                input="Compare answers", max_output_tokens=4096,
-                metadata={} if thinking is None else {
-                    "chat_template_kwargs": json.dumps({"enable_thinking": thinking})
-                },
+                input="Compare answers",
+                max_output_tokens=4096,
+                metadata={}
+                if thinking is None
+                else {"chat_template_kwargs": json.dumps({"enable_thinking": thinking})},
             )
             response = await server._responses_native(None, body)
             assert isinstance(response, NeMoGymResponse)
@@ -213,7 +231,8 @@ def test_native_responses_honors_per_request_thinking_metadata(monkeypatch):
             }
             assert forwarded["max_output_tokens"] == 4096
         assert server.config.chat_template_kwargs == {
-            "enable_thinking": True, "preserve_other_option": True,
+            "enable_thinking": True,
+            "preserve_other_option": True,
         }
 
     asyncio.run(exercise())

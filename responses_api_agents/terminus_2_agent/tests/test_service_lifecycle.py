@@ -1,4 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Real tmux process lifetime across the opted-in benchmark handoff."""
+
 import asyncio
 import os
 import shutil

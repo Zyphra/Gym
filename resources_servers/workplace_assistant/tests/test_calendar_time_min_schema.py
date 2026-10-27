@@ -3,6 +3,7 @@
 """Calendar discovery describes the same inclusive start bound the tool applies."""
 
 import pandas as pd
+
 from resources_servers.workplace_assistant.utils import get_tools
 
 

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Use served token usage for Terminus histories, including hidden reasoning."""
 
 import hashlib
@@ -21,8 +23,10 @@ def record_served_context(llm, messages, content, usage):
 
 def _served_count(count):
     if inspect.iscoroutinefunction(Terminus2._count_total_tokens):
+
         async def completed():
             return count
+
         return completed()
     return count
 

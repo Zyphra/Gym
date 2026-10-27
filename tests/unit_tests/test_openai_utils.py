@@ -129,6 +129,7 @@ class TestOpenAIUtils:
 
     async def test_failed_model_post_is_not_replayed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from aiohttp import ClientResponseError, ClientSession, web
+
         from nemo_gym import server_utils
 
         calls = []
