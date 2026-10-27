@@ -40,6 +40,13 @@ independent forwards, creations and plots in either order while rejecting wrong
 recipients, record IDs, fields, omitted writes and unintended changes. Final
 answers and evidence-read order remain outside the state grader.
 
+The live `/verify` route compares the actual session tables with a fresh
+reference replay. Submitted transcript calls cannot stand in for execution.
+Live tool execution and offline replay share identity and sent-email tracking;
+verification does not rerun predicted writes. An absent session is an unavailable
+verification (HTTP 409), not a successful replay. The offline `is_correct` helper
+continues to replay both action lists for construction controls.
+
 Sent email is graded as sent, not as the final mailbox shows it. Replay records
 every email each action creates (send, reply, forward), and the predicted and
 reference replays must send the same multiset of emails by content. Deleting a

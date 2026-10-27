@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import json
 from collections import Counter
 from typing import Dict, List
@@ -122,6 +123,14 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
         "customer_relationship_manager",
     ]
     tool_env = get_tools(toolkits)
+    initialize_effect_tracking(tool_env)
+    for action in actions:
+        execute_tracked_action(tool_env, action["name"], json.loads(action["arguments"]))
+    return tool_env
+
+
+def initialize_effect_tracking(tool_env):
+    """Capture seeded identities before the first live or replayed operation."""
     tool_env["stable_ids"] = {
         name: set(frame[id_column]) if id_column is not None else set()
         for name, (frame, id_column) in _state_tables(tool_env).items()
@@ -130,26 +139,32 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
     # Every email an action sends, as sent. A later delete removes the row from
     # the mailbox, but the recipient already has the message, so grading keeps it.
     tool_env["sent_emails"] = []
+    tool_env["observations"] = []
 
-    # Execute the actions
-    for action in actions:
-        emails_before = set(tool_env["containers"]["email"]._emails["email_id"])
-        try:
-            tool_env["functions"][action["name"]](**json.loads(action["arguments"]))
-        except Exception as e:
-            print("Error executing tool: ", e)
+
+def execute_tracked_action(tool_env, name, arguments):
+    """Execute once and retain real effects, including writes before an error."""
+    emails_before = set(tool_env["containers"]["email"]._emails["email_id"])
+    try:
+        result = tool_env["functions"][name](**arguments)
+    except Exception as error:
+        result = f"Error executing tool '{name}': {error}"
+    finally:
         emails = tool_env["containers"]["email"]._emails
         tool_env["sent_emails"].extend(emails[~emails["email_id"].isin(emails_before)].to_dict(orient="records"))
         # Once a seeded record is removed, reusing its ID does not restore its
         # identity. Track this per replay so delete/create order can also vary.
-        for name, (frame, id_column) in _state_tables(tool_env).items():
-            if id_column is not None and action.get("name", "").startswith(name + "_"):
+        for table, (frame, id_column) in _state_tables(tool_env).items():
+            if id_column is not None:
                 # Canonicalization rejects non-scalar IDs. Keep them out of
                 # hash-based identity tracking so they reach that validation.
-                tool_env["stable_ids"][name].intersection_update(
+                tool_env["stable_ids"][table].intersection_update(
                     value for value in frame[id_column] if pd.api.types.is_scalar(value)
                 )
-    return tool_env
+    tool_env["observations"].append(
+        {"tool": name, "arguments": copy.deepcopy(arguments), "result": copy.deepcopy(result)}
+    )
+    return result
 
 
 def _state_tables(tool_env):
@@ -243,6 +258,17 @@ def is_correct(
     if error:
         return False
     predicted_env = execute_actions_and_reset_state(predicted_actions)
+    return state_matches_reference(predicted_env, ground_truth_actions, reject_noop_reference=reject_noop_reference)
+
+
+def state_matches_reference(predicted_env, ground_truth_actions, *, reject_noop_reference=False):
+    """Compare server-owned final tables to a fresh reference replay.
+
+    Submitted action lists and assistant reports cannot create predicted effects.
+    Missing session tracking is an unavailable verifier, never inferred success.
+    """
+    if "stable_ids" not in predicted_env or "sent_emails" not in predicted_env:
+        raise ValueError("session effect tracking is unavailable")
     reference_env = execute_actions_and_reset_state(ground_truth_actions)
     predicted = _state_tables(predicted_env)
     reference = _state_tables(reference_env)
