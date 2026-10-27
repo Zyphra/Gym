@@ -38,12 +38,18 @@ from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body,
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import get_first_server_config_dict
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.rollout_observability import AgentObservationBundle, harness_response_error
+from nemo_gym.rollout_observability import (
+    AgentObservationBundle,
+    bounded_error_text,
+    endpoint_stop_reason,
+    harness_response_error,
+)
 from nemo_gym.sandbox import AsyncSandbox, SandboxCreateError, SandboxExecResult, SandboxResources, SandboxSpec
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
 from nemo_gym.sandbox.episode import (
     SandboxMemoryEvents,
     harness_memory_kill,
+    memory_kill_origin,
     run_sandbox_episode,
     sandbox_memory_events,
 )
@@ -109,6 +115,9 @@ class SWEBenchMetrics(SandboxMemoryEvents):
     error_kind: Optional[str] = None
     error_detail: Optional[str] = None
     mask_sample: Optional[bool] = None
+    # Class name and bounded message of the harness's own error, so a scored failure can be classified later.
+    agent_exception: Optional[str] = None
+    agent_error_text: Optional[str] = None
 
     agent_run_time: Optional[float] = None
     submitted_at: Optional[float] = None
@@ -1063,15 +1072,32 @@ class AnySweSandboxRunner:
                 )
             memory_kill = harness_memory_kill(result.return_code, memory_events)
             if memory_kill is not None:
-                # This result comes from the admitted harness. Kernel counters
-                # prove its memory-limit death, not independent infrastructure
-                # causation. Keep that unproven outcome as a task zero; failures
-                # during host setup still take the typed sandbox exception path.
-                error_kind = "agent_memory_limit"
-                error_detail = f"{memory_kill}; in-harness causation unproven"
+                # This result comes from the admitted harness. A kill its own sandbox limit caused is
+                # the policy's outcome and scores 0 (agent_memory_limit), as does one whose counters do not
+                # say. Only a kill while the sandbox's own limit never fired came from an ancestor cgroup
+                # or the host and is masked infrastructure. Failures during host setup still take the
+                # typed sandbox exception path.
+                origin = memory_kill_origin(memory_events)
+                if origin == "outside_sandbox_limit":
+                    error_kind = "sandbox"
+                    error_detail = f"{memory_kill}; the sandbox's own memory limit never fired"
+                else:
+                    error_kind = "agent_memory_limit"
+                    error_detail = f"{memory_kill}; scored (sandbox memory limit: {origin})"
         agent_stop_reason = (saved.metadata or {}).get("stop_reason") if saved is not None else None
         if not isinstance(agent_stop_reason, str):
             agent_stop_reason = None
+        agent_error_text = None
+        if saved is not None:
+            metadata = saved.metadata or {}
+            reported = [
+                metadata.get("exception_text"),
+                metadata.get("hermes_error"),
+                saved.error.message if saved.error else None,
+            ]
+            agent_error_text = next((text for text in map(bounded_error_text, reported) if text), None)
+            # A harness refused after the endpoint ended the episode reports the refusal as its own error.
+            agent_stop_reason = agent_stop_reason or endpoint_stop_reason(*reported)
         if saved is not None:
             declared_errors = [
                 saved.error.message if saved.error is not None else None,
@@ -1083,10 +1109,16 @@ class AnySweSandboxRunner:
         agent_error_kind = "context_window" if agent_stop_reason == "context_exhausted" else _classify_agent_error(agent_error)
         resolved = False
         # A runner exception outside the typed transport cases retains the old
-        # task-zero behavior. Its partial patch is evidence, not a successful
-        # harness completion; transient failures below remain native masks.
+        # task-zero behavior: an exception the policy's output raised (an invalid
+        # compaction summary) is the policy's, and any other cause is unproven. The
+        # exception class is named so it can be classified. Its partial patch is
+        # evidence, not a successful harness completion; transient failures below
+        # remain native masks.
+        agent_exception = None
         if saved is not None and (saved.metadata or {}).get("runner_exception") == "true" and harness_error is None:
             error_kind = error_kind or "agent"
+            exception_class = (saved.metadata or {}).get("exception_class")
+            agent_exception = exception_class if isinstance(exception_class, str) else None
         if patch.strip() and error_kind is None:
             grading_started_at = time.time()
             update_metrics(params.metrics_fpath, {"grading_started_at": grading_started_at})
@@ -1133,6 +1165,8 @@ class AnySweSandboxRunner:
                 "error_kind": error_kind,
                 "error_detail": error_detail,
                 "mask_sample": mask_sample,
+                "agent_exception": agent_exception,
+                "agent_error_text": agent_error_text,
                 "agent_run_time": time.time() - started,
                 **memory_events,
                 **integrity_metrics,

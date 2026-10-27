@@ -139,6 +139,20 @@ def harness_memory_kill(return_code: Optional[int], events: Mapping[str, int]) -
     return _memory_limit_kill("agent harness", return_code, events, "sandbox")
 
 
+def memory_kill_origin(events: Mapping[str, int], prefix: str = "sandbox") -> str:
+    """Whose memory limit a kernel OOM kill in this sandbox's cgroup came from.
+
+    ``"outside_sandbox_limit"``: the sandbox's own limit never fired (its ``oom`` and ``max`` counters are
+    present and zero) while the kernel still killed one of its processes, so the kill came from an ancestor
+    cgroup or the host, not from the workload using its own allotment up. ``"sandbox_limit"``: the limit
+    fired. ``"unresolved"``: the counters do not say, so the caller scores the kill and labels it.
+    """
+    oom, high_water = events.get(f"{prefix}_oom"), events.get(f"{prefix}_memory_max_events")
+    if oom is None or high_water is None:
+        return "unresolved"
+    return "sandbox_limit" if oom > 0 or high_water > 0 else "outside_sandbox_limit"
+
+
 def verifier_memory_kill(
     return_code: Optional[int], events: Mapping[str, int], prefix: str = "sandbox"
 ) -> Optional[str]:

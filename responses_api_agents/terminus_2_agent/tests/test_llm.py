@@ -365,6 +365,52 @@ async def test_only_existing_endpoint_failure_classes_get_transport_custody(stat
         await llm.aclose()
 
 
+_REFUSAL = (
+    '{"error":{"message":"This episode has ended (empty_turns); no further turns are served.",'
+    '"type":"invalid_request_error","param":"messages","code":"episode_terminated"}}'
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", [_REFUSAL, f"Hit an exception in VLLMModel calling an inner server: b'{_REFUSAL}'"])
+async def test_the_endpoints_refusal_after_it_ended_the_episode_is_a_policy_stop_not_an_http_error(text):
+    from responses_api_agents.terminus_2_agent.llm import EpisodeTerminatedError
+
+    requests = []
+
+    def endpoint(request):
+        requests.append(request)
+        return httpx.Response(400, text=text)
+
+    llm = _make_llm()
+    llm._http_client = httpx.AsyncClient(transport=httpx.MockTransport(endpoint))
+    try:
+        with pytest.raises(EpisodeTerminatedError):
+            await llm.call("q")
+        assert llm.terminal_stop_reason == "episode_terminated"
+        assert llm.model_transport_error is None
+        assert len(requests) == 1  # a refusal is not retried, and later calls are not sent
+        with pytest.raises(EpisodeTerminatedError):
+            await llm.call("again")
+        assert len(requests) == 1
+    finally:
+        await llm.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_bad_request_that_is_not_the_endpoints_refusal_stays_an_http_error():
+    llm = _make_llm()
+    llm._http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, text="invalid tool schema"))
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await llm._post_chat_completions({"messages": []})
+        assert llm.terminal_stop_reason is None
+    finally:
+        await llm.aclose()
+
+
 @pytest.mark.asyncio
 async def test_transport_error_clears_after_a_successful_request():
     attempts = 0

@@ -20,6 +20,8 @@ from nemo_gym.rollout_observability import (
     ToolCallObservation,
     TrajectoryModelCall,
     TrajectoryRecord,
+    bounded_error_text,
+    endpoint_stop_reason,
     harness_response_error,
     join_model_call_observations,
 )
@@ -61,6 +63,60 @@ def test_policy_errors_remain_scored_outcomes(message: str) -> None:
     raw["usage"]["input_tokens"] = 100
     response = NeMoGymResponse.model_validate(raw)
     assert harness_response_error(response, observations) is None
+
+
+def _failed_response(message: str, **metadata: str) -> NeMoGymResponse:
+    return NeMoGymResponse.model_validate({
+        "id": "r", "created_at": 0, "model": "policy", "object": "response", "output": [],
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [], "status": "failed",
+        "error": {"code": "server_error", "message": message}, "metadata": metadata,
+    })
+
+
+@pytest.mark.parametrize("response", [
+    _failed_response("Connection error."),
+    _failed_response("Connection error"),
+    _failed_response("anything", model_transport_error="true"),
+    _failed_response("Error code: 503 - upstream"),
+], ids=["sdk-connection-error", "sdk-connection-error-no-period", "declared-transport", "http-503"])
+def test_an_unreachable_or_failing_endpoint_is_a_harness_failure(response: NeMoGymResponse) -> None:
+    assert harness_response_error(response) == response.error
+
+
+def test_a_failed_setup_label_is_a_harness_failure_without_an_error() -> None:
+    response = NeMoGymResponse.model_validate({
+        "id": "r", "created_at": 0, "model": "policy", "object": "response", "output": [],
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [], "status": "completed",
+        "metadata": {"agent_error": "setup_failed:tmux_unavailable"},
+    })
+    error = harness_response_error(response)
+    assert error is not None and error.message == "setup_failed:tmux_unavailable"
+
+
+@pytest.mark.parametrize("response", [
+    _failed_response("Connection error while parsing the policy's tool call"),
+    _failed_response("Request timed out."),
+    _failed_response("HTTP 400: This episode has ended (empty_turns); no further turns are served."),
+    _failed_response("Model generated invalid tool call: finish"),
+    _failed_response("RuntimeError", agent_error="RuntimeError"),
+], ids=["lookalike", "client-timeout", "episode-ended", "invalid-tool-call", "exception-class"])
+def test_a_cause_that_may_be_the_policys_is_not_a_harness_failure(response: NeMoGymResponse) -> None:
+    assert harness_response_error(response) is None
+
+
+def test_bounded_error_text_redacts_secrets_and_bounds_length() -> None:
+    assert bounded_error_text("Error code: 400\n  - bad   request") == "Error code: 400 - bad request"
+    redacted = bounded_error_text("failed with Authorization: Bearer sk-abc123 and api_key=sk-xyz")
+    assert "sk-abc123" not in redacted and "sk-xyz" not in redacted and "[redacted]" in redacted
+    assert len(bounded_error_text("x" * 1000)) == 300
+    assert bounded_error_text("a\x00b\x1bc") == "abc"
+    assert bounded_error_text("   ") is None and bounded_error_text(None) is None and bounded_error_text(7) is None
+
+
+def test_endpoint_stop_reason_reads_only_the_refusal_code() -> None:
+    refusal = 'b\'{"error":{"code":"episode_terminated"}}\''
+    assert endpoint_stop_reason(None, "other", refusal) == "episode_terminated"
+    assert endpoint_stop_reason("HTTP 400: invalid tool schema", None, 7) is None
 
 
 @pytest.mark.parametrize(

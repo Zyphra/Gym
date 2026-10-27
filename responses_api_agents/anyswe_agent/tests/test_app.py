@@ -1653,14 +1653,21 @@ async def test_only_declared_failures_affect_a_verified_patch(
 
 
 @pytest.mark.parametrize(
-    "agent_return_code,oom_kill,infrastructure,startup,max_events",
-    [(0, 1, False, False, 9), (137, 2, False, False, 9), (137, 0, False, False, 9), (137, 2, True, True, 9)]
+    "agent_return_code,oom_kill,infrastructure,startup,max_events,oom",
+    [
+        (0, 1, False, False, 9, 2),
+        (137, 2, False, False, 9, 2),
+        (137, 0, False, False, 9, 0),
+        (137, 2, True, True, 9, 2),
+        # The kernel killed the harness while the sandbox's own limit never fired: an ancestor or host OOM.
+        (137, 2, True, False, 0, 0),
+    ]
     + [pytest.param(raw["return_code"], raw["sandbox_oom_kill"], False, False,
-                    raw["sandbox_memory_max_events"], id=raw["name"])
+                    raw["sandbox_memory_max_events"], raw["sandbox_oom"], id=raw["name"])
        for raw in json.loads((Path(__file__).parent / "fixtures/harness-memory-limit.json").read_text())],
 )
-async def test_memory_limit_death_after_harness_admission_is_zero_and_startup_is_infrastructure(
-    tmp_path, monkeypatch, episode_submissions, agent_return_code, oom_kill, infrastructure, startup, max_events
+async def test_harness_death_by_its_own_memory_limit_scores_and_a_kill_outside_the_limit_is_infrastructure(
+    tmp_path, monkeypatch, episode_submissions, agent_return_code, oom_kill, infrastructure, startup, max_events, oom
 ):
     from omegaconf import OmegaConf
 
@@ -1714,7 +1721,7 @@ async def test_memory_limit_death_after_harness_admission_is_zero_and_startup_is
 
         def retained_memory_events(self, handle):
             assert self.closed, "events are read after the sandbox is stopped"
-            return {"low": 0, "high": 0, "max": max_events, "oom": oom_kill, "oom_kill": oom_kill}
+            return {"low": 0, "high": 0, "max": max_events, "oom": oom, "oom_kill": oom_kill}
 
     graded = []
 
@@ -1726,19 +1733,145 @@ async def test_memory_limit_death_after_harness_admission_is_zero_and_startup_is
     monkeypatch.setattr(AnySweSandboxRunner, "_grade_sandbox_patch", grade)
     result = await agent.run(AnySweRunRequest(responses_create_params=body))
 
-    assert (result.sandbox_oom, result.sandbox_oom_kill, result.sandbox_memory_max_events) == (oom_kill, oom_kill, max_events)
+    assert (result.sandbox_oom, result.sandbox_oom_kill, result.sandbox_memory_max_events) == (oom, oom_kill, max_events)
     assert result.mask_sample is infrastructure
-    if infrastructure:
+    if infrastructure and startup:
         assert result.error_kind == "sandbox"
         assert "startup exhausted its memory limit" in result.error_detail
         assert graded == [] and result.reward == 0.0
+    elif infrastructure:
+        assert result.error_kind == "sandbox"
+        assert "never fired" in result.error_detail
+        assert graded == [] and result.reward == 0.0
     elif agent_return_code == 137 and oom_kill:
+        # The sandbox's own limit killed the harness: a trained zero, as in anyterminal.
         assert result.error_kind == "agent_memory_limit"
-        assert "in-harness causation unproven" in result.error_detail
+        assert "scored (sandbox memory limit: sandbox_limit)" in result.error_detail
         assert graded == [] and result.reward == 0.0
     else:
         assert result.error_kind is None
         assert graded == [patch] and result.reward == 1.0
+
+
+def test_a_task_image_without_git_is_a_setup_failure_not_a_runner_crash(monkeypatch, tmp_path):
+    from responses_api_agents.anyswe_agent.agent_runner import _git_unavailable_response
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path))  # nothing on the path is git
+    response = _git_unavailable_response(tmp_path, "test-model")
+    assert response.status == "failed" and response.metadata == {"agent_error": "setup_failed:git_unavailable"}
+    assert _git_unavailable_response(None, "test-model") is None  # no repository, nothing to snapshot
+    git = tmp_path / "git"
+    git.write_text("#!/bin/sh\n")
+    git.chmod(0o755)
+    assert _git_unavailable_response(tmp_path, "test-model") is None
+
+
+class CompactionFailed(RuntimeError):
+    """A harness exception class of its own, as a runner reports it by name."""
+
+
+@pytest.mark.parametrize(
+    "scenario,expected_kind,expected_mask,graded_patch,exception",
+    [
+        ("named-exception", "agent", False, False, "CompactionFailed"),
+        ("unproven-exception", "agent", False, False, "KeyError"),
+        ("endpoint-refusal", "agent", False, False, "BadRequestError"),
+        ("transport-exception", "harness", True, True, "RuntimeError"),
+        ("git-unavailable", "harness", True, False, None),
+        ("model-failure", None, False, True, None),
+    ],
+)
+async def test_runner_exception_is_named_and_only_a_proven_external_cause_is_masked(
+    tmp_path, monkeypatch, episode_submissions, scenario, expected_kind, expected_mask, graded_patch, exception
+):
+    from omegaconf import OmegaConf
+
+    from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+    from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
+    from responses_api_agents.anyswe_agent.agent_runner import _exception_response
+
+    head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
+    config = _config(
+        model_server=None,
+        agent_runtime_source="baked",
+        sandbox_model_base_url="http://127.0.0.1:19002/v1",
+        sandbox_spec={"resources": {"cpu": 2, "memory_mib": 4096, "pids": 128}},
+    )
+    client = ServerClient(head_server_config=head, global_config_dict=OmegaConf.create({"results_dir": str(tmp_path)}))
+    agent = AnySweAgent(config=config, server_client=client)
+    body = NeMoGymResponseCreateParamsNonStreaming(
+        model="test-model", input="Fix it", metadata={"instance_id": "test__test-1", "problem_statement": "Fix it"}
+    )
+    if scenario == "model-failure":
+        saved = NeMoGymResponse(
+            id="r", created_at=1, model="test-model", object="response", output=[],
+            parallel_tool_calls=False, tool_choice="auto", tools=[], status="completed",
+        )
+    elif scenario == "git-unavailable":
+        from responses_api_agents.anyswe_agent.agent_runner import _setup_failure_response
+
+        saved = _setup_failure_response("test-model", "git_unavailable")
+    else:
+        class BadRequestError(RuntimeError):
+            """The OpenHands LLM client's error for an HTTP 400."""
+
+            status_code = 400
+
+        raised = {
+            "named-exception": CompactionFailed("summary fixture was empty"),
+            "unproven-exception": KeyError("private key"),
+            "endpoint-refusal": BadRequestError(
+                'Error code: 400 - {"error": {"message": "This episode has ended (rumination_stop)", '
+                '"code": "episode_terminated"}}'
+            ),
+            "transport-exception": RuntimeError("private message"),
+        }[scenario]
+        if scenario == "transport-exception":
+            raised.status_code = 503
+        # The response the runner writes when the harness raises, here after editing files.
+        saved = _exception_response(raised, body)
+    # A runner that never started leaves no patch.
+    patch = "" if scenario == "git-unavailable" else "diff --git a/fixed.txt b/fixed.txt\n+fixed\n"
+
+    class ResultSandbox:
+        def __init__(self, provider, spec):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def exec(self, command, **kwargs):
+            return SandboxExecResult(saved.model_dump_json(), "", 0, None)
+
+        async def download(self, source, destination):
+            destination.write_text(saved.model_dump_json() if source.endswith("response.json") else patch)
+
+    graded = []
+
+    async def grade(self, params, received):
+        graded.append(received)
+        return False, None, None
+
+    monkeypatch.setattr(app_module, "AsyncSandbox", ResultSandbox)
+    monkeypatch.setattr(AnySweSandboxRunner, "_grade_sandbox_patch", grade)
+    result = await agent.run(AnySweRunRequest(responses_create_params=body))
+
+    assert result.reward == 0.0
+    assert result.error_kind == expected_kind
+    assert result.mask_sample is expected_mask
+    assert graded == ([patch] if graded_patch else [])
+    assert result.agent_exception == (None if scenario == "transport-exception" else exception)
+    # The refusal after a guard stop is a labelled policy stop with its text, not an anonymous exception.
+    assert result.agent_stop_reason == ("episode_terminated" if scenario == "endpoint-refusal" else None)
+    if scenario == "endpoint-refusal":
+        assert "This episode has ended (rumination_stop)" in result.agent_error_text
+    else:
+        assert (result.agent_error_text is None) is (scenario == "model-failure")
 
 
 @pytest.mark.parametrize("external", [False, True])
