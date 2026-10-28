@@ -5,12 +5,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
@@ -46,6 +47,16 @@ class AccountsRequest(BaseModel):
     query: str = ""
 
 
+class CatalogRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    query: str = ""
+    function: str | None = None
+    connected_only: bool = False
+    method: str | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+    offset: int = Field(default=0, ge=0)
+
+
 class SchemaRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     vendor: str
@@ -56,9 +67,26 @@ class APIRequest(BaseModel):
     vendor: str
     method: str
     path: str
-    params: dict[str, Any] = Field(default_factory=dict)
-    body: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] | str | None = None
+    body: dict[str, Any] | str | None = None
     idempotency_key: str | None = None
+
+    @field_validator("params", "body", mode="before")
+    @classmethod
+    def request_object(cls, value: Any) -> dict[str, Any]:
+        """Accept a JSON object or its serialized representation; null means absent."""
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    "Expected a JSON object, a serialized JSON object, or null; Python None is not JSON."
+                ) from error
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("Request containers must decode to an object, not an array or scalar.")
+        return value
 
 
 class ParallelRequest(BaseModel):
@@ -80,6 +108,7 @@ class APIWorkspaceResourcesServer(SimpleResourcesServer):
 
     def setup_webserver(self) -> FastAPI:
         app = super().setup_webserver()
+        app.post("/workspace_catalog")(self.workspace_catalog)
         app.post("/workspace_accounts")(self.workspace_accounts)
         app.post("/workspace_schema")(self.workspace_schema)
         app.post("/workspace_request")(self.workspace_request)
@@ -108,6 +137,12 @@ class APIWorkspaceResourcesServer(SimpleResourcesServer):
         else:
             self._sessions[identity] = _Session(Workspace(scenario))
         return {"task_id": scenario.task_id, "namespace": scenario.namespace, "reset": True}
+
+    async def workspace_catalog(self, request: Request, body: CatalogRequest) -> JSONResponse:
+        try:
+            return JSONResponse(self._session(request).world.catalog(**body.model_dump()))
+        except APIError as error:
+            return JSONResponse(error.payload(), status_code=error.status)
 
     async def workspace_accounts(self, request: Request, body: AccountsRequest) -> JSONResponse:
         try:

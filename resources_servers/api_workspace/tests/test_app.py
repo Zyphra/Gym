@@ -50,7 +50,7 @@ def gold_calls(scenario):
 def seeded():
     native = server()
     with TestClient(native.setup_webserver()) as client:
-        identity = "api-workspace-v1:train:acct_reconcile:0000"
+        identity = "api-workspace-v3:train:acct_reconcile:0000"
         assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
         yield native, client, scenario_from_id(identity)
 
@@ -197,7 +197,7 @@ def test_parallel_idempotency_order_and_session_isolation(seeded):
 def test_concurrent_independent_clients_reset_and_close():
     native = server()
     app = native.setup_webserver()
-    identity = "api-workspace-v1:train:storage_index:0000"
+    identity = "api-workspace-v3:train:storage_index:0000"
     scenario = scenario_from_id(identity)
 
     def run(index):
@@ -223,10 +223,10 @@ def test_corpus_split_prompt_authority_and_noncanonical_ids():
     assert "50 model turns" in row["responses_create_params"]["input"][0]["content"]
     assert not {"records", "updates", "creates", "deletes", "goals"} & row.keys()
     for identity in (
-        "api-workspace-v1:train:hr_onboarding:0",
-        "api-workspace-v1:train:hr_onboarding:0080",
-        "api-workspace-v1:eval:hr_onboarding:0000",
-        "api-workspace-v1:train:invented:0000",
+        "api-workspace-v3:train:hr_onboarding:0",
+        "api-workspace-v3:train:hr_onboarding:0080",
+        "api-workspace-v3:eval:hr_onboarding:0000",
+        "api-workspace-v3:train:invented:0000",
     ):
         with pytest.raises(ValueError):
             scenario_from_id(identity)
@@ -251,3 +251,93 @@ def test_api_write_validation_and_grader_ignores_claims(seeded):
     assert world.score()["reward"] == 1
     with pytest.raises(APIError):
         world.request(vendor="invented_vendor", method="GET", path="/v1/invoices")
+
+
+def test_catalog_metadata_pagination_and_encoded_request_recovery(seeded):
+    import json
+
+    native, client, scenario = seeded
+    page = client.post(
+        "/workspace_catalog", json={"query": "employees location", "method": "PATCH", "limit": 1}
+    ).json()
+    assert page["total"] == 3 and page["next_offset"] == 1
+    assert page["catalog_only"] is True
+    second = client.post(
+        "/workspace_catalog", json={"query": "employees location", "method": "PATCH", "limit": 1, "offset": 1}
+    ).json()
+    assert second["endpoints"][0]["vendor"] != page["endpoints"][0]["vendor"]
+    entries = client.post("/workspace_catalog", json={"query": "employees", "method": "GET"}).json()["endpoints"]
+    assert len(entries) == 3
+    assert scenario.namespace not in json.dumps(entries)
+    assert client.post("/workspace_catalog", json={"query": scenario.namespace}).json()["endpoints"] == []
+    unavailable = next(entry for entry in entries if not entry["connected"])
+    assert (
+        client.post(
+            "/workspace_request", json={"vendor": unavailable["vendor"], "method": "GET", "path": unavailable["path"]}
+        ).status_code
+        == 401
+    )
+    available = next(entry for entry in entries if entry["connected"])
+    base = {"vendor": available["vendor"], "method": "GET", "path": available["path"]}
+    before = canonical_json(next(iter(native._sessions.values())).world.records)
+    for invalid in ("None", "[]", '"text"', "true", "{not-json}"):
+        rejected = client.post("/workspace_request", json=base | {"params": invalid})
+        assert rejected.status_code == 422, rejected.text
+    assert canonical_json(next(iter(native._sessions.values())).world.records) == before
+    read = client.post("/workspace_request", json=base | {"params": json.dumps({"limit": 100}), "body": "null"})
+    assert read.status_code == 200 and read.json()["items"]
+    vendor = VENDORS[available["vendor"]]
+    observed_id = read.json()["items"][0][vendor.field("id")]
+    body = vendor.wire({"location": "Temporary Office"})
+    changed = client.post(
+        "/workspace_request",
+        json=base
+        | {"method": "PATCH", "path": vendor.path("employees", observed_id), "params": None, "body": json.dumps(body)},
+    )
+    assert changed.status_code == 200
+    reread = client.post("/workspace_request", json=base | {"path": vendor.path("employees", observed_id)})
+    assert reread.json()["item"][vendor.field("location")] == "Temporary Office"
+
+
+def test_catalog_validates_selectors_and_can_filter_connections(seeded):
+    _, client, _ = seeded
+    data = client.post("/workspace_catalog", json={"function": "hr", "connected_only": True, "method": "GET"}).json()
+    assert data["total"] == 4 and all(item["connected"] for item in data["endpoints"])
+    for payload, expected in (
+        ({"function": "unknown"}, 400),
+        ({"method": "HEAD"}, 400),
+        ({"limit": 0}, 422),
+        ({"offset": -1}, 422),
+    ):
+        assert client.post("/workspace_catalog", json=payload).status_code == expected
+
+
+@pytest.mark.parametrize("family", FAMILIES)
+def test_independent_sql_reference_rederives_every_gold(family):
+    from resources_servers.api_workspace.tests.independent_reference import derive_calls
+
+    for identity in task_ids("train"):
+        if f":{family}:" not in identity:
+            continue
+        scenario = scenario_from_id(identity)
+        calls = derive_calls(scenario.prompt, scenario.records, family)
+        assert calls, identity
+        world = Workspace(scenario)
+        for call in calls:
+            world.request(**call)
+        assert world.score()["reward"] == 1, (identity, world.score())
+        # A correct-looking report without these persisted operations earns zero.
+        assert Workspace(scenario).score()["reward"] == 0
+        vendor = next(
+            VENDORS[name]
+            for name in scenario.connected
+            if VENDORS[name].function == "hr" and scenario.records[name]["employees"]
+        )
+        identity = next(iter(scenario.records[vendor.name]["employees"]))
+        world.request(
+            vendor=vendor.name,
+            method="PATCH",
+            path=vendor.path("employees", identity),
+            body=vendor.wire({"location": "Wrong reference result"}),
+        )
+        assert world.score()["reward"] == 0

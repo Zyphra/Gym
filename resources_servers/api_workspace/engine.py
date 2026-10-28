@@ -188,6 +188,62 @@ class Workspace:
             ]
         }
 
+    def catalog(
+        self,
+        *,
+        query: str = "",
+        function: str | None = None,
+        connected_only: bool = False,
+        method: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search route metadata without inspecting any task records or goals."""
+        if function is not None and function not in COLLECTIONS:
+            _error(400, "invalid_function", "Unknown function; omit it to search all functions.")
+        if method is not None and method not in {"GET", "POST", "PATCH", "DELETE"}:
+            _error(400, "invalid_method", "Use GET, POST, PATCH or DELETE.")
+        if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or offset < 0:
+            _error(400, "invalid_pagination", "limit must be1..100 and offset nonnegative.")
+        terms = re.findall(r"[a-z0-9_]+", query.casefold())
+        results = []
+        actions = {
+            "GET": "read list search records",
+            "POST": "create record",
+            "PATCH": "update fields",
+            "DELETE": "delete record",
+        }
+        for vendor in VENDORS.values():
+            connected = vendor.name in self.scenario.connected
+            if function is not None and vendor.function != function or connected_only and not connected:
+                continue
+            for collection, fields in COLLECTIONS[vendor.function].items():
+                for verb, description in actions.items():
+                    if method is not None and verb != method:
+                        continue
+                    path = vendor.path(collection) + ("/{id}" if verb in {"PATCH", "DELETE"} else "")
+                    entry = {
+                        "vendor": vendor.name,
+                        "function": vendor.function,
+                        "connected": connected,
+                        "collection": collection,
+                        "method": verb,
+                        "path": path,
+                        "description": f"{description} in {collection}; schema includes {', '.join(fields)}",
+                        "schema_tool": "workspace_schema",
+                    }
+                    text = canonical_json(entry).casefold()
+                    if terms and not all(term in text for term in terms):
+                        continue
+                    results.append(entry)
+        return {
+            "endpoints": results[offset : offset + limit],
+            "total": len(results),
+            "next_offset": offset + limit if offset + limit < len(results) else None,
+            "catalog_only": True,
+            "usage": "Catalog entries describe routes, not record contents. Inspect vendor schema, then request records.",
+        }
+
     def schema(self, vendor: str) -> dict[str, Any]:
         v = self._vendor(vendor)
         return {

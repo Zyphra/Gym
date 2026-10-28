@@ -21,9 +21,3 @@ api_workspace_agent:
         - name: example
           type: example
           jsonl_fpath: resources_servers/api_workspace/data/example.jsonl
-api_workspace_environment_server:
-  environment_servers:
-    legacy_agent:
-      entrypoint: app.py
-      agent_server: {type: responses_api_agents, name: api_workspace_agent}
-ray_startup: {enabled: false}

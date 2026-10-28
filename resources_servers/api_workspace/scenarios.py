@@ -18,8 +18,8 @@ from typing import Any
 from resources_servers.api_workspace.engine import COLLECTIONS, VENDOR_NAMES, VENDORS, canonical_json
 
 
-REVISION = "api-workspace-v1"
-ROOT_SEED = 20261026
+REVISION = "api-workspace-v3"
+ROOT_SEED = 20261028
 TRAIN_VARIANTS = 80
 VAL_VARIANTS = 8
 FAMILIES = (
@@ -54,19 +54,9 @@ FAMILIES = (
     "chat_topic",
     "chat_closeout",
 )
-SYSTEM_PROMPT = """You work in a fictional API workspace with simulated HR, CRM, accounting,
-storage, mail and chat vendors. You have a budget of 50 model turns. Complete the user's
-request by changing the world through tools; a final text report alone does not complete it.
-Discover/list/search connected accounts and inspect their API schemas. Several vendors
-serve each function, but only some are connected. A401 means that vendor is unavailable;
-persist by finding another connected vendor. Relevant data can be split across accounts.
-Use exact method and path, put query fields in params, and write values in body. Query
-strings in path fail. Amounts are integer cents. Follow pagination. Search narrowly before
-reading or writing. Use workspace_parallel for independent API calls when useful; do not
-parallelize dependent reads/writes. Retrying a POST requires the same idempotency key.
-Make reasonable assumptions and act without asking clarification questions. Preserve
-unrelated records and fields. All operations are local to this fictional task, and no real
-external account is involved. Do not invent records, addresses or business facts.
+SYSTEM_PROMPT = """You are working in a fictional workspace containing simulated business records.
+The available tools provide an API catalog, vendor schemas and HTTP requests.
+You have at most50 model turns. Completion is determined by the resulting workspace state.
 """
 
 
@@ -75,18 +65,21 @@ def tools() -> list[dict[str, Any]]:
         "vendor": {"type": "string"},
         "method": {"type": "string", "enum": ["GET", "POST", "PATCH", "DELETE"]},
         "path": {"type": "string"},
-        "params": {"type": "object", "additionalProperties": True},
-        "body": {"type": "object", "additionalProperties": True},
-        "idempotency_key": {"type": "string"},
+        "params": {"anyOf": [{"type": "object", "additionalProperties": True}, {"type": "string"}, {"type": "null"}]},
+        "body": {"anyOf": [{"type": "object", "additionalProperties": True}, {"type": "string"}, {"type": "null"}]},
+        "idempotency_key": {"type": ["string", "null"]},
     }
     entries = [
         (
-            "workspace_accounts",
-            "Discover/list/search fictional accounts and connection status.",
+            "workspace_catalog",
+            "Search fictional API endpoint metadata by operation, collection, function or field. Returns routes and connection status, not records.",
             {
-                "function": {"type": "string", "enum": list(COLLECTIONS)},
-                "connected_only": {"type": "boolean"},
                 "query": {"type": "string"},
+                "function": {"type": ["string", "null"], "enum": [*COLLECTIONS, None]},
+                "connected_only": {"type": "boolean"},
+                "method": {"type": ["string", "null"], "enum": ["GET", "POST", "PATCH", "DELETE", None]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                "offset": {"type": "integer", "minimum": 0},
             },
             [],
         ),
@@ -98,8 +91,7 @@ def tools() -> list[dict[str, Any]]:
         ),
         (
             "workspace_request",
-            "Call a fictional vendor API.401 means switch to a connected vendor; "
-            "path must not contain a query string. This tool returns real HTTP errors.",
+            "Issue a request to a fictional vendor API using its method, path and optional containers.",
             request_fields,
             ["vendor", "method", "path"],
         ),
@@ -186,7 +178,10 @@ class _Builder:
         self.policy_name = f"{self.namespace}-operating-policy.json"
         self.policy = {
             "department": self.department,
-            "manager": self.manager,
+            "coordinator": self.manager,
+            "operations_folder": self.folder_name,
+            "dispatch_channel": self.channel_name,
+            "new_records_vendor_order": self.rng.choice(("alphabetical_first", "alphabetical_last")),
             "region": self.region,
             "location": self.rng.choice(("Tern Office", "Willow Office", "Reed Office")),
             "cost_center": f"CC-{self.rng.randint(210, 890)}",
@@ -290,7 +285,10 @@ class _Builder:
                     "name": f"Colleague {self.namespace[3:]} {i}",
                     "email": email,
                     "department": self.department if i % 3 else "Supply Design",
-                    "manager": self.manager,
+                    "coordinator": self.manager,
+                    "operations_folder": self.folder_name,
+                    "dispatch_channel": self.channel_name,
+                    "new_records_vendor_order": self.rng.choice(("alphabetical_first", "alphabetical_last")),
                     "status": "pending" if i % 2 == 0 else "active",
                     "location": "Remote",
                     "start_date": f"2026-11-{i + 1:02d}",
@@ -478,17 +476,30 @@ class _Builder:
         )
 
     def finish(self, request: str) -> Scenario:
-        prefix = (
-            f"Workspace {self.namespace}. The current operating policy is the approved file "
-            f"'{self.policy_name}'; ignore superseded versions. The operations folder is '{self.folder_name}', "
-            f"the dispatch channel is '{self.channel_name}', and the coordinator is {self.manager}. "
-            "For new drafts, files and chat posts, use the connected account of that function whose vendor "
-            "name sorts first alphabetically. Keep existing records in their current accounts. "
+        # Surface variation is deterministic and independent of any benchmark.
+        style = (FAMILIES.index(self.family) + self.variant) % 6
+        guidance = (
+            f"The operating-policy document is '{self.policy_name}'. The operations folder is "
+            f"'{self.folder_name}', and {self.manager} coordinates this work.",
+            f"Use the operating rules in '{self.policy_name}'; its current version is marked approved.",
+            "Use the approved operating policy in the document store for the company details and operating rules.",
+            "Apply the current workspace operating policy. The superseded policy is retained for history.",
+            f"The coordinator for this work is {self.manager}. Other workspace details are in the approved operating policy.",
+            f"The dispatch destination is '{self.channel_name}'. The governing policy document is '{self.policy_name}'.",
+        )[style]
+        renderings = (
+            f"{guidance} {request}",
+            f"{request}\n\nContext: {guidance}",
+            f"Please complete the following work.\n{request}\n\n{guidance}",
+            f"Work item\n\n{request}\n\nOperating context\n{guidance}",
+            f"{guidance}\n\nRequested changes: {request}",
+            f"{request}\n{guidance}",
         )
-        # Stable placement rule is discoverable and independent of hidden gold metadata.
+        placement = min if self.policy["new_records_vendor_order"] == "alphabetical_first" else max
+        # New-record placement is a business rule in the discoverable policy.
         for goal in self.creates:
             function = VENDORS[goal["vendor"]].function
-            goal["vendor"] = min(self.vendors[function])
+            goal["vendor"] = placement(self.vendors[function])
         return Scenario(
             self.task_id,
             self.namespace,
@@ -497,7 +508,7 @@ class _Builder:
             self.variant,
             tuple(sorted(self.connected)),
             self.records,
-            prefix + request,
+            renderings[style],
             tuple(self.updates),
             tuple(self.creates),
             tuple(self.deletes),
@@ -843,7 +854,7 @@ def scenario_from_id(task_id: str) -> Scenario:
         raise ValueError("invalid task variant") from error
     bound = TRAIN_VARIANTS if parts[1] == "train" else VAL_VARIANTS
     if not 0 <= variant < bound or parts[3] != f"{variant:04d}":
-        raise ValueError("task variant outside immutable V1 corpus")
+        raise ValueError("task variant outside immutable V3 corpus")
     builder = _Builder(parts[1], parts[2], variant)
     return builder.finish(_workflow(builder))
 

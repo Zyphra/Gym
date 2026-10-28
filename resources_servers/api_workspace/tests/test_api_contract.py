@@ -18,7 +18,7 @@ from resources_servers.api_workspace.tests.test_app import gold_calls, server
 @pytest.fixture
 def http_world():
     native = server()
-    identity = "api-workspace-v1:train:acct_reconcile:0000"
+    identity = "api-workspace-v3:train:acct_reconcile:0000"
     with TestClient(native.setup_webserver()) as client:
         assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
         world = next(iter(native._sessions.values())).world
@@ -171,7 +171,7 @@ def test_native_verify_scores_real_world_then_releases_it(http_world):
 def test_grader_rejects_wrong_valid_values_extra_collections_and_missing_rows():
     from resources_servers.api_workspace.engine import Workspace
 
-    scenario = scenario_from_id("api-workspace-v1:train:hr_location:0000")
+    scenario = scenario_from_id("api-workspace-v3:train:hr_location:0000")
     world = Workspace(scenario)
     for call in gold_calls(scenario):
         world.request(**call)
