@@ -322,6 +322,11 @@ class AnySweAgentConfig(BaseResponsesAPIAgentConfig):
     agent_server_class: str = Field(description="Agent class name, e.g. HermesAgent")
     agent_config_class: str = Field(description="Agent config class name, e.g. HermesAgentConfig")
     agent_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    agent_environment: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Process environment for the harness, as AnyTerminal's agent_environment: for a harness "
+        "setting read at import time (e.g. Hermes' HERMES_REDACT_SECRETS). It cannot replace NGSWE_* or PYTHONPATH.",
+    )
 
     container_formatter: str = Field(description="Baked task image containing the AnySWE agent runtime")
     sandbox_provider: str | Dict[str, Any] = "sandbox"
@@ -658,7 +663,10 @@ class AnySweSandboxRunner:
         # upstream URL scoping. Its explicit endpoint prevents double scoping.
         if params.rollout_id:
             env["NGSWE_ROLLOUT_ID"] = params.rollout_id
-        return env
+        reserved = sorted(name for name in params.agent_environment if name in env or name.startswith("NGSWE_"))
+        if reserved:
+            raise ValueError(f"agent_environment cannot set runner variables: {', '.join(reserved)}")
+        return {**env, **params.agent_environment}
 
     @staticmethod
     def _instance_dict(params: AnySweInstanceConfig) -> Dict[str, Any]:
@@ -1201,6 +1209,7 @@ class AnySweAgent(_AnySweAgentServer):
             AnySweEpisodePayload.worker_payload(params),
             self._sandbox_spec(params).resources,
             episode_id=params.rollout_id,
+            placement_key=params.instance_id,
         )
         return NeMoGymResponse.model_validate(result)
 

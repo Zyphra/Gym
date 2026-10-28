@@ -120,3 +120,9 @@ after max-iteration or context-window termination set `mask_sample=true`.
 
 Each rollout includes the trajectory, patch, reward, grading fields, and
 `mask_sample`.
+
+SWE and terminal episodes pass their stable instance identity as the native
+executor's placement preference. Samples of the same instance can share the
+node-local image cache. The executor may spill to another eligible node as soon
+as the preferred node lacks resources; readiness and node exclusions remain
+mandatory. Episode identities, hard resource limits and grading remain unchanged.

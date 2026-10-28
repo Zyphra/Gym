@@ -1,5 +1,7 @@
 # NeMo Gym
 
+[API workspace](resources_servers/api_workspace/README.md) owns the authored stateful API environment and its current admission status; source publication does not admit its pilot.
+
 [![PyPI](https://img.shields.io/pypi/v/nemo-gym)](https://pypi.org/project/nemo-gym/)
 [![Python](https://img.shields.io/pypi/pyversions/nemo-gym)](https://pypi.org/project/nemo-gym/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
