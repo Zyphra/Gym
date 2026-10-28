@@ -1278,7 +1278,9 @@ class TestTerminalResponseLabels:
         )
         (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
         response = app._terminal_response(cfg)
-        assert app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"]).finished_naturally is expected
+        assert (
+            app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"]).finished_naturally is expected
+        )
 
     def test_missing_response_claims_no_completion(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path)

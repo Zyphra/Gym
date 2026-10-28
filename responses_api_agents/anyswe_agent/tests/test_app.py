@@ -1068,9 +1068,14 @@ class TestSandboxAPI:
         """A setting the harness reads at import time (Hermes' HERMES_REDACT_SECRETS) takes effect."""
         params = SimpleNamespace(
             body=SimpleNamespace(model="model", temperature=1.0, top_p=1.0, max_output_tokens=None),
-            agent_kwargs={}, model_server_url="http://model-host:8000/v1", agent_server_module="example.agent",
-            agent_server_class="ExampleAgent", agent_config_class="ExampleAgentConfig", rollout_id=None,
-            sandbox_model_base_url=None, agent_overlay_files={},
+            agent_kwargs={},
+            model_server_url="http://model-host:8000/v1",
+            agent_server_module="example.agent",
+            agent_server_class="ExampleAgent",
+            agent_config_class="ExampleAgentConfig",
+            rollout_id=None,
+            sandbox_model_base_url=None,
+            agent_overlay_files={},
             agent_environment={"HERMES_REDACT_SECRETS": "false"},
         )
         env = AnySweAgent._sandbox_agent_env(params)
@@ -1082,8 +1087,13 @@ class TestSandboxAPI:
             "def redact(text):\n    return text.replace('token=abc', 'token=***') if _ENABLED else text\n"
         )
         probe = "import redact; print(redact.redact('token=abc'))"
-        shown = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(tmp_path)!r}); {probe}"],
-                               env={"PATH": os.environ["PATH"], **env}, capture_output=True, text=True, check=True)
+        shown = subprocess.run(
+            [sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(tmp_path)!r}); {probe}"],
+            env={"PATH": os.environ["PATH"], **env},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         assert shown.stdout.strip() == "token=abc"
         params.agent_environment = {"NGSWE_MODEL_URL": "http://elsewhere"}
         with pytest.raises(ValueError, match="runner variables"):
