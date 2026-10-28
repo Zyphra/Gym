@@ -1,4 +1,5 @@
-"""Opt-in event-name presence, using the real Calendar verifier and clients."""
+"""Mandatory name presence and the legacy stricter name-type guard."""
+
 import asyncio
 import json
 
@@ -19,21 +20,53 @@ STATE = {"0": {"event_id": 0, "duration": 30, "constraint": None, "min_time": "1
 
 
 def grade(event, enabled):
-    client = ServerClient(head_server_config=BaseServerConfig(host="127.0.0.1", port=0),
-                          global_config_dict=OmegaConf.create({}))
-    srv = CalendarResourcesServer(config=CalendarResourcesServerConfig(host="127.0.0.1", port=0,
-                                  entrypoint="app.py", name="calendar", require_event_names=enabled), server_client=client)
-    response = NeMoGymResponse.model_validate({"id": "control", "created_at": 0, "model": "fixture", "object": "response",
-        "status": "completed", "parallel_tool_calls": False, "tool_choice": "none", "tools": [],
-        "output": [{"id": "answer", "type": "message", "role": "assistant", "status": "completed",
-                    "content": [{"type": "output_text", "text": json.dumps(event if isinstance(event, list) else [event]), "annotations": [], "logprobs": []}]}]})
-    body = CalendarVerifyRequest(responses_create_params={"input": [{"role": "user", "content": "Schedule event 0, Coding workshop."}]},
-                                 exp_cal_state=STATE, response=response)
+    client = ServerClient(
+        head_server_config=BaseServerConfig(host="127.0.0.1", port=0), global_config_dict=OmegaConf.create({})
+    )
+    srv = CalendarResourcesServer(
+        config=CalendarResourcesServerConfig(
+            host="127.0.0.1", port=0, entrypoint="app.py", name="calendar", require_event_names=enabled
+        ),
+        server_client=client,
+    )
+    response = NeMoGymResponse.model_validate(
+        {
+            "id": "control",
+            "created_at": 0,
+            "model": "fixture",
+            "object": "response",
+            "status": "completed",
+            "parallel_tool_calls": False,
+            "tool_choice": "none",
+            "tools": [],
+            "output": [
+                {
+                    "id": "answer",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps(event if isinstance(event, list) else [event]),
+                            "annotations": [],
+                            "logprobs": [],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    body = CalendarVerifyRequest(
+        responses_create_params={"input": [{"role": "user", "content": "Schedule event 0, Coding workshop."}]},
+        exp_cal_state=STATE,
+        response=response,
+    )
     return asyncio.run(srv.verify(body)).reward
 
 
-@pytest.mark.parametrize("name,stock_reward", [(None, 1), ("", 1), ("   ", 1), (7, 1), ([], 0), ({}, 1)])
-def test_missing_or_nonstring_name_is_rejected_only_when_enabled(name, stock_reward):
+@pytest.mark.parametrize("name,stock_reward", [(None, 0), ("", 1), ("   ", 1), (7, 1), ([], 0), ({}, 1)])
+def test_name_presence_is_mandatory_and_legacy_type_guard_is_preserved(name, stock_reward):
     event = {"event_id": 0, "duration": 30, "start_time": "10:00"}
     if name is not None:
         event["event_name"] = name
