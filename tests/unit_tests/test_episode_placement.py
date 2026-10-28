@@ -20,10 +20,18 @@ def test_instance_affinity_preserves_real_resource_limits(monkeypatch):
 
     monkeypatch.setattr(executor, "run_episode", execute)
     for index in range(2):
-        assert asyncio.run(run_sandbox_episode(
-            lambda value: value, index, sandbox, episode_id=f"sample-{index}",
-            placement_key="shared-instance",
-        )) == index
+        assert (
+            asyncio.run(
+                run_sandbox_episode(
+                    lambda value: value,
+                    index,
+                    sandbox,
+                    episode_id=f"sample-{index}",
+                    placement_key="shared-instance",
+                )
+            )
+            == index
+        )
     for resources, _ in observed:
         assert resources.placement_key == "shared-instance"
         assert resources.memory_bytes == original.memory_bytes
