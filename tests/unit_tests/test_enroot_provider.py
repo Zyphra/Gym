@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import io
+import os
 import shlex
 import shutil
+import signal
 from pathlib import Path
 from typing import Any, Callable
 
@@ -47,8 +50,16 @@ class RunRecorder:
         self.calls: list[dict[str, Any]] = []
         self._responder = responder
 
-    async def __call__(self, argv: list[str], *, timeout_s: float | None, stdin: bytes | None = None):
-        self.calls.append({"argv": list(argv), "timeout_s": timeout_s, "stdin": stdin})
+    async def __call__(
+        self,
+        argv: list[str],
+        *,
+        timeout_s: float | None,
+        stdin: bytes | None = None,
+        capture_facts=None,
+        environment=None,
+    ):
+        self.calls.append({"argv": list(argv), "timeout_s": timeout_s, "stdin": stdin, "environment": environment})
         return self._responder(list(argv))
 
 
@@ -139,6 +150,7 @@ def _make_provider(
     monkeypatch.setattr(provider, "_run", rec)
     start_rec = StartRecorder(start_proc or FakeProc())
     monkeypatch.setattr(provider, "_start_detached", start_rec)
+    monkeypatch.setattr(enroot_provider, "_find_container_init_pid", lambda *_: FAKE_PID)
     # Bypass /proc check: tests use fake PIDs that don't exist on the host.
     monkeypatch.setattr(provider, "_pid_has_container_marker", lambda pid, name: True)
     return provider, rec, start_rec
@@ -315,11 +327,9 @@ async def test_create_builds_argv_and_runs_probe(
     assert handle.sandbox_id.startswith(enroot_provider.CONTAINER_NAME_PREFIX)
     assert handle.raw.container_pid == FAKE_PID
     assert handle.raw.start_pgid == FAKE_PID
-    assert handle.raw.env == {"FOO": "bar"}
+    assert handle.raw.env["FOO"] == "bar"
 
-    # create rootfs
-    create_argv = next(c["argv"] for c in rec.calls if "create" in c["argv"])
-    assert create_argv[:4] == [FAKE_BINARY, "create", "-n", handle.sandbox_id]
+    assert not any("create" in c["argv"] for c in rec.calls)
 
     # detached start argv (captured by StartRecorder)
     start_argv = start_rec.calls[0]
@@ -328,10 +338,10 @@ async def test_create_builds_argv_and_runs_probe(
     assert _contains_seq(start_argv, ["-m", f"{staging}:/sandbox"])
     assert _contains_seq(start_argv, ["-m", "/data:/data"])
     assert _contains_seq(start_argv, ["-m", "/host/a:/code/a"])
-    assert _contains_seq(start_argv, ["-e", "FOO=bar"])
-    assert _contains_seq(start_argv, ["-e", "NVIDIA_VISIBLE_DEVICES=0"])
+    assert _contains_seq(start_argv, ["-e", "FOO"])
+    assert _contains_seq(start_argv, ["-e", "NVIDIA_VISIBLE_DEVICES"])
     expected_init = f"{enroot_provider.DEFAULT_INIT_COMMAND}  # {handle.sandbox_id}"
-    assert start_argv[-4:] == [handle.sandbox_id, "sh", "-c", expected_init]
+    assert start_argv[-4:] == [str(tmp_path / "img.sqsh"), "sh", "-c", expected_init]
     assert _contains_seq(start_argv, ["--rc", "/dev/null"])
 
 
@@ -354,17 +364,6 @@ async def test_create_requires_image(fake_binary: str, monkeypatch: pytest.Monke
         await provider.create(SandboxSpec(image=None))
 
 
-async def test_create_rootfs_failure_raises(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (1, "", "boom"), tmp_path)
-
-    async def fake_ensure(image: str) -> Path:
-        return tmp_path / "img.sqsh"
-
-    monkeypatch.setattr(provider, "_ensure_image", fake_ensure)
-    with pytest.raises(enroot_provider.EnrootCreateError, match="create failed"):
-        await provider.create(SandboxSpec(image="ubuntu:22.04"))
-
-
 async def test_create_start_early_exit_cleans_up(
     fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, no_killpg: list
 ) -> None:
@@ -383,7 +382,7 @@ async def test_create_start_early_exit_cleans_up(
     with pytest.raises(enroot_provider.EnrootCreateError, match="exited early"):
         await provider.create(SandboxSpec(image="ubuntu:22.04"))
     assert not staging.exists()
-    assert any("remove" in c["argv"] for c in rec.calls)
+    assert not any("remove" in c["argv"] for c in rec.calls)
 
 
 async def test_create_start_timeout_cleans_up(
@@ -400,6 +399,8 @@ async def test_create_start_timeout_cleans_up(
     provider, _rec, _sr = _make_provider(
         monkeypatch, responder, tmp_path, create={"start_timeout_s": 0.05, "start_poll_s": 0.01}
     )
+
+    monkeypatch.setattr(enroot_provider, "_find_container_init_pid", lambda *_: None)
 
     async def fake_ensure(image: str) -> Path:
         return tmp_path / "img.sqsh"
@@ -432,7 +433,7 @@ async def test_create_probe_failure_cleans_up(
     with pytest.raises(enroot_provider.EnrootCreateVerificationError):
         await provider.create(SandboxSpec(image="ubuntu:22.04"))
     assert not staging.exists()
-    assert any("remove" in c["argv"] for c in rec.calls)
+    assert not any("remove" in c["argv"] for c in rec.calls)
 
 
 # --------------------------------------------------------------------------- #
@@ -511,10 +512,11 @@ async def test_exec_normal_with_cwd_and_env(fake_binary: str, monkeypatch: pytes
 
     argv = rec.calls[0]["argv"]
     assert argv[:2] == [FAKE_BINARY, "exec"]
-    assert _contains_seq(argv, ["-e", "A=b"])
+    assert _contains_seq(argv, ["-e", "A"])
     assert str(FAKE_PID) in argv
     assert argv[-3:] == ["sh", "-c", "cd /work && echo hi"]
     assert rec.calls[0]["timeout_s"] == 180
+    assert rec.calls[0]["environment"] == {"A": "b"}
 
 
 async def test_exec_reapplies_create_env_and_overrides_call_env(
@@ -526,9 +528,10 @@ async def test_exec_reapplies_create_env_and_overrides_call_env(
     await provider.exec(handle, "env", env={"A": "from-call"})
 
     argv = rec.calls[0]["argv"]
-    assert _contains_seq(argv, ["-e", "A=from-call"])
-    assert _contains_seq(argv, ["-e", "B=base"])
+    assert _contains_seq(argv, ["-e", "A"])
+    assert _contains_seq(argv, ["-e", "B"])
     assert "A=from-create" not in argv
+    assert rec.calls[0]["environment"] == {"A": "from-call", "B": "base"}
 
 
 async def test_exec_no_pid_is_sandbox_error(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -751,33 +754,6 @@ async def test_download_symlink_in_mount_is_refused(
 # --------------------------------------------------------------------------- #
 # status
 # --------------------------------------------------------------------------- #
-async def test_status_running(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (0, _list_output("nemo-gym-x"), ""), tmp_path)
-    assert await provider.status(_make_handle(tmp_path)) is SandboxStatus.RUNNING
-
-
-async def test_status_stopped_when_no_pid(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    provider, _rec, _sr = _make_provider(
-        monkeypatch, lambda argv: (0, _list_output("nemo-gym-x", pid=None), ""), tmp_path
-    )
-    assert await provider.status(_make_handle(tmp_path)) is SandboxStatus.STOPPED
-
-
-async def test_status_stopped_when_absent(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (0, _list_output("other"), ""), tmp_path)
-    assert await provider.status(_make_handle(tmp_path)) is SandboxStatus.STOPPED
-
-
-async def test_status_unknown_paths(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    handle = _make_handle(tmp_path)
-    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (1, "", "err"), tmp_path)
-    assert await provider.status(handle) is SandboxStatus.UNKNOWN
-
-    def timeout_responder(argv: list[str]) -> tuple[int, str, str]:
-        raise TimeoutError("slow")
-
-    provider, _rec, _sr = _make_provider(monkeypatch, timeout_responder, tmp_path)
-    assert await provider.status(handle) is SandboxStatus.UNKNOWN
 
 
 # --------------------------------------------------------------------------- #
@@ -792,42 +768,8 @@ async def test_close_success(
     await provider.close(_make_handle(staging, start_pgid=12345))
 
     assert not staging.exists()
-    assert _contains_seq(rec.calls[0]["argv"], [FAKE_BINARY, "remove", "-f", "nemo-gym-x"])
+    assert rec.calls == []
     assert (12345, enroot_provider.signal.SIGTERM) in no_killpg
-
-
-async def test_close_missing_container_is_success(
-    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (1, "", "does not exist"), tmp_path)
-    await provider.close(_make_handle(staging))
-    assert not staging.exists()
-
-
-async def test_close_real_failure_raises_but_cleans_up(
-    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (1, "", "permission denied"), tmp_path)
-    with pytest.raises(RuntimeError, match="remove failed"):
-        await provider.close(_make_handle(staging))
-    assert not staging.exists()
-
-
-async def test_close_timeout_raises(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    staging = tmp_path / "staging"
-    staging.mkdir()
-
-    def responder(argv: list[str]) -> tuple[int, str, str]:
-        raise TimeoutError("slow")
-
-    provider, _rec, _sr = _make_provider(monkeypatch, responder, tmp_path)
-    with pytest.raises(TimeoutError):
-        await provider.close(_make_handle(staging))
-    assert not staging.exists()
 
 
 async def test_close_staging_removal_failure_is_logged(
@@ -954,3 +896,24 @@ async def test_start_detached_does_not_await_exit(fake_binary: str, tmp_path: Pa
         await proc.wait()
         out_f.close()
         err_f.close()
+
+
+async def test_status_follows_owned_process_marker_for_shared_image(fake_binary, tmp_path):
+    provider = enroot_provider.EnrootProvider(create={"base_dir": str(tmp_path / "runtime")})
+    name = "nemo-gym-live-marker"
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/sh",
+        "-c",
+        "while :; do /bin/sleep 30; done # " + name,
+        start_new_session=True,
+    )
+    handle = _make_handle(tmp_path, name=name, container_pid=proc.pid)
+    try:
+        assert await provider.status(handle) is SandboxStatus.RUNNING
+        handle.raw.name = "nemo-gym-other-instance"
+        assert await provider.status(handle) is SandboxStatus.STOPPED
+        handle.raw.name = name
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        await proc.wait()
+    assert await provider.status(handle) is SandboxStatus.STOPPED

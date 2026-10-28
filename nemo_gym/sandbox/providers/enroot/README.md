@@ -3,6 +3,13 @@
 A [NeMo Gym](../../../../README.md) sandbox provider backed by the local
 [enroot](https://github.com/NVIDIA/enroot) CLI.
 
+Each sandbox starts the cached SquashFS image directly through stock Enroot.
+Enroot mounts a read-only image lower layer and a private, temporary writable
+overlay; closing the sandbox discards its writes. No named extracted rootfs is
+created. Install `squashfuse` and `fuse-overlayfs` alongside Enroot (or select
+Enroot’s native kernel overlay setting where supported). Runtime state must be
+private to each start. Imported image caching remains shared and read-only.
+
 ## Quick start
 
 **Step 1 — start the NeMo Gym container:**

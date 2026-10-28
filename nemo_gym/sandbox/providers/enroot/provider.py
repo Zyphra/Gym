@@ -78,7 +78,6 @@ ENROOT_RUNTIME_ERROR_MARKERS = (
     "no such file or directory: /proc",
     "nsenter",
 )
-ENROOT_MISSING_CONTAINER_MARKERS = ("does not exist", "no such", "not found")
 # Docker Hub canonical hostnames. These are dropped from image references (rather
 # than passed as enroot's REGISTRY fragment) so enroot uses its configured Hub
 # default — the real Hub registry API is registry-1.docker.io, not "docker.io".
@@ -160,15 +159,13 @@ class EnrootCreateConfig:
     bypass_entrypoint: bool = True
     init_command: str = DEFAULT_INIT_COMMAND
     import_timeout_s: float | None = 1800
-    create_timeout_s: float | None = 600
     start_timeout_s: float | None = 600
     start_poll_s: float = 0.5
     extra_import_args: list[str] = field(default_factory=list)
-    extra_create_args: list[str] = field(default_factory=list)
     extra_start_args: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        for attr in ("import_timeout_s", "create_timeout_s", "start_timeout_s"):
+        for attr in ("import_timeout_s", "start_timeout_s"):
             value = getattr(self, attr)
             if value is not None and value <= 0:
                 raise ValueError(f"create.{attr} must be > 0")
@@ -224,8 +221,8 @@ class EnrootProbeConfig:
 class _EnrootInstance:
     """Provider-private state stashed on SandboxHandle.raw."""
 
-    name: str  # enroot container (rootfs) name
-    sqsh_path: Path  # image squashfs backing the rootfs
+    name: str  # unique init marker, independent of the shared image name
+    sqsh_path: Path  # immutable lower image of the private native overlay
     staging_dir: Path  # shared host folder bind-mounted into the container
     mount_point: str  # where the staging folder shows up inside
     image: str  # original spec.image
@@ -273,11 +270,6 @@ def _is_runtime_failure(stderr: str) -> bool:
     )
 
 
-def _is_missing_container(stderr: str) -> bool:
-    low = stderr.lower()
-    return any(marker in low for marker in ENROOT_MISSING_CONTAINER_MARKERS)
-
-
 def _coerce_mounts(value: Any) -> list[str]:
     """Normalize ``spec.provider_options['mounts']`` into a list of enroot fstab entries.
 
@@ -313,7 +305,7 @@ class EnrootProvider:
             self._create_config,
             **{
                 name: setup_timeout_seconds(getattr(self._create_config, name))
-                for name in ("import_timeout_s", "create_timeout_s", "start_timeout_s")
+                for name in ("import_timeout_s", "start_timeout_s")
             },
         )
         self._probe = replace(
@@ -471,7 +463,7 @@ class EnrootProvider:
             return target
 
     async def create(self, spec: SandboxSpec) -> SandboxHandle:
-        """Import/create the rootfs, launch a detached init, and return a ready handle."""
+        """Start an immutable image with Enroot's private writable overlay."""
         if spec.ttl_s is not None:
             LOGGER.warning("ttl_s is not supported by the enroot provider; it will be ignored.")
         resources = spec.resources
@@ -491,17 +483,6 @@ class EnrootProvider:
 
         mount_point = self._create_config.mount_point
         name = CONTAINER_NAME_PREFIX + uuid.uuid4().hex
-
-        # Unpack the rootfs from the squashfs.
-        try:
-            code, _out, err = await self._run(
-                [self._binary, "create", "-n", name, *self._create_config.extra_create_args, str(sqsh_path)],
-                timeout_s=self._create_config.create_timeout_s,
-            )
-        except TimeoutError as e:
-            raise EnrootCreateError(f"enroot create timed out for image={spec.image!r}: {e}") from e
-        if code != 0:
-            raise EnrootCreateError(f"enroot create failed (code={code}) for image={spec.image!r}: {err.strip()}")
 
         # Host staging dir (bind-mounted in); must exist before start.
         staging_dir = Path(tempfile.mkdtemp(prefix="nemo-gym-enroot-"))
@@ -539,9 +520,13 @@ class EnrootProvider:
         # fallback can find THIS container's init process in /proc unambiguously. The
         # trailing `#` comment is inert to sh but makes the cmdline uniquely greppable.
         init_command = f"{self._create_config.init_command}  # {name}"
-        argv += [name, "sh", "-c", init_command]
+        argv += [str(sqsh_path), "sh", "-c", init_command]
 
-        proc, out_f, err_f = await self._start_detached(argv)
+        try:
+            proc, out_f, err_f = await self._start_detached(argv)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
         instance = _EnrootInstance(
             name=name,
             sqsh_path=sqsh_path,
@@ -557,7 +542,7 @@ class EnrootProvider:
         try:
             instance.container_pid = await self._await_container_pid(instance, err_f)
             await self._verify_created_handle(handle)
-        except Exception:
+        except BaseException:
             await self._cleanup_failed_create_handle(handle)
             raise
         finally:
@@ -569,7 +554,7 @@ class EnrootProvider:
         return handle
 
     async def _await_container_pid(self, instance: _EnrootInstance, err_f: IO[bytes]) -> int:
-        """Poll ``enroot list`` until the container's init PID appears, or raise."""
+        """Find this instance's marked init, independent of named rootfs state."""
         loop = asyncio.get_running_loop()
         deadline = (
             loop.time() + self._create_config.start_timeout_s
@@ -583,20 +568,12 @@ class EnrootProvider:
                 raise EnrootCreateError(
                     f"enroot start exited early (code={instance.proc.returncode}) for {instance.name!r}: {stderr}"
                 )
-            pid, _running = await self._lookup_container(instance.name)
-            if pid is None:
-                # Nested-in-pyxis fallback: when enroot runs as real root
-                # (ENROOT_ALLOW_SUPERUSER) it does not create a per-container user
-                # namespace, so `enroot list` shows the container as present but cannot
-                # map a PID to it. The detached `enroot start` stays in the foreground
-                # for the container lifetime, so its init is a descendant — find it by
-                # walking the start process's tree for the init command.
-                pid = await loop.run_in_executor(
-                    None,
-                    _find_container_init_pid,
-                    self._create_config.init_command,
-                    instance.name,
-                )
+            pid = await loop.run_in_executor(
+                None,
+                _find_container_init_pid,
+                self._create_config.init_command,
+                instance.name,
+            )
             if pid is not None:
                 return pid
             if deadline is not None and loop.time() >= deadline:
@@ -613,28 +590,6 @@ class EnrootProvider:
             handle.seek(0)
             return handle.read().decode(errors="replace").strip()
         return ""
-
-    async def _lookup_container(self, name: str) -> tuple[int | None, bool]:
-        """Return (pid, present). pid is the running init PID or None; present is
-        whether the rootfs exists at all (running or not)."""
-        try:
-            code, out, _err = await self._run(
-                [self._binary, "list", "-f"],
-                timeout_s=self._exec_config.default_timeout_s,
-            )
-        except TimeoutError:
-            return None, False
-        if code != 0:
-            return None, False
-
-        lines = out.splitlines()
-        for line in lines[1:]:  # skip the header row
-            parts = line.split()
-            if parts and parts[0] == name:
-                if len(parts) >= 2 and parts[1].isdigit():
-                    return int(parts[1]), True
-                return None, True
-        return None, False
 
     async def _verify_created_handle(self, handle: SandboxHandle) -> None:
         """Run the readiness probe until the sandbox responds, or raise.
@@ -693,11 +648,6 @@ class EnrootProvider:
         if instance.proc is not None:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(instance.proc.wait(), timeout=self._exec_config.default_timeout_s)
-        with contextlib.suppress(Exception):
-            await self._run(
-                [self._binary, "remove", "-f", instance.name],
-                timeout_s=self._exec_config.default_timeout_s,
-            )
         shutil.rmtree(instance.staging_dir, ignore_errors=True)
 
     @staticmethod
@@ -861,33 +811,16 @@ class EnrootProvider:
             host_tmp.unlink(missing_ok=True)
 
     async def status(self, handle: SandboxHandle) -> SandboxStatus:
-        """Return the container's lifecycle status via ``enroot list -f``.
-
-        Liveness is keyed off the PID column, not name presence: enroot lists
-        created-but-not-running rootfs with an empty PID. Running -> RUNNING;
-        present without a PID, or absent -> STOPPED; timeout/parse error -> UNKNOWN.
-        """
+        """Read the owned init marker; image-start creates no named rootfs."""
         instance = handle.raw
-        try:
-            code, out, _err = await self._run(
-                [self._binary, "list", "-f"],
-                timeout_s=self._exec_config.default_timeout_s,
-            )
-        except TimeoutError:
-            return SandboxStatus.UNKNOWN
-        if code != 0:
-            return SandboxStatus.UNKNOWN
-
-        for line in out.splitlines()[1:]:
-            parts = line.split()
-            if parts and parts[0] == instance.name:
-                if len(parts) >= 2 and parts[1].isdigit():
-                    return SandboxStatus.RUNNING
-                return SandboxStatus.STOPPED
+        if instance.container_pid is not None and self._pid_has_container_marker(
+            instance.container_pid, instance.name
+        ):
+            return SandboxStatus.RUNNING
         return SandboxStatus.STOPPED
 
     async def close(self, handle: SandboxHandle) -> None:
-        """Kill the container init, remove the rootfs, and clean up the staging dir."""
+        """Stop the native overlay lifetime and remove this instance's staging."""
         instance = handle.raw
 
         self._kill_start_group(instance)
@@ -895,24 +828,10 @@ class EnrootProvider:
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(instance.proc.wait(), timeout=self._exec_config.default_timeout_s)
 
-        remove_error: Exception | None = None
-        try:
-            code, _out, err = await self._run(
-                [self._binary, "remove", "-f", instance.name],
-                timeout_s=self._exec_config.default_timeout_s,
-            )
-            if code != 0 and not _is_missing_container(err):
-                remove_error = RuntimeError(f"enroot remove failed (code={code}) for {instance.name!r}: {err.strip()}")
-        except TimeoutError as e:
-            remove_error = e
-
         try:
             shutil.rmtree(instance.staging_dir, ignore_errors=False)
         except OSError as e:
             LOGGER.warning("failed to remove staging dir %s: %s", instance.staging_dir, e)
-
-        if remove_error is not None:
-            raise remove_error
 
     async def aclose(self) -> None:
         """No provider-wide resources to close."""
