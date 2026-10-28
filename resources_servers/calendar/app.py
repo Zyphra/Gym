@@ -71,7 +71,9 @@ class CalendarResourcesServer(SimpleResourcesServer):
 
         exp_cal_state = body.exp_cal_state
         try:
-            reward, reason = grade_assistant_response(assistant_response, exp_cal_state)
+            reward, reason = grade_assistant_response(
+                assistant_response, exp_cal_state, input_messages=body.responses_create_params.input
+            )
         except Exception:
             reward = 0
 
