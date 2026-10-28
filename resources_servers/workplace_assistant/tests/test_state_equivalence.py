@@ -14,6 +14,8 @@
 # limitations under the License.
 import json
 
+import pytest
+
 from resources_servers.workplace_assistant.utils import execute_actions_and_reset_state, is_correct
 
 
@@ -174,6 +176,35 @@ def test_existing_case_rules_and_error_rejection_are_preserved():
         )
     ]
     assert not is_correct(wrong, gold, None)
+
+
+@pytest.mark.parametrize(
+    "toolkit,table,identifier,field,update",
+    [
+        ("project_management", "_project_tasks", "task_id", "task_name", "project_management_update_task"),
+        (
+            "customer_relationship_manager",
+            "_crm_data",
+            "customer_id",
+            "customer_name",
+            "customer_relationship_manager_update_customer",
+        ),
+        ("calendar", "_calendar_events", "event_id", "event_name", "calendar_update_event"),
+    ],
+)
+def test_case_only_unrequested_name_change_fails(toolkit, table, identifier, field, update):
+    seed = execute_actions_and_reset_state([])
+    record = getattr(seed["containers"][toolkit], table).iloc[0]
+    original = record[field]
+    changed = original.swapcase()
+    assert changed != original and changed.lower() == original.lower()
+    extra = action(update, **{identifier: record[identifier], "field": field, "new_value": changed})
+    gold = [action("email_delete_email", email_id="00000031")]
+    actual = execute_actions_and_reset_state([*gold, extra])
+    persisted = getattr(actual["containers"][toolkit], table)
+    assert persisted.loc[persisted[identifier] == record[identifier], field].item() == changed
+    assert is_correct(gold, gold, None)
+    assert not is_correct([*gold, extra], gold, None)
 
 
 def first_generated_email_id():

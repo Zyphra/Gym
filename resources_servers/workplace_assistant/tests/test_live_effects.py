@@ -67,6 +67,40 @@ def test_live_state_retains_unintended_effects_absent_from_transcript():
     assert not state_matches_reference(env, [gold])
 
 
+@pytest.mark.parametrize(
+    "toolkit,table,identifier,field,update",
+    [
+        ("project_management", "_project_tasks", "task_id", "task_name", "project_management_update_task"),
+        (
+            "customer_relationship_manager",
+            "_crm_data",
+            "customer_id",
+            "customer_name",
+            "customer_relationship_manager_update_customer",
+        ),
+    ],
+)
+def test_verify_rejects_unrequested_case_only_write(toolkit, table, identifier, field, update):
+    async def run():
+        server, request = server_and_request()
+        await server.seed_session(request, BaseSeedSessionRequest())
+        record = getattr(execute_actions_and_reset_state([])["containers"][toolkit], table).iloc[0]
+        gold = creation()
+        await server.route_to_python_function(gold["name"], WorkbenchRequest(**json.loads(gold["arguments"])), request)
+        changed = record[field].swapcase()
+        assert changed != record[field]
+        result = await server.route_to_python_function(
+            update,
+            WorkbenchRequest(**{identifier: record[identifier], "field": field, "new_value": changed}),
+            request,
+        )
+        assert not str(result.output).startswith("Error"), result
+        result = await server.verify(request, verify_body([gold], [gold]))
+        assert result.reward == 0
+
+    asyncio.run(run())
+
+
 def test_missing_tracking_is_unavailable():
     env = execute_actions_and_reset_state([creation()])
     del env["sent_emails"]

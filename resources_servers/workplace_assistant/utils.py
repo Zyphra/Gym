@@ -270,11 +270,11 @@ def state_matches_reference(predicted_env, ground_truth_actions, *, reject_noop_
     if "stable_ids" not in predicted_env or "sent_emails" not in predicted_env:
         raise ValueError("session effect tracking is unavailable")
     reference_env = execute_actions_and_reset_state(ground_truth_actions)
+    seed_env = execute_actions_and_reset_state([])
+    seed = _state_tables(seed_env)
     predicted = _state_tables(predicted_env)
     reference = _state_tables(reference_env)
     if reject_noop_reference:
-        seed_env = execute_actions_and_reset_state([])
-        seed = _state_tables(seed_env)
         unchanged = True
         for name, (reference_frame, id_column) in reference.items():
             expected = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
@@ -289,7 +289,26 @@ def state_matches_reference(predicted_env, ground_truth_actions, *, reject_noop_
         reference_rows = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
         if predicted_rows is None or reference_rows is None or predicted_rows != reference_rows:
             return False
+        if id_column is not None and not _preserves_reference_untouched_fields(
+            predicted[name][0], reference_frame, seed[name][0], id_column, reference_env["stable_ids"][name]
+        ):
+            return False
     # The final mailbox hides a wrong email that was sent and then deleted.
     predicted_sent = _sent_email_rows(predicted_env)
     reference_sent = _sent_email_rows(reference_env)
     return predicted_sent is not None and reference_sent is not None and predicted_sent == reference_sent
+
+
+def _preserves_reference_untouched_fields(predicted, reference, seed, id_column, stable_ids):
+    """Unrequested changes cannot hide behind normalization of requested writes."""
+    if predicted[id_column].duplicated().any():
+        return False
+    ids = reference.loc[reference[id_column].isin(stable_ids), id_column]
+    if not ids.isin(predicted[id_column]).all():
+        return False
+    expected = reference.set_index(id_column).loc[ids]
+    initial = seed.set_index(id_column).loc[ids]
+    actual = predicted.set_index(id_column).loc[ids]
+    unchanged = expected.eq(initial) | (expected.isna() & initial.isna())
+    matches = actual.eq(expected) | (actual.isna() & expected.isna())
+    return bool((matches | ~unchanged).all(axis=None))
