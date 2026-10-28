@@ -1232,6 +1232,12 @@ class SimpleServer(BaseServer):
                 )
 
                 response_content = f"Hit an exception in {self.get_session_middleware_key()} calling an inner server: {e.response_content}"
+                try:
+                    upstream = json.loads(e.response_content)
+                    if isinstance(upstream, dict):
+                        response_content = upstream
+                except (ValueError, TypeError):
+                    pass
                 print(_format_upstream_error_log(self.get_session_middleware_key(), e), flush=True)
 
                 # Keep deterministic client failures and gateway availability/deadline
