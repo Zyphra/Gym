@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import json
 import logging
 import os
 import shlex
@@ -504,6 +505,49 @@ class TestResponses:
         with patch.object(Terminus2Agent, "resolve_model_base_url", return_value="http://model/v1"):
             response = await agent.responses(request=None, body=body)
         assert "agent_error" not in response.metadata
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("flags", "timed_out", "confirmed", "expected"),
+        [
+            ({}, False, True, True),  # task_complete confirmed twice
+            ({}, False, False, False),  # turn cap or an unconfirmed claim
+            ({}, True, True, False),  # harness timeout
+            ({"agent_error": "RuntimeError"}, False, True, False),  # harness exception
+            ({"model_transport_error": "upstream 502"}, False, True, False),
+            ({"stop_reason": "turn_limit"}, False, True, False),  # endpoint stop
+            ({"stop_reason": "identical_call"}, False, True, False),  # endpoint guard
+            ({"context_length_exceeded": True}, False, True, False),
+        ],
+    )
+    async def test_finished_naturally_is_only_the_confirmed_completion(
+        self, flags, timed_out, confirmed, expected
+    ) -> None:
+        agent = _make_agent()
+        agent._run_terminus = AsyncMock(return_value=({"steps": []}, AgentContext(), flags, timed_out, confirmed))
+        body = NeMoGymResponseCreateParamsNonStreaming(model="model", input="task")
+        with patch.object(Terminus2Agent, "resolve_model_base_url", return_value="http://model/v1"):
+            response = await agent.responses(request=None, body=body)
+        # A wrapping agent reads this harness-neutral key without parsing terminus_2.
+        assert response.metadata["finished_naturally"] == ("true" if expected else "false")
+        assert json.loads(response.metadata["terminus_2"])["finished_naturally"] is expected
+
+        response_json = response.model_dump(mode="json")
+        verify_json = {
+            "responses_create_params": body.model_dump(mode="json"),
+            "response": response_json,
+            "reward": 0.0,
+        }
+        agent.server_client.post = AsyncMock(return_value=MagicMock(cookies={}))
+        with (
+            patch("responses_api_agents.terminus_2_agent.app.raise_for_status", new=AsyncMock()),
+            patch(
+                "responses_api_agents.terminus_2_agent.app.get_response_json",
+                new=AsyncMock(side_effect=[response_json, verify_json]),
+            ),
+        ):
+            verified = await agent.run(MagicMock(cookies={}), Terminus2AgentRunRequest(responses_create_params=body))
+        assert verified.finished_naturally is expected
 
     @pytest.mark.asyncio
     async def test_model_client_close_failure_is_logged(self) -> None:

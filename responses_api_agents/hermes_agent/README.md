@@ -58,7 +58,7 @@ python -m unittest responses_api_agents.hermes_agent.tests.test_tool_results -v
 
 `hermes-agent` is pinned in `requirements.txt` to a fork branch with patches for token id tracking, chat template, and sampling parameters needed for training.
 
-For agent integrations like this, the agent must point at Gym's model server, it must include prompt and generation token id in requests for Nemo RL and other trainer integration on policy token id correction, it must not override sampling parameters like temperature and top p, and it must preserve sampled reasoning in retained history. When compression is enabled, the native per-instance managed summary callback uses the same policy client, model and rollout URL as main turns; auxiliary provider auto-detection is not used. The pinned Hermes runtime must expose that callback. Summary requests retain the offered tool schema, forbid tool execution and fail on empty, truncated or tool-calling responses.
+For agent integrations like this, the agent must point at Gym's model server, it must include prompt and generation token id in requests for Nemo RL and other trainer integration on policy token id correction, it must not override sampling parameters like temperature and top p, and it must preserve sampled reasoning in retained history. When compression is enabled, Hermes runs its stock compressor (`agent/context_compressor.py`) unchanged, and its `call_llm(task="compression")` request is answered by the calling run's policy client, model and rollout URL, as a self-hosted deployment without an auxiliary provider resolves it. The request is Hermes' own: one user message, no tools, Hermes' summary `max_tokens` and temperature. An empty summary leaves only the compaction marker and a failed call drops the middle turns; the run continues in both cases.
 
 ## Resources server compatibility
 
@@ -101,4 +101,13 @@ hermes_agent:
 
 The model-server url is resolved at request time and passed to `AIAgent(base_url=..., api_key="gym")`. <!-- pragma: allowlist secret -->
 
-`context_window` binds the native compressor to the served model window. Its compression threshold reserves `max_tokens` for the next completion before applying `compression_threshold`; model-name fallback metadata must not override a configured training window.
+`context_window` binds the native compressor to the served model window; model-name fallback metadata must not override a configured training window. `compression_threshold` (default `0.50`, Hermes' `compression.threshold` default) is the fraction of that window at which Hermes compresses. `compression_summary_temperature` (default `null`) replaces the temperature of the compression request; `null` keeps Hermes' own `0.3`.
+
+### Summary output budget
+
+`compression_summary_max_output_tokens` defaults to `32768` and projects to
+Hermes' `compression.summary_max_output_tokens`. It includes reasoning and visible
+summary tokens. Thinking and the visible-summary target remain unchanged;
+`compression_target_ratio` only controls recent-tail retention. Choose an output
+budget that fits the policy model's context window together with the summary input.
+Requires the Hermes runtime's summary-output-budget configuration support.

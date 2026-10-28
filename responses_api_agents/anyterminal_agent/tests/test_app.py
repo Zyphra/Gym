@@ -1269,6 +1269,22 @@ class TestTerminalResponseLabels:
             "mask_sample": True,
         }
 
+    @pytest.mark.parametrize(("label", "expected"), [("true", True), ("false", False), (None, False)])
+    def test_inner_completion_label_is_carried(self, tmp_path: Path, label, expected) -> None:
+        cfg = _make_instance_config(tmp_path)
+        metadata = {} if label is None else {"finished_naturally": label}
+        (cfg.persistent_dir / "response.json").write_text(
+            json.dumps(self._response(status="completed", metadata=metadata))
+        )
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        response = app._terminal_response(cfg)
+        assert app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"]).finished_naturally is expected
+
+    def test_missing_response_claims_no_completion(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        response = app._terminal_response(cfg)
+        assert app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"]).finished_naturally is False
+
     def test_clean_run_carries_no_label(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path)
         (cfg.persistent_dir / "response.json").write_text(json.dumps(self._response(status="completed")))
