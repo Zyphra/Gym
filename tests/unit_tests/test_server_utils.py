@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import json
 import multiprocessing
 import socket
 from concurrent.futures import ProcessPoolExecutor
@@ -833,12 +834,13 @@ class TestServerUtils:
         ("inner", "outer"),
         [(400, 400), (413, 413), (429, 429), (500, 500), (501, 500), (502, 502), (503, 503), (504, 504)],
     )
+    @pytest.mark.parametrize("structured", [False, True])
     async def test_exception_middleware_keeps_inner_client_error_status(
-        self, monkeypatch: MonkeyPatch, inner: int, outer: int
+        self, monkeypatch: MonkeyPatch, inner: int, outer: int, structured: bool
     ) -> None:
         callbacks = []
         app = MagicMock()
-        app.middleware.side_effect = lambda _kind: (lambda callback: callbacks.append(callback) or callback)
+        app.middleware.side_effect = lambda _kind: lambda callback: callbacks.append(callback) or callback
         server = MagicMock()
         server.get_session_middleware_key.return_value = "TestSimpleServer___my_server"
         SimpleServer.setup_exception_middleware(server, app)
@@ -849,7 +851,17 @@ class TestServerUtils:
             real_url=URL("http://simulator.test/v1/responses"),
         )
         error = ClientResponseError(request_info=request_info, history=(), status=inner, message="inner")
-        error.response_content = b"This model's maximum context length is 131072 tokens."
+        payload = {
+            "detail": {
+                "error": "user_sim_unvoiced_required_intent",
+                "verifier_verdict": {
+                    "source_audit": {"user_sim_rejections": [{"reply": "Please proceed.", "retry_index": 0}]}
+                },
+            }
+        }
+        error.response_content = (
+            json.dumps(payload).encode() if structured else b"This model's maximum context length is 131072 tokens."
+        )
 
         async def fail(_request):
             raise error
@@ -858,7 +870,13 @@ class TestServerUtils:
         response = await callbacks[0](MagicMock(), fail)
 
         assert response.status_code == outer
-        assert b"maximum context length" in response.body
+        if structured:
+            assert json.loads(response.body) == payload
+            # A second relay must retain the object rather than stringify it.
+            error.response_content = response.body
+            assert json.loads((await callbacks[0](MagicMock(), fail)).body) == payload
+        else:
+            assert b"maximum context length" in response.body
         # Gateway status preservation keeps the same retry-eligible failures.
         assert (outer in nemo_gym.server_utils.RETRY_ERROR_CODES) == (inner in (429, 500, 501, 502, 503, 504))
 
