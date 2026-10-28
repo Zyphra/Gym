@@ -330,6 +330,7 @@ class EnrootProvider:
 
         self._enroot_env = {
             **os.environ,
+            "ENROOT_NATIVE_OVERLAYFS": "no",
             "ENROOT_DATA_PATH": data_path,
             "ENROOT_CACHE_PATH": cache_path,
             "ENROOT_RUNTIME_PATH": runtime_path,

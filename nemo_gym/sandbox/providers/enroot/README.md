@@ -6,8 +6,10 @@ A [NeMo Gym](../../../../README.md) sandbox provider backed by the local
 Each sandbox starts the cached SquashFS image directly through stock Enroot.
 Enroot mounts a read-only image lower layer and a private, temporary writable
 overlay; closing the sandbox discards its writes. No named extracted rootfs is
-created. Install `squashfuse` and `fuse-overlayfs` alongside Enroot (or select
-Enroot’s native kernel overlay setting where supported). Runtime state must be
+created. Install `squashfuse` and `fuse-overlayfs` alongside Enroot. The provider
+selects stock `ENROOT_NATIVE_OVERLAYFS=no`: kernel overlays over Enroot's tmpfs
+upper cannot store opaque-directory attributes on older rootless kernels.
+Runtime state must be
 private to each start. Imported image caching remains shared and read-only.
 
 ## Quick start
