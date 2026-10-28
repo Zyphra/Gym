@@ -21,12 +21,12 @@ from time import monotonic, time
 from traceback import format_exc
 from typing import Any, Dict, Optional, Tuple
 
+from docker.models.containers import ExecResult
 from fastapi import Request
 from pydantic import BaseModel, Field
 from swebench.harness.run_evaluation import make_test_spec
 from swebench.harness.test_spec.test_spec import LATEST, TestSpec
 
-from docker.models.containers import ExecResult
 from nemo_gym.base_resources_server import (
     BaseResourcesServerConfig,
     BaseSeedSessionRequest,
