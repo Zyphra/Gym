@@ -1317,7 +1317,7 @@ class TestAgentRuntimeDirectory:
         empty.mkdir()
         with pytest.raises(ValueError, match="lacks bin/python"):
             self._agent(tmp_path, empty, {"apptainer": {}})
-        with pytest.raises(ValueError, match="apptainer provider"):
+        with pytest.raises(ValueError, match="Apptainer or Enroot provider"):
             self._agent(tmp_path, self._runtime(tmp_path), {"opensandbox": {}})
 
     async def test_directory_is_bind_mounted_not_copied(self, tmp_path) -> None:
