@@ -15,6 +15,7 @@
 
 import json
 import re
+import unicodedata
 
 
 def time_to_minutes(time_str: str) -> int:
@@ -152,19 +153,54 @@ def is_constraint_satisfied(event, exp_event):
     return True
 
 
-def grade_assistant_response(assistant_response, exp_cal_state, allow_no_json_list=False):
+def _event_name_key(name):
+    if not isinstance(name, str):
+        return None
+    return " ".join(unicodedata.normalize("NFKC", name).split()).casefold()
+
+
+def _expected_event_names(exp_cal_state, input_messages):
+    names = {}
+    for message in reversed(input_messages or []):
+        if hasattr(message, "model_dump"):
+            message = message.model_dump()
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content", "")
+        if isinstance(content, list):
+            content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
+        if not isinstance(content, str):
+            continue
+        for event in extract_json_list(content) or []:
+            if isinstance(event, dict) and "event_id" in event and _event_name_key(event.get("event_name")):
+                names.setdefault(str(event["event_id"]), event["event_name"])
+    # Explicit source metadata takes precedence over earlier conversation state.
+    for event_id, event in exp_cal_state.items():
+        if _event_name_key(event.get("event_name")):
+            names[str(event_id)] = event["event_name"]
+    return names
+
+
+def grade_assistant_response(assistant_response, exp_cal_state, allow_no_json_list=False, input_messages=None):
     # invalid response
     if "<think>" in assistant_response:
         return 0, "think_found"
 
+    cal_state = extract_json_list(assistant_response)
+    required_fields = {"event_id", "event_name", "start_time", "duration"}
+    if cal_state is not None and any(
+        not isinstance(event, dict) or not required_fields.issubset(event) for event in cal_state
+    ):
+        return 0, "missing_required_fields"
+
     # valid response
-    elif len(exp_cal_state) == 0:
-        # No change expected
+    if len(exp_cal_state) == 0:
+        if cal_state:
+            return 0, "unexpected_events"
         return 1, "pass"
     else:
         # events were expected to be scheduled/changed
         try:
-            cal_state = extract_json_list(assistant_response)
             if cal_state is None or len(cal_state) == 0:
                 if allow_no_json_list:
                     return 1, "pass"
@@ -176,7 +212,7 @@ def grade_assistant_response(assistant_response, exp_cal_state, allow_no_json_li
                 events_dict[str(event["event_id"])] = event
 
             # Assistant response has a different number of events than the expected calendar state
-            if len(events_dict) != len(exp_cal_state):
+            if len(cal_state) != len(exp_cal_state) or len(events_dict) != len(exp_cal_state):
                 return 0, "different_number_of_events"
 
             # There are events with time conflicts
@@ -185,7 +221,12 @@ def grade_assistant_response(assistant_response, exp_cal_state, allow_no_json_li
                     return 0, "conflicting_events"
 
             # Events are not correctly scheduled
+            expected_names = _expected_event_names(exp_cal_state, input_messages)
             for event_id in exp_cal_state.keys():
+                if str(event_id) in expected_names and _event_name_key(
+                    events_dict[event_id]["event_name"]
+                ) != _event_name_key(expected_names[str(event_id)]):
+                    return 0, "wrong_event_name"
                 if not is_constraint_satisfied(events_dict[event_id], exp_cal_state[event_id]):
                     return 0, "constraint_violated"
         except:

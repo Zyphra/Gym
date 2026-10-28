@@ -66,6 +66,9 @@ The server grades assistant responses based on multiple criteria:
 **Reward = 0 (failure) if:**
 - Response contains `<think>` tags
 - No JSON list extracted from response (when events expected)
+- A calendar entry omits a required field: `event_id`, `event_name`, `start_time`, or `duration`
+- An event name disagrees with source metadata or the latest explicit assistant calendar for that event ID
+- A response adds events to an empty expected calendar or repeats an event ID
 - Wrong number of events scheduled
 - Events have time conflicts (overlapping times)
 - Events violate time constraints:
@@ -81,6 +84,9 @@ The server grades assistant responses based on multiple criteria:
 - No time conflicts
 - All constraints satisfied
 - Or when no events are expected and response is valid
+
+Event-name comparison ignores Unicode compatibility formatting, letter case, and whitespace.
+When neither source metadata nor a previous assistant calendar names an event, the verifier cannot establish that event's name identity.
 
 
 # Data Generation Pipeline
