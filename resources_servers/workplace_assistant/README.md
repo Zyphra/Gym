@@ -36,9 +36,10 @@ keys between generated records; adding such links requires extending the mapping
 
 The existing case rules remain: `status`, `list_name` and `board` are case
 sensitive; other strings in requested writes are compared in lowercase.
-Fields on retained seeded records that the reference leaves unchanged must
+Fields on retained seeded records that the task does not request changing must
 match the seed exactly, including letter case. Normalization cannot conceal an
-unrequested rename or other collateral edit. This change accepts
+unrequested rename or other collateral edit. Requested idempotent updates retain
+the same validated time and duration equivalence as other requested updates. This change accepts
 independent forwards, creations and plots in either order while rejecting wrong
 recipients, record IDs, fields, omitted writes and unintended changes. Final
 answers and evidence-read order remain outside the state grader.

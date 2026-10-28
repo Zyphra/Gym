@@ -270,6 +270,7 @@ def state_matches_reference(predicted_env, ground_truth_actions, *, reject_noop_
     if "stable_ids" not in predicted_env or "sent_emails" not in predicted_env:
         raise ValueError("session effect tracking is unavailable")
     reference_env = execute_actions_and_reset_state(ground_truth_actions)
+    requested_fields = _reference_update_fields(reference_env)
     seed_env = execute_actions_and_reset_state([])
     seed = _state_tables(seed_env)
     predicted = _state_tables(predicted_env)
@@ -290,7 +291,12 @@ def state_matches_reference(predicted_env, ground_truth_actions, *, reject_noop_
         if predicted_rows is None or reference_rows is None or predicted_rows != reference_rows:
             return False
         if id_column is not None and not _preserves_reference_untouched_fields(
-            predicted[name][0], reference_frame, seed[name][0], id_column, reference_env["stable_ids"][name]
+            predicted[name][0],
+            reference_frame,
+            seed[name][0],
+            id_column,
+            reference_env["stable_ids"][name],
+            requested_fields.get(name, {}),
         ):
             return False
     # The final mailbox hides a wrong email that was sent and then deleted.
@@ -299,7 +305,23 @@ def state_matches_reference(predicted_env, ground_truth_actions, *, reject_noop_
     return predicted_sent is not None and reference_sent is not None and predicted_sent == reference_sent
 
 
-def _preserves_reference_untouched_fields(predicted, reference, seed, id_column, stable_ids):
+def _reference_update_fields(reference_env):
+    targets = {
+        "calendar_update_event": ("calendar", "event_id"),
+        "project_management_update_task": ("project_management", "task_id"),
+        "customer_relationship_manager_update_customer": ("customer_relationship_manager", "customer_id"),
+    }
+    requested = {}
+    for observation in reference_env["observations"]:
+        target = targets.get(observation["tool"])
+        if target is not None:
+            name, key = target
+            args = observation["arguments"]
+            requested.setdefault(name, {}).setdefault(args.get(key), set()).add(args.get("field"))
+    return requested
+
+
+def _preserves_reference_untouched_fields(predicted, reference, seed, id_column, stable_ids, requested_fields):
     """Unrequested changes cannot hide behind normalization of requested writes."""
     if predicted[id_column].duplicated().any():
         return False
@@ -310,5 +332,12 @@ def _preserves_reference_untouched_fields(predicted, reference, seed, id_column,
     initial = seed.set_index(id_column).loc[ids]
     actual = predicted.set_index(id_column).loc[ids]
     unchanged = expected.eq(initial) | (expected.isna() & initial.isna())
+    # An explicitly requested idempotent update can leave the seed unchanged.
+    # Its equivalent validated spellings still use the ordinary comparison.
+    for identity, fields in requested_fields.items():
+        if identity in unchanged.index:
+            for field in fields:
+                if field in unchanged.columns:
+                    unchanged.loc[identity, field] = False
     matches = actual.eq(expected) | (actual.isna() & expected.isna())
     return bool((matches | ~unchanged).all(axis=None))
