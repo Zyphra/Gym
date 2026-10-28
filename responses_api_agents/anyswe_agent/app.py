@@ -1202,6 +1202,7 @@ class AnySweAgent(_AnySweAgentServer):
             AnySweEpisodePayload.worker_payload(params),
             self._sandbox_spec(params).resources,
             episode_id=params.rollout_id,
+            placement_key=params.instance_id,
         )
         return NeMoGymResponse.model_validate(result)
 

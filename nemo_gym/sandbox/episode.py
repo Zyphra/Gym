@@ -16,6 +16,7 @@
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import replace
 from typing import Any, Callable, Mapping, Optional
 
 from pydantic import BaseModel, Field, model_serializer
@@ -64,11 +65,14 @@ def sandbox_episode_control(name: Optional[str], episode_id: Optional[str] = Non
 
 
 async def run_sandbox_episode(
-    fn: Callable, payload: Any, sandbox: SandboxResources, *, episode_id: Optional[str]
+    fn: Callable, payload: Any, sandbox: SandboxResources, *, episode_id: Optional[str],
+    placement_key: Optional[str] = None,
 ) -> object:
     from core.sandbox.executor import run_episode
 
     resources = sandbox_episode_resources(sandbox)
+    if placement_key is not None:
+        resources = replace(resources, placement_key=placement_key)
     control, enrolled_id, excluded_node_ids = _EPISODE_CONTROL.get()
     if control is not None:
         from core.sandbox import EpisodeOwnershipError
