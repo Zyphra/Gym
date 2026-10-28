@@ -639,7 +639,14 @@ def _path_without_tmux() -> str:
 class TestSetupFailureLabel:
     @pytest.mark.asyncio
     async def test_setup_without_tmux_fails_labelled_with_its_first_cause(self, tmp_path: Path, monkeypatch) -> None:
-        monkeypatch.setenv("PATH", _path_without_tmux())
+        # bash and tmux can share a directory. Keep a real shell available
+        # while removing tmux, so this exercises the intended setup failure.
+        bash = shutil.which("bash")
+        assert bash
+        shell_bin = tmp_path / "shell-bin"
+        shell_bin.mkdir()
+        (shell_bin / "bash").symlink_to(bash)
+        monkeypatch.setenv("PATH", str(shell_bin) + os.pathsep + _path_without_tmux())
         assert shutil.which("tmux") is None
         environment = LocalEnvironment(tmp_path, command_timeout_sec=120)
         agent = _setup_agent(tmp_path)
