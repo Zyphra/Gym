@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import json
 from unittest.mock import MagicMock
+
+import pytest
 
 from nemo_gym.base_resources_server import NeMoGymResponse
 from nemo_gym.server_utils import ServerClient
@@ -30,7 +33,7 @@ class TestApp:
         config = CalendarResourcesServerConfig(host="0.0.0.0", port=8080, entrypoint="", name="")
         return CalendarResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
 
-    def _create_real_request(self, response_content, exp_cal_state, request_id=1):
+    def _create_real_request(self, response_content, exp_cal_state, request_id=1, input_messages=None):
         """Helper to create real request with NeMoGymResponse."""
         # Create real NeMoGymResponse object
         response = NeMoGymResponse(
@@ -62,7 +65,7 @@ class TestApp:
         return CalendarVerifyRequest(
             id=request_id,
             exp_cal_state=exp_cal_state,
-            responses_create_params={"input": []},
+            responses_create_params={"input": input_messages or []},
             response=response,
         )
 
@@ -97,7 +100,7 @@ class TestApp:
                 "max_time": "16:00",
             }
         }
-        response_content = '[{"event_id": 0, "start_time": "2pm", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
 
@@ -120,8 +123,8 @@ class TestApp:
             },
         }
         response_content = (
-            '[{"event_id": 0, "start_time": "2pm", "duration": 60}, '
-            '{"event_id": 1, "start_time": "12pm", "duration": 90}]'
+            '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 60}, '
+            '{"event_id": 1, "event_name": "Event 1", "start_time": "12pm", "duration": 90}]'
         )
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
@@ -137,9 +140,7 @@ class TestApp:
                 "max_time": "16:00",
             }
         }
-        response_content = (
-            '<think>Planning the schedule...</think>[{"event_id": 0, "start_time": "2pm", "duration": 60}]'
-        )
+        response_content = '<think>Planning the schedule...</think>[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -198,7 +199,7 @@ class TestApp:
                 "max_time": "16:00",
             },
         }
-        response_content = '[{"event_id": 0, "start_time": "2pm", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -214,8 +215,8 @@ class TestApp:
             }
         }
         response_content = (
-            '[{"event_id": 0, "start_time": "2pm", "duration": 60}, '
-            '{"event_id": 1, "start_time": "12pm", "duration": 90}]'
+            '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 60}, '
+            '{"event_id": 1, "event_name": "Event 1", "start_time": "12pm", "duration": 90}]'
         )
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
@@ -240,8 +241,8 @@ class TestApp:
         }
         # Events overlap: 2pm-3pm and 2:30pm-3:30pm
         response_content = (
-            '[{"event_id": 0, "start_time": "2pm", "duration": 60}, '
-            '{"event_id": 1, "start_time": "2:30pm", "duration": 60}]'
+            '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 60}, '
+            '{"event_id": 1, "event_name": "Event 1", "start_time": "2:30pm", "duration": 60}]'
         )
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
@@ -258,7 +259,7 @@ class TestApp:
             }
         }
         # Event ends at 1pm, which is after 12:45pm
-        response_content = '[{"event_id": 0, "start_time": "12:15pm", "duration": 45}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "12:15pm", "duration": 45}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -274,7 +275,7 @@ class TestApp:
             }
         }
         # Event ends at 12:00pm, which is before 12:45pm
-        response_content = '[{"event_id": 0, "start_time": "11:15am", "duration": 45}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "11:15am", "duration": 45}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
 
@@ -290,7 +291,7 @@ class TestApp:
             }
         }
         # Event starts at 1:30pm, which is before 2pm
-        response_content = '[{"event_id": 0, "start_time": "1:30pm", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "1:30pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -306,7 +307,7 @@ class TestApp:
             }
         }
         # Event starts at 2:30pm, which is after 2pm
-        response_content = '[{"event_id": 0, "start_time": "2:30pm", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "2:30pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
 
@@ -322,7 +323,7 @@ class TestApp:
             }
         }
         # Event starts at 1:30pm, before 2pm
-        response_content = '[{"event_id": 0, "start_time": "1:30pm", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "1:30pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -338,7 +339,7 @@ class TestApp:
             }
         }
         # Event starts at 3pm and ends at 4:30pm, after 4pm
-        response_content = '[{"event_id": 0, "start_time": "3pm", "duration": 90}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "3pm", "duration": 90}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -354,7 +355,7 @@ class TestApp:
             }
         }
         # Event starts at 2pm and ends at 3:30pm, within window
-        response_content = '[{"event_id": 0, "start_time": "2pm", "duration": 90}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 90}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
 
@@ -370,7 +371,7 @@ class TestApp:
             }
         }
         # Event starts at 12:30pm instead of 12:15pm
-        response_content = '[{"event_id": 0, "start_time": "12:30pm", "duration": 30}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "12:30pm", "duration": 30}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -386,7 +387,7 @@ class TestApp:
             }
         }
         # Event starts exactly at 12:15pm
-        response_content = '[{"event_id": 0, "start_time": "12:15pm", "duration": 30}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "12:15pm", "duration": 30}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
 
@@ -402,7 +403,7 @@ class TestApp:
             }
         }
         # Event starts at 9am, before min_time of 10am
-        response_content = '[{"event_id": 0, "start_time": "9am", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "9am", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -418,7 +419,7 @@ class TestApp:
             }
         }
         # Event starts at 3:30pm and ends at 4:30pm, after max_time of 4pm (16:00)
-        response_content = '[{"event_id": 0, "start_time": "3:30pm", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "3:30pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -434,7 +435,7 @@ class TestApp:
             }
         }
         # Event has duration 90 instead of expected 60
-        response_content = '[{"event_id": 0, "start_time": "2pm", "duration": 90}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 90}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 0)
 
@@ -449,7 +450,7 @@ class TestApp:
                 "max_time": "16:00",
             }
         }
-        response_content = '[{"event_id": 0, "start_time": "2pm", "duration": 60}]'
+        response_content = '[{"event_id": 0, "event_name": "Event 0", "start_time": "2pm", "duration": 60}]'
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
 
@@ -486,10 +487,70 @@ class TestApp:
             },
         }
         response_content = (
-            '[{"event_id": 0, "start_time": "2:30pm", "duration": 60}, '
-            '{"event_id": 1, "start_time": "12:30pm", "duration": 90}, '
-            '{"event_id": 2, "start_time": "10:30am", "duration": 45}, '
-            '{"event_id": 3, "start_time": "10:00", "duration": 30}]'
+            '[{"event_id": 0, "event_name": "Event 0", "start_time": "2:30pm", "duration": 60}, '
+            '{"event_id": 1, "event_name": "Event 1", "start_time": "12:30pm", "duration": 90}, '
+            '{"event_id": 2, "event_name": "Event 2", "start_time": "10:30am", "duration": 45}, '
+            '{"event_id": 3, "event_name": "Event 3", "start_time": "10:00", "duration": 30}]'
         )
         real_request = self._create_real_request(response_content, exp_cal_state)
         self._run_verify_test(real_request, 1)
+
+    @pytest.mark.parametrize("missing_field", ["event_id", "event_name", "start_time", "duration"])
+    @pytest.mark.parametrize("empty_expected_state", [False, True])
+    def test_missing_required_event_field(self, missing_field, empty_expected_state):
+        event = {"event_id": 0, "event_name": "Meeting", "start_time": "10:00", "duration": 60}
+        del event[missing_field]
+        expected = (
+            {}
+            if empty_expected_state
+            else {
+                "0": {
+                    "event_id": 0,
+                    "duration": 60,
+                    "constraint": None,
+                    "min_time": "10:00",
+                    "max_time": "16:00",
+                }
+            }
+        )
+        request = self._create_real_request(json.dumps([event]), expected)
+        self._run_verify_test(request, 0)
+
+    def test_non_object_calendar_entry_with_empty_expected_state(self):
+        event = {"event_id": 0, "event_name": "Meeting", "start_time": "10:00", "duration": 60}
+        request = self._create_real_request(json.dumps([event, 7]), {})
+        self._run_verify_test(request, 0)
+
+    @pytest.mark.parametrize("event_name, reward", [("Wrong meeting", 0), (" TEAM   MEETING ", 1)])
+    def test_event_name_identity_from_public_calendar(self, event_name, reward):
+        state = {"0": {"event_id": 0, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"}}
+        prior = [{"event_id": 0, "event_name": "Team Meeting", "start_time": "10:00", "duration": 60}]
+        answer = [{**prior[0], "event_name": event_name}]
+        request = self._create_real_request(
+            json.dumps(answer), state, input_messages=[{"role": "assistant", "content": json.dumps(prior)}]
+        )
+        self._run_verify_test(request, reward)
+
+    def test_extra_event_when_calendar_is_empty(self):
+        event = {"event_id": 0, "event_name": "Meeting", "start_time": "10:00", "duration": 60}
+        self._run_verify_test(self._create_real_request(json.dumps([event]), {}), 0)
+
+    def test_duplicate_event_id(self):
+        event = {"event_id": 0, "event_name": "Meeting", "start_time": "10:00", "duration": 60}
+        state = {"0": {"event_id": 0, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"}}
+        self._run_verify_test(self._create_real_request(json.dumps([event, event]), state), 0)
+
+    def test_event_order_and_time_format_equivalents(self):
+        state = {
+            "0": {"event_id": 0, "duration": 60, "constraint": None, "min_time": "10:00", "max_time": "16:00"},
+            "1": {"event_id": 1, "duration": 30, "constraint": None, "min_time": "10:00", "max_time": "16:00"},
+        }
+        prior = [
+            {"event_id": 0, "event_name": "Team Meeting", "start_time": "10:00", "duration": 60},
+            {"event_id": 1, "event_name": "Review", "start_time": "11:00", "duration": 30},
+        ]
+        answer = [{**prior[1], "start_time": "11am"}, {**prior[0], "start_time": "10am"}]
+        request = self._create_real_request(
+            json.dumps(answer), state, input_messages=[{"role": "assistant", "content": json.dumps(prior)}]
+        )
+        self._run_verify_test(request, 1)
