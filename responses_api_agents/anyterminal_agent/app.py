@@ -1466,7 +1466,8 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         worker = importlib.import_module("responses_api_agents.anyterminal_agent.app").run_terminal_episode
         update_metrics(params.metrics_fpath, {"submitted_at": time.time()}, params.task_name)
         result = await run_sandbox_episode(
-            worker, payload, _episode_sandbox_resources(params), episode_id=params.rollout_id
+            worker, payload, _episode_sandbox_resources(params), episode_id=params.rollout_id,
+            placement_key=params.instance_id,
         )
         return NeMoGymResponse.model_validate(result)
 
