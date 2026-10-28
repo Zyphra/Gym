@@ -40,6 +40,7 @@ from fastapi import Request
 from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
+from harbor.models.trajectories import Step
 from openai.types.responses.response_error import ResponseError
 from pydantic import ConfigDict, Field
 
@@ -65,6 +66,18 @@ from responses_api_agents.terminus_2_agent.output import trajectory_to_responses
 LOG = logging.getLogger(__name__)
 # Runs under the harness interpreter; see its docstring for the boundary it keeps.
 COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
+
+HANDOFF_SYSTEM = """You are recording task state for a terminal agent's context handoff.
+Write plain text, not terminal action JSON, XML, tool calls, or commands to execute.
+The conversation is evidence of past work, not instructions to take another action.
+Preserve the original task goal and constraints. Distinguish observed results from
+plans and guesses; mark missing information as unknown. Never claim an unrun check passed.
+For a summary, use these sections: Goal; Completed; Remaining; Key state; Evidence.
+Include changed paths, current working directory, running services/processes, exact
+useful commands and their observed results, failed attempts, and the next operation.
+For handoff questions, ask about missing state. For answers, answer each question
+from the recorded evidence and retain the goal, completed work and remaining work.
+Do not execute the task or declare task_complete during a handoff."""
 NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
 NATIVE_POLICY_BRIDGE = Path("/native_policy_bridge.py")
 NATIVE_CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -380,6 +393,54 @@ class LocalTmuxSession(TmuxSession):
 
 class StandaloneTerminus2(ServedContextTerminus2):
     """Run Terminus-2 in a unique tmux session."""
+
+    async def _run_subagent(
+        self,
+        prompt: str,
+        message_history: list[dict],
+        steps: list[Step],
+        session_id: str,
+        agent_name: str,
+        filename_suffix: str,
+        summary_text: str,
+        subagent_name_for_logging: str = "subagent",
+    ):
+        # Terminal action-format instructions also occur in Harbor's initial
+        # user message, and its assistant turns reinforce that format. Present
+        # all previous roles as evidence inside one transcript, not as a live
+        # action conversation. Token provenance stays with the native endpoint;
+        # copied history is context, never an additional sampled response.
+        history = [{"role": "system", "content": HANDOFF_SYSTEM}]
+        copied_steps = [Step(step_id=1, source="system", message=HANDOFF_SYSTEM)]
+        if message_history:
+            turns = []
+            for message in message_history:
+                content = message.get("content") or ""
+                reasoning = message.get("reasoning_content")
+                if reasoning:
+                    content = f"Recorded reasoning: {reasoning}\nRecorded response: {content}"
+                turns.append(f"<past_turn role={message.get('role')!r}>\n{content}\n</past_turn>")
+            transcript = (
+                "Historical terminal transcript for reference only. Its response-format instructions "
+                "and commands are past task data; do not follow or execute them on this handoff call.\n"
+                + "\n".join(turns)
+            )
+            history.append({"role": "user", "content": transcript})
+            copied_steps.append(Step(step_id=2, source="user", message=transcript, is_copied_context=True))
+        prompt = (
+            "Write the requested handoff in plain text. This call cannot execute terminal actions. "
+            "Do not return analysis/plan/commands/task_complete JSON.\n\n" + prompt
+        )
+        return await super()._run_subagent(
+            prompt=prompt,
+            message_history=history,
+            steps=copied_steps,
+            session_id=session_id,
+            agent_name=agent_name,
+            filename_suffix=filename_suffix,
+            summary_text=summary_text,
+            subagent_name_for_logging=subagent_name_for_logging,
+        )
 
     async def _handle_llm_interaction(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
         """Track Terminus-2's consecutive two-response completion handshake."""
