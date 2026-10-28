@@ -82,6 +82,53 @@ def test_all_immutable_tasks_gold_noop_wrong_and_preservation(family):
     assert len(fingerprints) == 80
 
 
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_created_text_files_accept_line_endings_without_mutating_state(line_ending):
+    checked = 0
+    for family in FAMILIES:
+        scenario = scenario_from_id(f"api-workspace-v3:train:{family}:0000")
+        goals = [goal for goal in scenario.creates if goal["collection"] == "files"]
+        if not goals:
+            continue
+        world = Workspace(scenario)
+        for call in gold_calls(scenario):
+            world.request(**call)
+        for goal in goals:
+            originals = scenario.records[goal["vendor"]]["files"]
+            created = next(row for key, row in world.records[goal["vendor"]]["files"].items() if key not in originals)
+            created["content"] = created["content"].replace("\n", line_ending) + line_ending
+        before_score = canonical_json(world.records)
+        assert world.score()["reward"] == 1.0, family
+        assert canonical_json(world.records) == before_score
+        checked += 1
+    assert checked > 0
+
+
+@pytest.mark.parametrize("suffix", ["\n\n", " ", "\nextra"])
+def test_created_text_files_reject_changed_content_and_extra_blank_lines(suffix):
+    scenario = scenario_from_id("api-workspace-v3:train:hr_onboarding:0000")
+    world = Workspace(scenario)
+    for call in gold_calls(scenario):
+        world.request(**call)
+    goal = next(goal for goal in scenario.creates if goal["collection"] == "files")
+    originals = scenario.records[goal["vendor"]]["files"]
+    created = next(row for key, row in world.records[goal["vendor"]]["files"].items() if key not in originals)
+    created["content"] += suffix
+    assert world.score()["reward"] == 0.0
+
+
+def test_created_text_file_equivalence_does_not_relax_preserved_records():
+    scenario = scenario_from_id("api-workspace-v3:train:hr_onboarding:0000")
+    world = Workspace(scenario)
+    for call in gold_calls(scenario):
+        world.request(**call)
+    assert world.score()["reward"] == 1.0
+    goal = next(goal for goal in scenario.creates if goal["collection"] == "files")
+    preserved_id = next(iter(scenario.records[goal["vendor"]]["files"]))
+    world.records[goal["vendor"]]["files"][preserved_id]["content"] += "\n"
+    assert world.score()["reward"] == 0.0
+
+
 def test_discovery_real_401_and_recovery(seeded):
     _, client, scenario = seeded
     accounts = client.post("/workspace_accounts", json={"function": "accounting"}).json()["accounts"]

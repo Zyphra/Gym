@@ -159,6 +159,14 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _creation_for_score(collection: str, row: dict[str, Any]) -> str:
+    # Text-file tasks specify lines, not an operating-system line ending or
+    # whether the last line has a terminator. Preserve every other character.
+    if collection == "files" and isinstance(row.get("content"), str):
+        row = {**row, "content": row["content"].replace("\r\n", "\n").removesuffix("\n")}
+    return canonical_json(row)
+
+
 class Workspace:
     """One episode's state. Its immutable scenario is reconstructed by the server."""
 
@@ -456,7 +464,9 @@ class Workspace:
                     if identity not in records
                 ]
                 # Deleted original records must not be reintroduced under another ID.
-                if sorted(map(canonical_json, creations)) != sorted(map(canonical_json, actual_new)):
+                if sorted(_creation_for_score(collection, row) for row in creations) != sorted(
+                    _creation_for_score(collection, row) for row in actual_new
+                ):
                     unexpected += 1
         success = missing == 0 and unexpected == 0 and set(self.records) == set(expected)
         return {
