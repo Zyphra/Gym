@@ -65,7 +65,11 @@ def sandbox_episode_control(name: Optional[str], episode_id: Optional[str] = Non
 
 
 async def run_sandbox_episode(
-    fn: Callable, payload: Any, sandbox: SandboxResources, *, episode_id: Optional[str],
+    fn: Callable,
+    payload: Any,
+    sandbox: SandboxResources,
+    *,
+    episode_id: Optional[str],
     placement_key: Optional[str] = None,
 ) -> object:
     from core.sandbox.executor import run_episode
@@ -82,11 +86,12 @@ async def run_sandbox_episode(
             raise EpisodeOwnershipError("controlled episode has no producer-enrolled identity")
         if episode_id is not None and episode_id != enrolled_id:
             raise EpisodeOwnershipError("sandbox episode identity differs from its enrolled identity")
-        return await RayEpisodeLifecycle.attach(control).execute(
-            enrolled_id, fn, payload, resources
-        )
+        return await RayEpisodeLifecycle.attach(control).execute(enrolled_id, fn, payload, resources)
     return await run_episode(
-        fn, payload, resources, episode_id=episode_id,
+        fn,
+        payload,
+        resources,
+        episode_id=episode_id,
         **({"excluded_node_ids": excluded_node_ids} if excluded_node_ids else {}),
     )
 
