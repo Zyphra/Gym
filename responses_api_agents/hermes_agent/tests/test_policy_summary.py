@@ -432,3 +432,56 @@ def test_summary_output_budget_reaches_compressor_request(monkeypatch, tmp_path,
     assert body["chat_template_kwargs"] == main["chat_template_kwargs"]
     assert compressor.tail_token_budget == int(compressor.threshold_tokens * 0.20)
     assert any(SUMMARY_TEXT in (message.get("content") or "") for message in main["messages"])
+
+
+@pytest.mark.parametrize("content, kept", [(SUMMARY_TEXT, SUMMARY_TEXT), ("", "")])
+def test_compaction_observation_names_the_served_summary_call(monkeypatch, tmp_path, content, kept):
+    from nemo_gym.rollout_observability import ContextCompactionObservation
+
+    summary = {
+        "status": 200,
+        "choice": {"message": {"role": "assistant", "content": content}, "finish_reason": "stop"},
+    }
+    native_agents: list = []
+    with _PolicyFixture(summary) as policy:
+        app = _agent(tmp_path, monkeypatch, policy.server.server_port, native_agents)
+        try:
+            episode = asyncio.run(
+                app._create_episode(
+                    NeMoGymResponseCreateParamsNonStreaming(input=_long_history_input()), rollout_id="rollout-o"
+                )
+            )
+        finally:
+            _close(native_agents)
+        served = [(index + 1, body) for index, (_, body) in enumerate(policy.requests)]
+
+    summaries = [index for index, body in served if _is_summary_request(body)]
+    mains = [index for index, body in served if not _is_summary_request(body)]
+    records = [r for r in episode.observations.records if isinstance(r, ContextCompactionObservation)]
+    # Hermes' preflight repeats compression; the pass with nothing left to
+    # summarize requests no summary, keeps the context, and is not a compaction.
+    noops = [r for r in records if r.outcome == "aborted"]
+    assert noops and all(r.model_calls == [] and r.tokens_before == r.tokens_after for r in noops)
+    compactions = [r for r in records if r.outcome != "aborted"]
+    assert summaries and len(compactions) == len(summaries)
+    policy_ref = ModelServerRef(type="responses_api_models", name="policy")
+    for compaction, served_index in zip(compactions, summaries, strict=True):
+        # Each compaction names the summary call it was served, and the main
+        # calls on either side of it.
+        assert compaction.outcome == "completed"
+        assert compaction.summary == kept
+        assert [ref.response_id for ref in compaction.model_calls] == [f"fixture-{served_index}"]
+        assert compaction.model_calls[0].model_ref == policy_ref
+        earlier = [index for index in mains if index < served_index]
+        later = [index for index in mains if index > served_index]
+        assert (compaction.before_model_call is None) == (not earlier)
+        if earlier:
+            assert compaction.before_model_call.response_id == f"fixture-{earlier[-1]}"
+        assert compaction.after_model_call.response_id == f"fixture-{later[0]}"
+    codes = {gap.code for gap in episode.observations.gaps}
+    assert not codes & {
+        "compaction_summary_call_unavailable",
+        "compaction_model_call_boundary_unavailable",
+        "compaction_summary_unavailable",
+        "compaction_after_model_call_unavailable",
+    }

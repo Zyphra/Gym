@@ -131,6 +131,10 @@ class HermesAgentObserver:
         self._started_ticks: dict[tuple[str, str], float] = {}
         self._invocations = {root_invocation_id: AgentInvocation(invocation_id=root_invocation_id)}
         self._compactions: list[ContextCompactionObservation] = []
+        # The invocation's latest main-loop model call, and its compactions still
+        # waiting for the first main-loop call after them.
+        self._last_calls: dict[str, ModelCallRef] = {}
+        self._awaiting_after: dict[str, list[ContextCompactionObservation]] = {}
         self._gaps: list[ObservationGap] = []
 
     def instrument(self, agent: Any) -> "HermesAgentObserver":
@@ -150,6 +154,9 @@ class HermesAgentObserver:
             system_message=self._system_prompt(self._invocation_agents.get(self._root_id)),
         )
         with self._lock:
+            for invocation_id, waiting in self._awaiting_after.items():
+                if waiting:
+                    self._gap("compaction_after_model_call_unavailable", invocation_id)
             for tool in self._tools.values():
                 if tool.status == "unknown":
                     tool.status = "incomplete"
@@ -240,6 +247,9 @@ class HermesAgentObserver:
                     invocation = self._invocations[invocation_id]
                     if reference not in invocation.model_calls:
                         invocation.model_calls.append(reference)
+                    self._last_calls[invocation_id] = reference
+                    for compaction in self._awaiting_after.pop(invocation_id, []):
+                        compaction.after_model_call = reference
             return response
 
         setattr(agent, "_interruptible_api_call", call)
@@ -304,12 +314,16 @@ class HermesAgentObserver:
 
         def compact(*args: Any, **kwargs: Any) -> Any:
             failed = False
+            previous = getattr(self._current, "summary_calls", None)
+            summary_calls: list[tuple[ModelCallRef | None, str | None]] = []
+            self._current.summary_calls = summary_calls
             try:
                 result = original(*args, **kwargs)
             except BaseException:
                 failed = True
                 raise
             finally:
+                self._current.summary_calls = previous
                 before = kwargs.get("approx_tokens")
                 try:
                     after = None
@@ -317,19 +331,36 @@ class HermesAgentObserver:
                         value = getattr(getattr(agent, "context_compressor", None), "last_prompt_tokens", None)
                         if type(value) is int and value >= 0:
                             after = value
+                    references = [reference for reference, _ in summary_calls if reference is not None]
+                    # Hermes keeps the last summary reply; an empty one leaves only the marker.
+                    summary = summary_calls[-1][1] if summary_calls else None
+                    # Hermes' preflight repeats compression while the estimate stays above
+                    # its threshold; a pass with nothing left to summarize requests no
+                    # summary and leaves the context as it was. It is not a compaction.
+                    noop = not failed and not summary_calls and type(before) is int and after == before
                     with self._lock:
-                        self._compactions.append(
-                            ContextCompactionObservation(
-                                invocation_id=invocation_id,
-                                observed_at=time(),
-                                trigger="context_pressure",
-                                tokens_before=before if type(before) is int else None,
-                                tokens_after=after,
-                                outcome="failed" if failed else "completed",
-                            )
+                        compaction = ContextCompactionObservation(
+                            invocation_id=invocation_id,
+                            observed_at=time(),
+                            trigger="context_pressure",
+                            tokens_before=before if type(before) is int else None,
+                            tokens_after=after,
+                            outcome="failed" if failed else "aborted" if noop else "completed",
+                            summary=summary,
+                            before_model_call=self._last_calls.get(invocation_id),
+                            model_calls=references,
                         )
-                    self._gap("compaction_model_call_boundary_unavailable", invocation_id)
-                    self._gap("compaction_summary_unavailable", invocation_id)
+                        self._compactions.append(compaction)
+                        if not noop:
+                            self._awaiting_after.setdefault(invocation_id, []).append(compaction)
+                    if noop:
+                        pass
+                    elif not summary_calls:
+                        self._gap("compaction_summary_call_unavailable", invocation_id)
+                    elif len(references) != len(summary_calls):
+                        self._gap("compaction_model_call_boundary_unavailable", invocation_id)
+                    if summary is None and not noop:
+                        self._gap("compaction_summary_unavailable", invocation_id)
                     if after is None:
                         self._gap("compaction_tokens_after_unavailable", invocation_id)
                 except Exception:
@@ -337,6 +368,31 @@ class HermesAgentObserver:
             return result
 
         setattr(agent, "_compress_context", compact)
+
+    def summary_response(self, response: Any) -> None:
+        """Record one reply to Hermes' summary request inside the current compaction.
+
+        The compression route calls this with each response it receives. The
+        reply's id is the model call the summary tokens came from, and its
+        visible content is the summary Hermes keeps (empty when the reply
+        presented nothing).
+        """
+        summary_calls = getattr(self._current, "summary_calls", None)
+        if summary_calls is None:
+            return
+        try:
+            response_id = response.get("id") if isinstance(response, dict) else getattr(response, "id", None)
+            reference = (
+                ModelCallRef(model_ref=self._model_ref, response_id=response_id)
+                if self._model_ref is not None and isinstance(response_id, str) and response_id
+                else None
+            )
+            choices = getattr(response, "choices", None) or []
+            content = getattr(getattr(choices[0], "message", None), "content", None) if choices else None
+            summary_calls.append((reference, content.strip() if isinstance(content, str) else ""))
+        except Exception:
+            summary_calls.append((None, None))
+            self._gap("hermes_observer_error", None, "summary_response")
 
     def _child_added(self, child: Any, parent_id: str) -> None:
         try:
