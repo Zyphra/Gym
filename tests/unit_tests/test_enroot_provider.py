@@ -846,6 +846,33 @@ async def test_close_staging_removal_failure_is_logged(
     assert "failed to remove staging dir" in caplog.text
 
 
+async def test_close_removes_staging_dir_with_read_only_directories(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An archive unpacked in the sandbox leaves dr-xr-xr-x trees the host user must still remove."""
+    staging = tmp_path / "staging"
+    runtime = staging / "agent_deps_runtime" / "lib" / "pkg"
+    runtime.mkdir(parents=True)
+    (runtime / "mod.py").write_text("x = 1\n")
+    (staging / "agent_deps_runtime" / "link").symlink_to(runtime)
+    for directory in (runtime, runtime.parent, staging / "agent_deps_runtime"):
+        directory.chmod(0o555)
+    provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (0, "", ""), tmp_path)
+    try:
+        with caplog.at_level("WARNING"):
+            await provider.close(_make_handle(staging))
+        assert not staging.exists()
+        assert "failed to remove staging dir" not in caplog.text
+    finally:
+        for directory in (
+            staging / "agent_deps_runtime" / "lib" / "pkg",
+            staging / "agent_deps_runtime" / "lib",
+            staging / "agent_deps_runtime",
+        ):
+            if directory.exists():
+                directory.chmod(0o755)
+
+
 async def test_aclose(fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     provider, _rec, _sr = _make_provider(monkeypatch, lambda argv: (0, "", ""), tmp_path)
     assert await provider.aclose() is None
