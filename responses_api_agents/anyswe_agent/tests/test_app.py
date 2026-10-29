@@ -653,6 +653,70 @@ async def test_private_grader_return_code_contract(tmp_path, monkeypatch, result
     assert (params.persistent_dir / "grader.stderr").read_text() == result.stderr
 
 
+@pytest.mark.parametrize(
+    ("container", "declared"),
+    [
+        ("/artifacts/sifs/" + "a" * 64 + ".sif", {"TASK_IMAGE_ID": "a" * 64}),
+        ("/artifacts/sifs/" + "b" * 64 + ".sqsh", {"TASK_IMAGE_ID": "b" * 64}),
+        ("/artifacts/sifs/latest.sif", {}),
+        ("/artifacts/sifs/" + "A" * 64 + ".sif", {}),
+        ("registry.example/org/task:latest", {}),
+    ],
+)
+async def test_private_grader_declares_the_content_addressed_grading_image(
+    tmp_path, monkeypatch, container, declared
+) -> None:
+    """The grading exec names its image for a verifier that cannot see it; the plan's env is kept."""
+    from omegaconf import OmegaConf
+
+    from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+    from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
+
+    head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
+    config = _config(
+        model_server=None,
+        agent_runtime_source="baked",
+        sandbox_model_base_url="http://127.0.0.1:19002/v1",
+        private_grader=_private_grader_config(),
+    )
+    client = ServerClient(head_server_config=head, global_config_dict=OmegaConf.create({"results_dir": str(tmp_path)}))
+    agent = AnySweAgent(config=config, server_client=client)
+    params = agent._setup_params(
+        NeMoGymResponseCreateParamsNonStreaming(
+            input="Fix the test.",
+            metadata={
+                "instance_id": "test__test-1",
+                "problem_statement": "Fix the test.",
+                "private_verifier": json.dumps({"protocol": "test-private-grader-v1", "gold_patch": "private"}),
+            },
+        )
+    )
+    params = params.model_copy(update={"container": container})
+
+    class FakeSandbox:
+        instance = None
+
+        def __init__(self, provider, spec):
+            self.spec = spec
+            self.__class__.instance = self
+
+        async def start(self):
+            return None
+
+        async def stop(self):
+            return None
+
+        async def exec(self, command, **kwargs):
+            self.command = (command, kwargs)
+            return SandboxExecResult("passed", "", 0)
+
+    monkeypatch.setattr(app_module, "AsyncSandbox", FakeSandbox)
+    assert await agent._grade_private_patch(params, "model patch") == (True, None, None)
+    assert FakeSandbox.instance.command[1]["env"] == {"GRADE": "1", **declared}
+    assert "TASK_IMAGE_ID" not in FakeSandbox.instance.spec.env
+
+
 async def test_private_grader_records_its_sandbox_memory_events(tmp_path, monkeypatch) -> None:
     """A grader the memory limit killed is told apart from a setup or scoring failure by its own events."""
     from omegaconf import OmegaConf
