@@ -364,8 +364,8 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # Stock Hermes compresses at this fraction of the model context
     # (hermes_cli/config.py DEFAULT_CONFIG compression.threshold).
     compression_threshold: float = Field(default=0.50, gt=0, le=1)
-    # Temperature of the compression summary request. None keeps Hermes' own
-    # value (context_compressor.py sends 0.3).
+    # Temperature of the compression summary request. None samples it like the
+    # run's policy turns, never at Hermes' own 0.3 (context_compressor.py).
     compression_summary_temperature: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     # Hermes' compression.target_ratio: the kept recent tail as a fraction of the threshold.
     # None keeps Hermes' default (0.20); Hermes clamps it to [0.10, 0.80].
@@ -431,18 +431,18 @@ def _policy_compression_route(agent, summary_temperature: float | None) -> Calla
     ``agent._build_api_kwargs`` (the run's patched builder) supplies the model,
     timeout and ``extra_body`` (the thinking mode included) that the run's policy
     turns carry; the request then takes the compression messages only, with no
-    tools, Hermes' summary ``max_tokens`` and its temperature, which
-    ``summary_temperature`` replaces when set.
+    tools and Hermes' summary ``max_tokens``. The summary is sampled at the policy
+    turns' temperature, or ``summary_temperature`` when set; Hermes' own 0.3 is
+    dropped because the summary is trained as a policy turn.
     """
 
     def complete(*, messages, temperature=None, max_tokens=None, tools=None, extra_body=None, **_):
         request: dict[str, Any] = agent._build_api_kwargs(messages)
         request["messages"] = messages
-        for key in ("tools", "tool_choice", "max_tokens", "max_completion_tokens", "temperature"):
+        for key in ("tools", "tool_choice", "max_tokens", "max_completion_tokens"):
             request.pop(key, None)
-        temperature = summary_temperature if summary_temperature is not None else temperature
-        if temperature is not None:
-            request["temperature"] = temperature
+        if summary_temperature is not None:
+            request["temperature"] = summary_temperature
         if max_tokens is not None:
             request["max_tokens"] = max_tokens
         if tools:

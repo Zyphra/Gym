@@ -186,14 +186,15 @@ def test_stock_summary_request_goes_to_each_rollouts_own_policy(monkeypatch, rec
     ]
     assert sorted(path for path, _ in mains) == sorted(path for path, _ in summaries)
     for _, body in summaries:
-        # Hermes' stock compression request: one user message, no tools, Hermes'
-        # configured total-output budget and temperature.
+        # Hermes' stock compression request: one user message, no tools and
+        # Hermes' configured total-output budget, sampled like the policy turns.
         assert body["model"] == "fixture-policy"
         assert [message["role"] for message in body["messages"]] == ["user"]
         assert "TURNS TO SUMMARIZE:\n[ASSISTANT]: history message 3: " in body["messages"][0]["content"]
         assert "tools" not in body and "tool_choice" not in body
         assert body["max_tokens"] == 32768
-        assert body["temperature"] == 0.3
+        assert body.get("temperature") == mains[0][1].get("temperature")
+        assert body.get("temperature") != 0.3
     from agent.context_compressor import SUMMARY_PREFIX
 
     for _, body in mains:
@@ -373,7 +374,26 @@ def test_summary_request_without_template_kwargs_matches_policy_turns(monkeypatc
         ((_, main_body),) = policy.mains()
 
     assert "chat_template_kwargs" not in summary_body and "chat_template_kwargs" not in main_body
-    assert summary_body["temperature"] == 0.3
+    assert summary_body.get("temperature") == main_body.get("temperature")
+
+
+def test_summary_without_override_samples_at_the_policy_temperature(monkeypatch, tmp_path):
+    """compression_summary_temperature=None samples the summary like the policy turns, never at Hermes' 0.3."""
+    summary = {
+        "status": 200,
+        "choice": {"message": {"role": "assistant", "content": SUMMARY_TEXT}, "finish_reason": "stop"},
+    }
+    native_agents: list = []
+    with _PolicyFixture(summary) as policy:
+        app = _agent(tmp_path, monkeypatch, policy.server.server_port, native_agents, temperature=1.0)
+        try:
+            _run(app, "rollout-policy-temperature")
+        finally:
+            _close(native_agents)
+        ((_, summary_body),) = policy.summaries()
+        ((_, main_body),) = policy.mains()
+
+    assert summary_body["temperature"] == main_body["temperature"] == 1.0
 
 
 @pytest.mark.parametrize("target_ratio, expected", [(None, 0.20), (0.10, 0.10)])
