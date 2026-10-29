@@ -180,3 +180,16 @@ def test_existing_policy_stop_and_endpoint_failure_classification(tmp_path):
         }
     )
     assert harness_response_error(endpoint_failure, observations) is endpoint_failure.error
+
+
+def test_instruction_starting_with_at_sign_is_not_a_file_argument(tmp_path):
+    """pi attaches "@name" arguments as files; the task text must reach it as a message."""
+    argv_file = tmp_path / "argv.json"
+    script = "import json,sys; open(" + repr(str(argv_file)) + ", 'w').write(json.dumps(sys.argv[1:]))"
+    agent = _agent(tmp_path / "work", "", 0)
+    agent.config.command = shlex.join([sys.executable, "-c", script])
+    instruction = '@overload cannot be used with conditional "if TYPE_CHECKING"'
+    asyncio.run(agent._run_pi(instruction, None))
+    message = json.loads(argv_file.read_text())[-1]
+    assert not message.startswith("@")
+    assert message.strip() == instruction

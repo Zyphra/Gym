@@ -605,7 +605,9 @@ class PiAgent(SimpleResponsesAPIAgent):
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
         cmd += self.config.extra_args
-        cmd.append(instruction)
+        # The pi CLI reads a leading "@" argument as a file to attach, so an issue text such as
+        # "@overload cannot be used ..." fails with "File not found" before any model call.
+        cmd.append(f"\n{instruction}" if instruction.startswith("@") else instruction)
 
         try:
             proc = await asyncio.create_subprocess_exec(
