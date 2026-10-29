@@ -10,11 +10,14 @@ import aiohttp
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from omegaconf import DictConfig
+from pydantic import BaseModel
 
 from nemo_gym import call_timing, global_config, server_utils
 from nemo_gym.call_timing import HEADER, CallTimingMiddleware, header_value, merge_header, record_call, timed_call
 from nemo_gym.config_types import BaseServerConfig
+from nemo_gym.judge import JudgeError, call_judge
 from nemo_gym.server_utils import ServerClient
 
 
@@ -191,3 +194,187 @@ def test_judge_and_verify_roll_up_through_two_hops(monkeypatch):
     assert timing["judge"]["max_ms"] >= 45.0
     assert timing["verify"]["n"] == 1 and timing["verify"]["sum_ms"] >= timing["judge"]["sum_ms"]
     assert HEADER not in plain_headers
+
+
+# --- Real call_judge through real servers: multi-hop, error and cancellation ---------------------------------------
+
+
+class _Verdict(BaseModel):
+    verdict: str
+
+
+def _graph_config(monkeypatch, judge_port, resources_port):
+    config = DictConfig(
+        {
+            "judge": {"responses_api_models": {"j": {"host": "127.0.0.1", "port": judge_port}}},
+            "resources": {"resources_servers": {"r": {"host": "127.0.0.1", "port": resources_port}}},
+        }
+    )
+    monkeypatch.setattr(global_config, "_GLOBAL_CONFIG_DICT", config)
+    return ServerClient(head_server_config=BaseServerConfig(host="127.0.0.1", port=1), global_config_dict=config)
+
+
+def _judge_app(delay_s=0.05, status=200):
+    app = FastAPI()
+
+    @app.post("/v1/responses")
+    async def respond():
+        await asyncio.sleep(delay_s)
+        if status != 200:
+            return JSONResponse({"error": "judge down"}, status_code=status)
+        return {"verdict": "A"}
+
+    return app
+
+
+def _with_prod_order(app):
+    """The exception middleware sits inside the call-timing middleware, as in ``SimpleServer.run_webserver``."""
+
+    @app.middleware("http")
+    async def exception_middleware(request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as error:
+            return JSONResponse(repr(error), status_code=500)
+
+    return app
+
+
+async def _judge(client):
+    return await call_judge(client, server_name="judge", url_path="/v1/responses", json={}, response_model=_Verdict)
+
+
+def test_run_header_carries_the_judge_once_with_the_resource_servers_exact_values(monkeypatch):
+    judge_port, resources_port, agent_port = _free_port(), _free_port(), _free_port()
+    client = _graph_config(monkeypatch, judge_port, resources_port)
+    resources, agent = FastAPI(), FastAPI()
+    seen = {}
+
+    @resources.post("/verify")
+    async def verify():
+        return {"reward": 1.0 if (await _judge(client)).verdict == "A" else 0.0}
+
+    @agent.post("/run")
+    async def run():
+        response = await client.post(server_name="resources", url_path="/verify", json={})
+        seen["verify_header"] = json.loads(response.headers[HEADER])
+        return await response.json()
+
+    resources.add_middleware(CallTimingMiddleware)
+    agent.add_middleware(CallTimingMiddleware)
+
+    async def main():
+        async with _Server(_judge_app(), judge_port), _Server(resources, resources_port), _Server(agent, agent_port):
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"http://127.0.0.1:{agent_port}/run") as response:
+                    result = (await response.json(), json.loads(response.headers[HEADER]))
+            await server_utils.close_global_aiohttp_client()
+            return result
+
+    body, run_header = asyncio.run(main())
+    assert body == {"reward": 1.0}
+    # The resource server reported one judge call; the agent added only its own /verify call on top.
+    assert seen["verify_header"] == {"judge": run_header["judge"]}
+    assert run_header["judge"]["n"] == 1 and run_header["judge"]["sum_ms"] >= 45.0
+    assert run_header["judge"]["max_ms"] == run_header["judge"]["sum_ms"]
+    assert set(run_header) == {"judge", "verify"} and run_header["verify"]["n"] == 1
+    assert run_header["verify"]["sum_ms"] >= run_header["judge"]["sum_ms"]
+
+
+@pytest.mark.parametrize("handled", [False, True])
+def test_a_failing_judge_call_is_timed_and_changes_neither_status_nor_body(monkeypatch, handled):
+    judge_port = _free_port()
+    client = _graph_config(monkeypatch, judge_port, 1)
+
+    def build(with_timing):
+        app = FastAPI()
+
+        @app.post("/verify")
+        async def verify():
+            try:
+                return {"reward": (await _judge(client)).verdict}
+            except JudgeError:
+                if not handled:
+                    raise
+                return {"reward": 0.0, "_ng_failure_class": "judge_failed"}
+
+        _with_prod_order(app)
+        if with_timing:
+            app.add_middleware(CallTimingMiddleware)
+        return app
+
+    async def fetch(app, port):
+        async with _Server(app, port):
+            async with aiohttp.ClientSession() as session:
+                async with session.post(f"http://127.0.0.1:{port}/verify") as response:
+                    return response.status, await response.text(), dict(response.headers)
+
+    async def main():
+        async with _Server(_judge_app(status=500), judge_port):
+            plain = await fetch(build(False), _free_port())
+            timed = await fetch(build(True), _free_port())
+            await server_utils.close_global_aiohttp_client()
+            return plain, timed
+
+    (plain_status, plain_body, plain_headers), (status, body, headers) = asyncio.run(main())
+    assert (status, body) == (plain_status, plain_body)
+    assert status == (200 if handled else 500)
+    assert ("judge_failed" in body) if handled else ("JudgeError" in body)
+    assert HEADER not in plain_headers
+    timing = json.loads(headers[HEADER])
+    assert set(timing) == {"judge"} and timing["judge"]["n"] == 1 and timing["judge"]["sum_ms"] >= 45.0
+
+
+def test_a_raising_timed_block_records_and_reraises_the_original_exception():
+    original = ValueError("kept as is")
+
+    async def body():
+        with pytest.raises(ValueError) as caught:
+            with timed_call("judge"):
+                raise original
+        assert caught.value is original
+        return json.loads(header_value())
+
+    assert _in_scope(body)["judge"]["n"] == 1
+
+
+def test_cancelling_a_request_mid_judge_call_resets_the_scope_and_leaves_no_task(monkeypatch):
+    judge_port = _free_port()
+    client = _graph_config(monkeypatch, judge_port, 1)
+    scopes = []
+
+    async def app(scope, receive, send):
+        scopes.append(call_timing._SCOPE.get())
+        await _judge(client)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    async def main():
+        async with _Server(_judge_app(delay_s=10), judge_port):
+            await asyncio.sleep(0.05)
+            baseline = asyncio.all_tasks()
+            sent = []
+
+            async def send(message):
+                sent.append(message)
+
+            middleware = CallTimingMiddleware(app)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(middleware({"type": "http", "path": "/x"}, None, send), 0.15)
+            leaked_scope = call_timing._SCOPE.get()
+            # A following request starts with an empty scope of its own.
+            after = {}
+
+            async def following(scope, receive, send):
+                after["scope"] = dict(call_timing._SCOPE.get())
+
+            await CallTimingMiddleware(following)({"type": "http", "path": "/y"}, None, send)
+            await asyncio.sleep(0.05)
+            pending = asyncio.all_tasks() - baseline
+            await server_utils.close_global_aiohttp_client()
+            return leaked_scope, after, sent, pending
+
+    leaked_scope, after, sent, pending = asyncio.run(main())
+    assert leaked_scope is None and after["scope"] == {} and sent == []
+    # The cancelled call's partial time is recorded in the cancelled request's own scope, never raised.
+    assert scopes[0]["judge"]["n"] == 1 and scopes[0]["judge"]["sum_ms"] >= 100.0
+    assert not [task for task in pending if not task.done()]
