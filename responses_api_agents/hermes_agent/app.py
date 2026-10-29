@@ -425,14 +425,19 @@ def _route_compression_calls() -> None:
     context_compressor.call_llm = call_llm
 
 
-def _policy_compression_route(agent, summary_temperature: float | None) -> Callable[..., Any]:
+def _policy_compression_route(
+    agent,
+    summary_temperature: float | None,
+    on_response: Optional[Callable[[Any], None]] = None,
+) -> Callable[..., Any]:
     """Send a compression request through the run's own policy request builder.
 
     ``agent._build_api_kwargs`` (the run's patched builder) supplies the model,
     timeout and ``extra_body`` (the thinking mode included) that the run's policy
     turns carry; the request then takes the compression messages only, with no
     tools, Hermes' summary ``max_tokens`` and its temperature, which
-    ``summary_temperature`` replaces when set.
+    ``summary_temperature`` replaces when set. ``on_response`` receives each
+    reply, so observability can name the summary's model call.
     """
 
     def complete(*, messages, temperature=None, max_tokens=None, tools=None, extra_body=None, **_):
@@ -449,7 +454,10 @@ def _policy_compression_route(agent, summary_temperature: float | None) -> Calla
             request["tools"] = tools
         if extra_body:
             request["extra_body"] = {**request.get("extra_body", {}), **extra_body}
-        return agent.client.chat.completions.create(**request)
+        response = agent.client.chat.completions.create(**request)
+        if on_response is not None:
+            on_response(response)
+        return response
 
     return complete
 
@@ -595,10 +603,6 @@ class HermesAgent(SimpleResponsesAPIAgent):
             return kw
 
         agent._build_api_kwargs = _patched_build_api_kwargs
-        compression_route = None
-        if self.config.compression_enabled:
-            _route_compression_calls()
-            compression_route = _policy_compression_route(agent, self.config.compression_summary_temperature)
         _execute_every_tool_call(agent)
         _limit_tool_results(agent)
         ended_by_endpoint = _observe_endpoint_stop(agent)
@@ -609,6 +613,14 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 observer = HermesAgentObserver(model_ref=self.config.model_server).instrument(agent)
             except Exception:
                 LOG.exception("failed to initialize Hermes observability")
+        compression_route = None
+        if self.config.compression_enabled:
+            _route_compression_calls()
+            compression_route = _policy_compression_route(
+                agent,
+                self.config.compression_summary_temperature,
+                observer.summary_response if observer is not None else None,
+            )
 
         # Interrupt the agent cleanly on SIGTERM so run_conversation returns with partial messages
         # instead of being killed mid-turn (which would leave response.json unwritten). A single

@@ -301,11 +301,59 @@ def test_compaction_is_explicit_and_hook_failures_do_not_break_execution():
     assert compaction.tokens_before == 42
     assert compaction.tokens_after == 7
     assert compaction.outcome == "completed"
+    # No summary request reached the route: nothing names a summary or its call.
+    assert compaction.summary is None and compaction.model_calls == []
     assert {
-        "compaction_model_call_boundary_unavailable",
+        "compaction_summary_call_unavailable",
         "compaction_summary_unavailable",
+        "compaction_after_model_call_unavailable",
     } <= {gap.code for gap in bundle.gaps}
     assert "compaction_tokens_after_unavailable" not in {gap.code for gap in bundle.gaps}
+
+
+def _summary_reply(response_id, content):
+    return SimpleNamespace(
+        id=response_id,
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+    )
+
+
+@pytest.mark.parametrize("content, summary", [("  ## Goal\nFix it.\n", "## Goal\nFix it."), (None, "")])
+def test_compaction_names_its_summary_call_and_the_calls_around_it(content, summary):
+    class _SummarizingAgent(_FakeAgent):
+        route = None
+
+        def _compress_context(self, messages, system_message, **kwargs):
+            # Hermes' compressor asks its route for the summary inside _compress_context.
+            self.route(_summary_reply("resp-summary", content))
+            return super()._compress_context(messages, system_message, **kwargs)
+
+    model_ref = ModelServerRef(type="responses_api_models", name="policy")
+    agent = _SummarizingAgent()
+    observer = HermesAgentObserver(model_ref=model_ref).instrument(agent)
+    agent.route = observer.summary_response
+    agent._interruptible_api_call({"response_id": "resp-before"})
+    agent._compress_context([{"role": "user", "content": "x"}], "system", approx_tokens=42)
+    # A summary reply outside a compaction is not attributed to one.
+    observer.summary_response(_summary_reply("resp-stray", "stray"))
+    agent._interruptible_api_call({"response_id": "resp-after"})
+    bundle = observer.finish({"completed": True, "messages": []})
+
+    [compaction] = _compactions(bundle)
+    assert compaction.summary == summary
+    assert [ref.response_id for ref in compaction.model_calls] == ["resp-summary"]
+    assert compaction.model_calls[0].model_ref == model_ref
+    assert compaction.before_model_call.response_id == "resp-before"
+    assert compaction.after_model_call.response_id == "resp-after"
+    # The summary call is not one of the invocation's main-loop calls.
+    assert [ref.response_id for ref in _invocation(bundle, "root").model_calls] == ["resp-before", "resp-after"]
+    codes = {gap.code for gap in bundle.gaps}
+    assert not codes & {
+        "compaction_summary_call_unavailable",
+        "compaction_model_call_boundary_unavailable",
+        "compaction_summary_unavailable",
+        "compaction_after_model_call_unavailable",
+    }
 
 
 def test_failed_compaction_is_recorded_without_swallowing_the_error():
@@ -354,3 +402,22 @@ def test_missing_private_hooks_are_reported_without_raising():
 def test_root_status(result, expected):
     observer = HermesAgentObserver().instrument(_FakeAgent())
     assert _invocation(observer.finish(result), "root").status == expected
+
+
+def test_a_compression_pass_that_changes_nothing_is_not_a_compaction():
+    agent = _FakeAgent()
+    observer = HermesAgentObserver().instrument(agent)
+
+    # The fake compressor reports 7 tokens afterwards: nothing was summarized or dropped.
+    agent._compress_context([{"role": "user", "content": "x"}], "system", approx_tokens=7)
+    bundle = observer.finish({"completed": True, "messages": []})
+
+    [noop] = _compactions(bundle)
+    assert noop.outcome == "aborted"
+    assert noop.tokens_before == noop.tokens_after == 7
+    codes = {gap.code for gap in bundle.gaps}
+    assert not codes & {
+        "compaction_summary_call_unavailable",
+        "compaction_summary_unavailable",
+        "compaction_after_model_call_unavailable",
+    }
