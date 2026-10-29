@@ -845,7 +845,21 @@ class ServerClient(BaseModel):
 
         if headers := metadata_headers():
             kwargs["headers"] = {**(kwargs.get("headers") or {}), **headers}
-        return await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+        from time import perf_counter
+
+        from nemo_gym.call_timing import HEADER as CALL_TIMING_HEADER
+        from nemo_gym.call_timing import merge_header, record_call
+
+        started = perf_counter()
+        try:
+            response = await request(method=method, url=f"{base_url}{url_path}", _internal=True, **kwargs)
+        finally:
+            if model_path.endswith("/verify"):
+                record_call("verify", 1000.0 * (perf_counter() - started))
+        response_headers = getattr(response, "headers", None)
+        if response_headers is not None:
+            merge_header(response_headers.get(CALL_TIMING_HEADER))
+        return response
 
     async def get(
         self,
@@ -1271,6 +1285,11 @@ repr(e): {repr(e)}"""
                 )
                 return JSONResponse(content="An unknown error occurred", status_code=500)
 
+    def setup_call_timing_middleware(self, app: FastAPI) -> None:
+        from nemo_gym.call_timing import CallTimingMiddleware
+
+        app.add_middleware(CallTimingMiddleware)
+
     def setup_cancellation_middleware(self, app: FastAPI) -> None:
         app.add_middleware(ClientDisconnectCancellationMiddleware)
 
@@ -1391,6 +1410,7 @@ repr(e): {repr(e)}"""
         server.set_ulimit()
         server.prefix_server_logs()
         server.setup_exception_middleware(app)
+        server.setup_call_timing_middleware(app)
         # Register last so cancellation wraps the complete request stack.
         server.setup_cancellation_middleware(app)
         # Must precede uvicorn.run: Starlette refuses add_middleware once the app has
