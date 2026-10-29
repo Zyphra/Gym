@@ -16,6 +16,7 @@ import base64
 import hashlib
 import importlib
 import json
+import re
 import shlex
 import shutil
 import tarfile
@@ -155,6 +156,28 @@ class PrivateGraderConfig(BaseModel):
         if not callable(planner):
             raise TypeError(f"private grader target is not callable: {self.target}")
         return planner
+
+
+_IMAGE_ID = re.compile(r"[0-9a-f]{64}")
+
+
+def _image_identity_env(container: str) -> Dict[str, str]:
+    """Declare the grading sandbox's content-addressed image to its verifier.
+
+    Enroot gives the sandbox no view of the image it was created from, so the
+    host that chose the image names it: the file name of a content-addressed
+    ``.sif`` or ``.sqsh`` (a 64-hex digest). Anything else, such as a registry
+    reference, declares nothing. The value is set on the grading exec only; the
+    policy's own sandbox never receives it.
+    """
+    name = Path(container).name
+    for suffix in (".sif", ".sqsh"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    else:
+        return {}
+    return {"TASK_IMAGE_ID": name} if _IMAGE_ID.fullmatch(name) else {}
 
 
 class PrivateGraderPlan(BaseModel):
@@ -783,7 +806,7 @@ class AnySweSandboxRunner:
             result = await sandbox.exec(
                 plan.command,
                 cwd=plan.workdir,
-                env=plan.env,
+                env={**plan.env, **_image_identity_env(params.container)},
                 timeout_s=params.swebench_tests_timeout,
                 user="root",
             )
