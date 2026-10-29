@@ -136,6 +136,32 @@ def _require_enroot() -> str:
     return path
 
 
+def _remove_staging_dir(path: Path) -> None:
+    """Remove a staging tree whose contents were created inside the sandbox.
+
+    An archive unpacked in the sandbox keeps its read-only directory modes
+    (``dr-xr-xr-x``), so the owning host user cannot unlink their entries and a
+    plain ``rmtree`` fails with ``EACCES`` and leaves the whole tree on the node.
+    Directories are made owner-writable only after that failure; symlinks are
+    never followed or chmod-ed.
+    """
+    try:
+        shutil.rmtree(path, ignore_errors=False)
+        return
+    except PermissionError:
+        pass
+    with contextlib.suppress(OSError):
+        os.chmod(path, os.lstat(path).st_mode | stat.S_IRWXU)
+    for root, dirs, _files in os.walk(path, followlinks=False):
+        for name in dirs:
+            directory = os.path.join(root, name)
+            if os.path.islink(directory):
+                continue
+            with contextlib.suppress(OSError):
+                os.chmod(directory, os.lstat(directory).st_mode | stat.S_IRWXU)
+    shutil.rmtree(path, ignore_errors=False)
+
+
 @dataclass(frozen=True)
 class EnrootCreateConfig:
     """Settings for creating an Enroot sandbox container."""
@@ -698,7 +724,8 @@ class EnrootProvider:
                 [self._binary, "remove", "-f", instance.name],
                 timeout_s=self._exec_config.default_timeout_s,
             )
-        shutil.rmtree(instance.staging_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            _remove_staging_dir(instance.staging_dir)
 
     @staticmethod
     def _pid_has_container_marker(pid: int, name: str) -> bool:
@@ -907,7 +934,7 @@ class EnrootProvider:
             remove_error = e
 
         try:
-            shutil.rmtree(instance.staging_dir, ignore_errors=False)
+            _remove_staging_dir(instance.staging_dir)
         except OSError as e:
             LOGGER.warning("failed to remove staging dir %s: %s", instance.staging_dir, e)
 
