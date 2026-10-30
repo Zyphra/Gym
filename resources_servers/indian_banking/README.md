@@ -1,4 +1,10 @@
-# Description
+# Indian Banking
+
+`indian_banking` is the original NeMo Gym Indian retail-banking environment. A policy model plays a bank's virtual assistant for a simulated customer; it uses servicing tools and a knowledge base, and an episode is scored at the end against the task's gold actions, final database state and required disclosures.
+
+**Scope.** This page documents this environment's own source, tools and reward. RLTasks hosts a separate Tau-style port of the same NPCI data (see [its page](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/tau/splits/indian_bank_tau3/README.md)) and separate Rho/off-KB banking environments. They share some infrastructure, but not one task source or one reward formula: the dense, efficiency-shaped reward below is specific to `indian_banking` and is not the RLTasks training reward. For example, the session here starts already authenticated, while the port requires the agent to verify identity.
+
+## Overview
 
 `indian_banking` is a multi-turn, tool-using customer-support environment for an India-based retail bank. The policy model plays the bank's virtual assistant inside an already-authenticated customer session; a second LLM plays the customer (a role-swapped user simulator driven by a per-task persona and scenario); the assistant serves the customer by calling servicing tools against a per-episode snapshot of a synthetic core-banking database, and by looking up policy in a small knowledge base. Every episode is scored once, at the end, with a dense partial-credit reward built from deterministic checks on the tool calls, the final database state, and the customer-facing messages, plus a bounded LLM-judge score for natural-language assertions.
 
@@ -58,7 +64,7 @@ Each task's `evaluation_criteria` specifies `actions` (gold tool calls, optional
 
 `reward_basis` is the authoritative selector: a task may carry `nl_assertions` or `communicate_info` even when the corresponding check is not in its basis - those fields then document the expected outcome (and remain available to custom evaluations) but do not enter `strict` or `dense`. The judge runs only when `NL_ASSERTION` is in the basis and assertions are present.
 
-An errored tool call never satisfies a gold action unless that gold action carries an explicit `expect_error: true` (tasks that deliberately exercise an error path, e.g. querying a nonexistent service request). A gold action that errors on replay without the marking is a data bug, and `tests/test_app.py::TestShippedDataIntegrity` fails on it (the committed `example.jsonl` is always checked; the train/validation splits are included whenever they are present locally).
+An errored tool call never satisfies a gold action unless that gold action carries an explicit `expect_error: true` (tasks that deliberately exercise an error path, e.g. querying a nonexistent service request). A gold action that errors on replay without the marking is a data bug, and `tests/test_app.py::TestShippedDataIntegrity` fails on it (the test needs `db.json`, which is fetched from the dataset repo and otherwise skips; with it present, the committed `example.jsonl` is always checked and the train/validation splits are included whenever they are present locally).
 
 Three further deterministic floors gate `strict`: an episode with no non-empty customer-facing assistant message never passes (a mute agent cannot outscore a correct refusal-with-explanation); a task may declare `max_tool_calls` (e.g. `0` for a purely conversational task, failing any tool use) or `require_transfer: true` (the episode must end in `transfer_to_human_agents`, read from the engine's transfer flag). All three are code checks, independent of the judge.
 
@@ -69,9 +75,11 @@ Three further deterministic floors gate `strict`: an episode with no non-empty c
 
 The shaping constant is below the smallest increment a true pass earns, so a partial-credit trajectory can never outscore a pass. The judge score never enters `strict`, is capped at a small share of `dense`, sees only the customer-facing transcript (no tool calls, DB state, or gold actions), and fails open (the judge is left out rather than scored as zero) on an endpoint error.
 
-**Call-order strictness.** `core/reward.py` exposes a module constant `SEQ_STRICT`, shipped as `True` (order-strict, the setting used for every number reported for this environment: the 300/300 gold replay, the example rollouts, and the reference GRPO run). Set it to `False` for tau2-comparable set-based scoring. With it off, the ACTION check is set-based, matching the tau2-bench evaluator. With it on, the order of gold tool calls becomes load-bearing for ACTION: `strict` additionally requires that the matched gold calls appear in canonical order (`seq_frac == 1.0`, computed as the longest common subsequence between gold actions and the assistant's calls divided by the number of gold actions), and half of the ACTION argument credit in `dense` is reserved for in-order matches. Pass rates scored with the flag on and off are not comparable, so state which setting was used when reporting results. The `seq_frac` value is always reported in `info`, and out-of-order gold calls always feed the efficiency cost on passing trajectories.
+**Call-order strictness.** `core/reward.py` exposes a module constant `SEQ_STRICT`, shipped as `True` (order-strict). Set it to `False` for tau2-comparable set-based scoring. With it off, the ACTION check is set-based, matching the tau2-bench evaluator. With it on, the order of gold tool calls becomes load-bearing for ACTION: `strict` additionally requires that the matched gold calls appear in canonical order (`seq_frac == 1.0`, computed as the longest common subsequence between gold actions and the assistant's calls divided by the number of gold actions), and half of the ACTION argument credit in `dense` is reserved for in-order matches. Pass rates scored with the flag on and off are not comparable, so state which setting was used when reporting results. The `seq_frac` value is always reported in `info`, and out-of-order gold calls always feed the efficiency cost on passing trajectories.
 
 **Multiplicity.** All action signals share one consumption-based semantics: each gold action consumes one matching agent call under a maximum bipartite assignment (never dependent on gold declaration order), so a gold list that repeats an action (a read-after-write verification step - 67 of the 300 tasks do this) requires the agent to repeat it, and one call never satisfies two gold entries. A gold-mandated repeat is never charged as a duplicate by the efficiency cost and never flags the trajectory out of order - a byte-perfect replay of gold scores exactly 1.0. Conversely, a non-errored write call beyond what gold asks for counts as a wrong write, and an unmandated repeated call is charged as a duplicate.
+
+With `db.json` present, the same test replays every locally present row's gold actions and asserts `strict == 1.0` and `reward == 1.0` (the five example rows, plus the hosted splits when downloaded), so a byte-perfect gold replay scores exactly 1.0.
 
 Every terminal step returns the full reward breakdown (`reward`, `strict`, `dense`, per-component values, `action_frac`, `seq_frac`, `bad_writes`, `judge`) in `info`, so aggregation across rollouts works without a separate verify pass.
 
@@ -84,7 +92,7 @@ Every row is one task, and every task seeds one conversation.
 | train | 250 | Training split |
 | validation | 50 | Held-out; the 5 `example.jsonl` rows are drawn from it |
 
-300 tasks in total across 50 task families, referencing 177 of the 197 synthetic customers in `data/db.json`. Every task was checked for required fields, an existing customer, real tool names, and clean serialisation. Tasks were generated with an LLM-driven pipeline (not included) and validated programmatically; the tasks, database, knowledge base, agent instruction, and domain policy are all synthetic and ship under Apache 2.0.
+The hosted dataset documents 300 tasks across 50 task families, referencing 177 of the 197 synthetic customers in `data/db.json`. This repository ships the five example rows, the agent instruction, the policy and the row-count metadata (250 train, 50 validation); the test above checks those row counts whenever the splits are present. The tasks were generated with an LLM-driven pipeline (not included) and validated programmatically; the tasks, database, knowledge base, agent instruction, and domain policy are all synthetic and ship under Apache 2.0.
 
 All customer, account, transaction, and merchant data is synthetic, and every bank, brand, and merchant name in the data is fictional; any resemblance to real entities is coincidental.
 
@@ -97,7 +105,7 @@ hf download NPCI/nemo-gym-indian-banking db.json kb.json \
 
 (set `HF_TOKEN` if the dataset repo requires authentication). The server refuses to start without them and names this location in its error message.
 
-A row looks like this (long fields elided):
+A row looks like this (the first in-tree example row; long fields elided). Its `nl_assertions` document the expected behaviour but are not in its `reward_basis`, so they do not enter `strict` or `dense`:
 
 ```json
 {
@@ -106,7 +114,7 @@ A row looks like this (long fields elided):
     "tools": [{"type": "function", "name": "search_knowledge_base", "..": ".."}, ".. 34 tools .."],
     "parallel_tool_calls": false
   },
-  "task_id": "edgablk2x194",
+  "task_id": "rl_edgablk2x_0194",
   "customer": "CUST_A0C6A651",
   "user_scenario": {
     "persona": "You are a methodical customer who likes things done step by step ..",
@@ -126,7 +134,7 @@ A row looks like this (long fields elided):
     ],
     "communicate_info": [],
     "nl_assertions": ["Agent checks status first, blocks the card exactly once after confirmation, .."],
-    "reward_basis": ["ACTION", "DB", "NL_ASSERTION"]
+    "reward_basis": ["ACTION", "DB"]
   },
   "initial_state": {},
   "opening_message": "Hi, I think someone has used my card without my permission .."
