@@ -158,6 +158,9 @@ def _instruction_from_input(body: NeMoGymResponseCreateParamsNonStreaming) -> st
 
 class TerminalBenchMetrics(SandboxMemoryEvents):
     resolved: Optional[bool] = None
+    # The verifier's own reward.txt value, kept so a fractional grade survives
+    # `resolved` (reward > 0). Only used when `fractional_reward` is selected.
+    verifier_reward: Optional[float] = None
     agent_timed_out: bool = False
     container_timed_out: bool = False
     sandbox_failed: bool = False
@@ -192,16 +195,35 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     grading_started_at: Optional[float] = None
     grading_completed_at: Optional[float] = None
 
+    def reward(self, *, fractional: bool) -> float:
+        """The rollout reward: binary by default, the verifier's own value when fractional."""
+        if not self.resolved:
+            return 0.0
+        if not fractional:
+            return 1.0
+        if self.verifier_reward is None:
+            raise ValueError("fractional reward requested but the verifier reward was not recorded")
+        return self.verifier_reward
+
     def apply_timeout_policy(self, *, agent_timeout_is_failure: bool) -> None:
         """Keep policy timeouts in the scored population when explicitly enabled."""
         if self.agent_timed_out and agent_timeout_is_failure:
             self.resolved = False
+            if self.verifier_reward is not None:
+                self.verifier_reward = 0.0
         self.mask_sample = bool(
             self.mask_sample
             or self.container_timed_out
             or self.sandbox_failed
             or (self.agent_timed_out and not agent_timeout_is_failure)
         )
+
+
+def _checked_reward(value: float, fractional: bool) -> float:
+    """Return a verifier reward; a fractional grade must be finite and within [0, 1]."""
+    if fractional and not (0.0 <= value <= 1.0):
+        raise ValueError(f"fractional verifier reward outside [0, 1]: {value!r}")
+    return value
 
 
 def update_metrics(metrics_fpath: Path, update_dict: Dict[str, Any], task_name: str = "") -> None:
@@ -474,6 +496,9 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
         description="auto, an absolute prepared dependency directory for local sandboxes, or a remote runtime archive/URL",
     )
     agent_timeout_is_failure: bool = Field(default=False, strict=True)
+    # Report the verifier's reward.txt value (0 to 1) instead of 1.0 for any positive grade.
+    # Needed by Harbor verifiers that award partial credit; a value outside [0, 1] is unreadable.
+    fractional_reward: bool = Field(default=False, strict=True)
     tb_agent_timeout: int = 1800
     # When set, overrides the per-task agent_timeout_sec from the dataset for every task.
     global_agent_timeout: Optional[int] = Field(default=None, gt=0)
@@ -1068,6 +1093,7 @@ class RunTerminalAgent(BaseModel):
         verifier_memory_before = verifier_memory_after = {}
         integrity_problem = reward_problem = None
         resolved = False
+        verifier_reward = None
         try:
             if self._uses_bind_mounts(cfg):
                 integrity = VerifierIntegrity(cfg.verifier_dir, cfg.persistent_dir)
@@ -1127,7 +1153,8 @@ class RunTerminalAgent(BaseModel):
                 if integrity is not None:
                     try:
                         if integrity_problem is None:
-                            resolved = integrity.read_reward() > 0
+                            verifier_reward = _checked_reward(integrity.read_reward(), cfg.fractional_reward)
+                            resolved = verifier_reward > 0
                     except VerifierIntegrityRefused as e:
                         integrity_problem = str(e)[:512]
                     except (ValueError, OSError) as e:
@@ -1161,7 +1188,8 @@ class RunTerminalAgent(BaseModel):
         reward_path = cfg.verifier_dir / "reward.txt"
         if integrity is None:
             try:
-                resolved = float(reward_path.read_text().strip()) > 0
+                verifier_reward = _checked_reward(float(reward_path.read_text().strip()), cfg.fractional_reward)
+                resolved = verifier_reward > 0
             except (ValueError, OSError) as e:
                 reward_problem = f"{type(e).__name__}: {e}"
         # test.sh writes 0 or 1; a completed eval without a readable reward is a verifier failure.
@@ -1174,6 +1202,7 @@ class RunTerminalAgent(BaseModel):
         metrics = TerminalBenchMetrics(
             ray_queue_time=time.time() - cfg.ray_queue_timestamp,
             resolved=resolved,
+            verifier_reward=verifier_reward if resolved else None,
             agent_timed_out=agent_timed_out,
             container_timed_out=container_timed_out,
             sandbox_failed=sandbox_failed,
@@ -1503,7 +1532,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
                     "model": response.model,
                 },
                 response=response,
-                reward=1.0 if metrics.resolved else 0.0,
+                reward=metrics.reward(fractional=self.config.fractional_reward),
                 done_reason="context_exhausted" if meta.get("stop_reason") == "context_exhausted" else None,
                 **metrics.model_dump(),
                 instance_config=AnyTerminalInstanceConfig.model_validate_json(meta["instance_config"]).model_dump(),
