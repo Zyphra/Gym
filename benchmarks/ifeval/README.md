@@ -1,6 +1,6 @@
 # IFEval
 
-[IFEval](https://github.com/google-research/google-research/tree/master/instruction_following_eval) is the original instruction-following evaluation benchmark from Google Research. It evaluates whether a model follows explicit, programmatically-verifiable constraints (length, format, keywords, etc.) embedded in a prompt. The data is the upstream `input_data.jsonl` of 541 prompts.
+[IFEval](https://github.com/google-research/google-research/tree/master/instruction_following_eval) is the original instruction-following evaluation benchmark from Google Research. It evaluates whether a model follows explicit, programmatically-verifiable constraints (length, format, keywords, etc.) embedded in a prompt. The data is the upstream `input_data.jsonl` of 541 prompts (834 instructions), fetched at a pinned commit (`26d8ccd`, 2024-06-11, the last change to the file) and checked against a pinned SHA-256 before it is parsed. `prepare` also writes `ifeval_benchmark.manifest.json` with the commit, source and output digests and counts.
 
 This benchmark chains to the existing `instruction_following` resources server, which uses [`verifiable_instructions`](https://github.com/abukharin-nv/verifiable-instructions) to perform the per-instruction checks. Per-rollout reward equals Skills' STRICT-mode accuracy under `grading_mode="binary"` (1 if all instructions pass, 0 otherwise).
 
