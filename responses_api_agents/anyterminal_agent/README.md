@@ -1,5 +1,11 @@
 # anyterminal_agent
 
+Sandbox startup, execution and cleanup exceptions persist their type and message
+in `nemo_gym_metrics.json`'s `error_detail` (at most 2,000 characters), alongside
+the existing infrastructure and masking fields. When execution and cleanup both
+fail, the initiating error comes first. Existing memory-kill attribution takes
+precedence; this diagnostic field does not change reward or masking policy.
+
 Runs any Gym agent inside a Terminal Bench task container and evaluates the result
 by running the task's `tests/test.sh` in the same container. Works with
 `hermes_agent`, `claude_code_agent`, `terminus_2_agent`, `pi_agent` (`configs/anyterminal_pi.yaml`),
@@ -125,6 +131,7 @@ either:
 | `verifier_environment` | `{}` | Values for the names a task's `[verifier.env]` references. `test.sh` receives each declared variable with Harbor's `${NAME}` / `${NAME:-default}` templates resolved against these values, never the worker environment; an unsupplied reference without a default fails the row before the agent runs. |
 | `continue_until_timeout` | `false` | Honour each task's `[agent].continue_until_timeout = true`, as Long-Horizon Terminal-Bench's Harbor does (stock Harbor ignores it). The agent runs in fresh phases of at most `checkpoint_interval_s` on the same instance. After each phase the hidden `test.sh` runs with the agent's tmux descendants frozen; the staged tests and `/logs/verifier` are removed before the agent resumes. A reward below 1.0 re-invokes the agent with the original instruction plus a binary rejection that names no verifier detail; a pass or the end of the agent budget ends the run, and the final verifier grades it. The budget ending is not an agent timeout. Phase outputs and interim grades are kept as `response-phase-NNNN.json` and `interim_verifier/phase-NNNN/`. Needs a bind-mount sandbox provider; background processes outside tmux are not frozen. |
 | `checkpoint_interval_s` | `1800` | Longest agent phase under `continue_until_timeout`. |
-| `scalar_reward` | `false` | Report `reward.txt`'s value as the reward (and `resolved` at 0.95 or above) for partial-credit graders. Off: reward is 1 when `reward.txt` is positive. |
+| `fractional_reward` | `false` | Report `reward.txt`'s value (0 to 1; anything else is unreadable) as the reward instead of 1.0 for any positive grade, for verifiers that award partial credit. |
+| `solved_reward_threshold` | unset | Call a row `resolved` only at or above this verifier reward (LHTB's "solved" is `0.95`) instead of at any positive reward. The reward itself is unchanged. |
 | `apptainer_memory_limit_mb` | `32768` | Per-container memory cap via `ulimit -v` |
 | `concurrency` | `256` | Max concurrent tasks dispatched to Ray |

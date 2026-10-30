@@ -400,6 +400,39 @@ async def test_verifier_environment_is_private_and_passed_to_grading(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [False, True])
+async def test_forwarded_verifier_environment_reaches_grading_only(tmp_path, declared):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    (task_dir / "task.toml").write_text(
+        '[verifier.env]\nJUDGE_MODEL_ID = "${JUDGE_MODEL_ID:-default-judge}"\n' if declared else "[verifier]\n"
+    )
+    cfg = _make_instance_config(
+        tmp_path,
+        problem_info={"task_name": "t", "task_dir": str(task_dir), "docker_image": "x", "workdir": "/"},
+        verifier_forwarded_environment={"JUDGE_BASE_URL": "http://judge/v1", "JUDGE_API_KEY": "k"},
+        verifier_environment={"JUDGE_MODEL_ID": "served-judge"},
+    )
+    sandbox = AsyncMock()
+    sandbox.exec.return_value = SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+    await RunTerminalAgent(config=cfg)._run_eval(sandbox, cfg)
+    (grading,) = sandbox.exec.await_args_list
+    env = grading.kwargs["env"]
+    assert env["JUDGE_BASE_URL"] == "http://judge/v1" and env["JUDGE_API_KEY"] == "k"
+    assert env.get("JUDGE_MODEL_ID") == ("served-judge" if declared else None)
+    assert "JUDGE_API_KEY" not in cfg.agent_environment
+    assert '"JUDGE_API_KEY": "***"' in app._safe_config_json(cfg)
+
+
+async def test_no_forwarded_environment_leaves_grading_env_unset(tmp_path):
+    cfg = _make_instance_config(tmp_path)
+    sandbox = AsyncMock()
+    sandbox.exec.return_value = SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+    await RunTerminalAgent(config=cfg)._run_eval(sandbox, cfg)
+    assert sandbox.exec.await_args.kwargs["env"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("home", ["/tmp/private-verifier/home", "/tmp/private ' $(false); home"])
 async def test_private_home_survives_apptainer_environment_boundary(tmp_path, home):
     import subprocess
@@ -1330,6 +1363,48 @@ def test_harness_oom_requires_both_process_exit_and_kernel_event(harness_exit, o
 
 
 class TestProcessSingleDatapoint:
+    @pytest.mark.parametrize("phase", ["create", "exec", "close", "exec-and-close"])
+    async def test_sandbox_exception_is_persisted_with_original_disposition(self, tmp_path: Path, phase) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+        message = "image environment snapshot failed: error_type='timeout'; timed out after 60s"
+
+        class FailingProvider:
+            async def create(self, spec):
+                if phase == "create":
+                    raise RuntimeError(message)
+                return SandboxHandle(sandbox_id="box", provider_name="failure", raw=None)
+
+            async def exec(self, handle, command, **kwargs):
+                if phase in ("exec", "exec-and-close"):
+                    raise RuntimeError(message + ": " + "x" * 3000)
+                if "bash /tests/test.sh" in command:
+                    (cfg.verifier_dir / "reward.txt").write_text("1.0")
+                return SandboxExecResult("", "", 0)
+
+            async def close(self, handle):
+                if phase in ("close", "exec-and-close"):
+                    raise OSError("cleanup did not drain")
+
+            async def aclose(self):
+                pass
+
+        with (
+            patch(
+                "responses_api_agents.anyterminal_agent.app.AsyncSandbox",
+                side_effect=lambda provider, spec: AsyncSandbox(FailingProvider(), spec),
+            ),
+            patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)),
+        ):
+            resolved = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["sandbox_failed"] is True and metrics["mask_sample"] is True
+        assert metrics["error_detail"].startswith(
+            "OSError: cleanup did not drain" if phase == "close" else "RuntimeError: " + message
+        )
+        assert len(metrics["error_detail"]) <= 2000
+        assert resolved is (phase == "close")
+
     @pytest.fixture(autouse=True)
     def _no_real_provider(self):
         # AsyncSandbox is mocked below, so the provider it's built with is never used —
@@ -1394,6 +1469,47 @@ class TestProcessSingleDatapoint:
         assert "PermissionError" in metrics["verifier_integrity_problem"]
         assert metrics["mask_sample"] is False
         sandbox.stop.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "text,fractional,expected_reward,unreadable",
+        [
+            ("0.5", False, 1.0, False),
+            ("0.5", True, 0.5, False),
+            ("1.0", True, 1.0, False),
+            ("0", True, 0.0, False),
+            ("1.5", True, 0.0, True),
+            ("-0.1", True, 0.0, True),
+            ("nan", True, 0.0, True),
+        ],
+    )
+    async def test_fractional_reward_is_reported_only_when_selected(
+        self, tmp_path: Path, text, fractional, expected_reward, unreadable
+    ) -> None:
+        cfg = _make_instance_config(tmp_path, fractional_reward=fractional)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.verifier_dir / "reward.txt").write_text(text)
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=verifier), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        metrics = app.TerminalBenchMetrics.model_validate_json(cfg.metrics_fpath.read_text())
+        assert metrics.verifier_reward_unreadable is unreadable
+        assert metrics.reward(fractional=fractional) == expected_reward
+
+    def test_fractional_reward_is_strict_and_default_off(self, tmp_path: Path) -> None:
+        assert _make_instance_config(tmp_path).fractional_reward is False
+        with pytest.raises(ValidationError, match="fractional_reward"):
+            _make_instance_config(tmp_path, fractional_reward="true")
+
+    def test_fractional_timeout_failure_scores_zero(self) -> None:
+        metrics = app.TerminalBenchMetrics(resolved=True, verifier_reward=0.5, agent_timed_out=True)
+        metrics.apply_timeout_policy(agent_timeout_is_failure=True)
+        assert metrics.reward(fractional=True) == 0.0
 
     async def test_unresolved_when_no_reward_file(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path)

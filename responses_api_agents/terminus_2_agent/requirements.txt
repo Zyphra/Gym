@@ -1,2 +1,5 @@
 -e nemo-gym[dev] @ ../../
 harbor @ git+https://github.com/laude-institute/harbor.git@9dddd797b57ab8a0f9d6352a20fce73abbb29573
+# Harbor's Terminus imports litellm, which imports tiktoken, inside task images down to glibc 2.17;
+# tiktoken>=0.12 publishes only manylinux_2_28 wheels.
+tiktoken>=0.8,<0.12

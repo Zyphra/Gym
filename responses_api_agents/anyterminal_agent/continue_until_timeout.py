@@ -22,10 +22,8 @@ try:
 except ModuleNotFoundError:  # Python 3.10
     import tomli as tomllib  # type: ignore[no-redef]
 
-# Reward at which the verifier's pass ends a trial (``_verifier_passed``) and the
-# LHTB report's "solved" threshold.
+# Reward at which the verifier's pass ends a trial (``_verifier_passed``).
 PASS_REWARD = 1.0
-SOLVED_REWARD = 0.95
 
 
 def task_continues_until_timeout(task_dir: Path) -> bool:

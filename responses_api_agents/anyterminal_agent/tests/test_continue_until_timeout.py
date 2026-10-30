@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from responses_api_agents.anyterminal_agent import continue_until_timeout as phases
-from responses_api_agents.anyterminal_agent.app import RunTerminalAgent, TerminalBenchMetrics, _reward
+from responses_api_agents.anyterminal_agent.app import RunTerminalAgent, TerminalBenchMetrics
 from responses_api_agents.anyterminal_agent.tests.test_app import _make_instance_config, _sandbox_result
 
 
@@ -80,7 +80,9 @@ class ScriptedSandbox:
         return _sandbox_result()
 
 
-async def _run(tmp_path, rewards, *, flag=True, scalar=True, agent_seconds=0.0, agent_error=None, **overrides):
+async def _run(
+    tmp_path, rewards, *, flag=True, fractional=True, solved=0.95, agent_seconds=0.0, agent_error=None, **overrides
+):
     task = _task(tmp_path, flag=flag)
     cfg = _make_instance_config(
         tmp_path,
@@ -93,7 +95,8 @@ async def _run(tmp_path, rewards, *, flag=True, scalar=True, agent_seconds=0.0, 
         },
         agent_command_str="run-the-agent",
         continue_until_timeout=True,
-        scalar_reward=scalar,
+        fractional_reward=fractional,
+        solved_reward_threshold=solved,
         **overrides,
     )
     (cfg.persistent_dir / "instruction.txt").write_text(INSTRUCTION)
@@ -176,7 +179,7 @@ async def test_each_phase_is_bounded_by_the_checkpoint_interval_and_the_budget_i
     # Spending the budget is the normal end: the final verifier's value is the reward.
     assert resolved is False
     assert (metrics["verifier_reward"], metrics["agent_timed_out"], metrics["mask_sample"]) == (0.3, False, False)
-    assert _reward(TerminalBenchMetrics.model_validate(metrics), True) == 0.3
+    assert TerminalBenchMetrics.model_validate(metrics).reward(fractional=True) == 0.3
 
 
 async def test_a_task_without_the_flag_runs_the_agent_once(tmp_path: Path) -> None:
@@ -204,14 +207,20 @@ async def test_the_agent_is_thawed_even_when_the_interim_grade_fails(tmp_path: P
     assert not (cfg.persistent_dir / "staging" / "tests").exists()
 
 
-@pytest.mark.parametrize(("scalar", "expected"), [(True, 0.62), (False, 1.0)])
-def test_the_reward_is_the_verifier_value_only_when_scalar(scalar: bool, expected: float) -> None:
+@pytest.mark.parametrize(("fractional", "expected"), [(True, 0.62), (False, 1.0)])
+def test_the_reward_is_the_verifier_value_only_when_fractional(fractional: bool, expected: float) -> None:
     metrics = TerminalBenchMetrics(resolved=True, verifier_reward=0.62)
-    assert _reward(metrics, scalar) == expected
-    assert _reward(TerminalBenchMetrics(resolved=False), scalar) == 0.0
+    assert metrics.reward(fractional=fractional) == expected
+    assert TerminalBenchMetrics(resolved=False).reward(fractional=fractional) == 0.0
 
 
-async def test_scalar_reward_calls_a_row_solved_at_the_lhtb_threshold(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("fractional", "expected"), [(True, 0.62), (False, 0.0)])
+def test_a_partial_grade_below_the_solved_threshold_keeps_its_reward(fractional: bool, expected: float) -> None:
+    metrics = TerminalBenchMetrics(resolved=False, verifier_reward=0.62)
+    assert metrics.reward(fractional=fractional) == expected
+
+
+async def test_the_solved_threshold_decides_resolved_at_the_lhtb_value(tmp_path: Path) -> None:
     for reward, solved in ((0.949, False), (0.95, True)):
         cfg, sandbox, _task_dir = await _run(tmp_path / str(reward), [reward], flag=False)
         resolved, metrics = await _process(cfg, sandbox)
