@@ -106,6 +106,47 @@ def test_numeric_search_comparisons_have_correct_boundary_semantics(http_world, 
     }
 
 
+@pytest.mark.parametrize(
+    "condition",
+    ["middle", {"eq": "middle"}, {"in": ["middle"]}, {"gt": "a"}, {"gte": "middle"}, {"lt": "z"}, {"lte": "middle"}],
+)
+def test_missing_schema_field_does_not_match_or_mutate(condition):
+    native = server()
+    app = native.setup_webserver()
+    # Production catches unexpected resource exceptions outside session handling.
+    native.setup_exception_middleware(app)
+    identity = "api-workspace-v3:train:hr_location:0000"
+    with TestClient(app) as client:
+        assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
+        world = next(iter(native._sessions.values())).world
+        vendor = next(VENDORS[name] for name in world.scenario.connected if VENDORS[name].function == "hr")
+        employees = world.records[vendor.name]["employees"]
+        assert employees and all("manager" not in row for row in employees.values())
+        request = {
+            "vendor": vendor.name,
+            "method": "GET",
+            "path": vendor.path("employees"),
+            "params": {"limit": 100, "filters": {vendor.field("manager"): condition}},
+        }
+        original = canonical_json(world.records)
+        result = client.post("/workspace_request", json=request)
+        assert result.status_code == 200, result.text
+        assert result.json()["items"] == []
+        assert canonical_json(world.records) == original
+        identity = next(iter(employees))
+        patched = client.post(
+            "/workspace_request",
+            json={"vendor": vendor.name, "method": "PATCH", "path": vendor.path("employees", identity),
+                  "body": {vendor.field("manager"): "middle"}},
+        )
+        assert patched.status_code == 200
+        original = canonical_json(world.records)
+        result = client.post("/workspace_request", json=request)
+        assert result.status_code == 200
+        assert [row[vendor.field("id")] for row in result.json()["items"]] == [identity]
+        assert canonical_json(world.records) == original
+
+
 def test_search_validation_and_unknown_accounts(http_world):
     _, client, world = http_world
     vendor = next(VENDORS[name] for name in world.scenario.connected if VENDORS[name].function == "accounting")
