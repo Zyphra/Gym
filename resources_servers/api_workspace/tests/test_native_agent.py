@@ -53,7 +53,7 @@ async def test_native_agent_recovers_tool_queries_and_completes_world_without_ma
     monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
     transport = server_utils.set_global_aiohttp_client(server_utils.GlobalAIOHTTPAsyncClientConfig())
     native = server()
-    identity = "api-workspace-v3:train:hr_location:0000"
+    identity = "api-workspace-v4:train:hr_location:0000"
     scenario = scenario_from_id(identity)
     unavailable = next(v for v in VENDORS.values() if v.function == "hr" and v.name not in scenario.connected)
     connected = next(VENDORS[name] for name in scenario.connected if VENDORS[name].function == "hr")
@@ -203,7 +203,7 @@ async def test_native_agent_recovers_tool_queries_and_completes_world_without_ma
 @pytest.mark.asyncio
 async def test_reset_and_close_isolate_outstanding_calls():
     native = server()
-    identity = "api-workspace-v3:train:hr_location:0000"
+    identity = "api-workspace-v4:train:hr_location:0000"
     request = Request({"type": "http", "session": {SESSION_ID_KEY: "concurrent-reset"}})
     await native.seed_session(request, WorkspaceSeed(task_id=identity))
     old = native._session(request)
