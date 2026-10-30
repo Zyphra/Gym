@@ -376,6 +376,10 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
     checkpoints_enabled: bool = False
+    # Hermes' own `mcp_servers` config (tools/mcp_tool.py): stdio or URL servers whose tools Hermes
+    # registers beside its built-ins. A benchmark that ships its tools as an MCP server selects it
+    # here; the mapping is written to config.yaml unchanged. Absent by default.
+    mcp_servers: Optional[dict[str, dict[str, Any]]] = None
     # Offer OpenHands' `finish(message)` tool; the turn that calls it ends the run as completed.
     finish_tool: bool = False
 
@@ -519,6 +523,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 "enabled": self.config.checkpoints_enabled,
             },
         }
+        if self.config.mcp_servers:
+            config["mcp_servers"] = self.config.mcp_servers
         if self.config.context_window is not None:
             config["model"] = {"default": self._model_name(), "context_length": self.config.context_window}
             reserve = self.config.max_tokens or 0
