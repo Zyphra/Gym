@@ -400,6 +400,39 @@ async def test_verifier_environment_is_private_and_passed_to_grading(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [False, True])
+async def test_forwarded_verifier_environment_reaches_grading_only(tmp_path, declared):
+    task_dir = tmp_path / "task"
+    task_dir.mkdir()
+    (task_dir / "task.toml").write_text(
+        '[verifier.env]\nJUDGE_MODEL_ID = "${JUDGE_MODEL_ID:-default-judge}"\n' if declared else "[verifier]\n"
+    )
+    cfg = _make_instance_config(
+        tmp_path,
+        problem_info={"task_name": "t", "task_dir": str(task_dir), "docker_image": "x", "workdir": "/"},
+        verifier_forwarded_environment={"JUDGE_BASE_URL": "http://judge/v1", "JUDGE_API_KEY": "k"},
+        verifier_environment={"JUDGE_MODEL_ID": "served-judge"},
+    )
+    sandbox = AsyncMock()
+    sandbox.exec.return_value = SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+    await RunTerminalAgent(config=cfg)._run_eval(sandbox, cfg)
+    (grading,) = sandbox.exec.await_args_list
+    env = grading.kwargs["env"]
+    assert env["JUDGE_BASE_URL"] == "http://judge/v1" and env["JUDGE_API_KEY"] == "k"
+    assert env.get("JUDGE_MODEL_ID") == ("served-judge" if declared else None)
+    assert "JUDGE_API_KEY" not in cfg.agent_environment
+    assert '"JUDGE_API_KEY": "***"' in app._safe_config_json(cfg)
+
+
+async def test_no_forwarded_environment_leaves_grading_env_unset(tmp_path):
+    cfg = _make_instance_config(tmp_path)
+    sandbox = AsyncMock()
+    sandbox.exec.return_value = SimpleNamespace(return_code=0, error_type=None, stdout="", stderr="")
+    await RunTerminalAgent(config=cfg)._run_eval(sandbox, cfg)
+    assert sandbox.exec.await_args.kwargs["env"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("home", ["/tmp/private-verifier/home", "/tmp/private ' $(false); home"])
 async def test_private_home_survives_apptainer_environment_boundary(tmp_path, home):
     import subprocess

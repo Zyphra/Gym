@@ -459,6 +459,10 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     agent_environment: Dict[str, str] = Field(default_factory=dict)
     # Values for the names a task's [verifier.env] references (see task_verifier_environment).
     verifier_environment: Dict[str, str] = Field(default_factory=dict)
+    # Variables the grading step receives for every task, declared in task.toml or not: a judge
+    # endpoint that a benchmark's verifier reads by name (Harbor's `--ee`), without a task overlay.
+    # The agent never receives them, unlike Harbor's `--ee`.
+    verifier_forwarded_environment: Dict[str, str] = Field(default_factory=dict)
 
     @field_validator("task_network", mode="before")
     @classmethod
@@ -1010,8 +1014,8 @@ class RunTerminalAgent(BaseModel):
         t0 = time.time()
         verifier_env = await self._prepare_verifier_runtime(sandbox, cfg)
         task_env = task_verifier_environment(Path(cfg.problem_info["task_dir"]), cfg.verifier_environment)
-        if task_env:
-            verifier_env = {**task_env, **(verifier_env or {})}
+        if task_env or cfg.verifier_forwarded_environment:
+            verifier_env = {**cfg.verifier_forwarded_environment, **task_env, **(verifier_env or {})}
         test_cmd = (
             (
                 "readlink /proc/self/ns/net > /logs/verifier/network-namespace.txt && "
