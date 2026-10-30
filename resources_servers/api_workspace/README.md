@@ -1,22 +1,52 @@
-# API workspace
+# API Workspace
 
-Independently authored V4 training environment. Native gold, no-op, wrong-answer and independent-reference controls pass over the full corpus; current-policy V4 calibration has not been run. Source controls do not establish learnability or transfer. This environment does not change any existing dataset, reward objective, cost coefficient, budget, mask or group filter. The resource server is fully offline and mutates only its own fictional task state.
+API Workspace is an offline simulation of fictional SaaS vendors for HR, CRM, accounting, storage, email and chat. An agent receives a business task, discovers the available APIs, reads records and policy documents, and changes the workspace through API calls. A deterministic grader checks the final state.
 
-Status: V4 TRAIN is selected for the consuming restart without a policy pass-rate criterion. V4 rejects V3 IDs, so source pins and re-prepared DATA must move together. Mixture targets and reward coefficients belong to the selected run configuration; the selected API episode-cost coefficient remains `2e-6`. Source controls, reviewed task admission, real-model inspection and live production adoption establish separate facts.
+Example: approve leave and transfer a CRM account to the delegate while preserving the employee record. Other workflows cover invoices, expenses, files, email and chat.
 
-The immutable generator bounds contain 2,400 train identities and 240 separately seeded validation identities across 30 workflow families: five each for HR, CRM, accounting, storage, mail and chat. Every function has three fictional vendors. Each task connects two of those vendors and spreads relevant records across both. The vendors use different API prefixes, collection names and field aliases. Account discovery reports actual connection status; calling an unconnected account returns HTTP 401 with a `WWW-Authenticate` header. Schema discovery never connects an account.
+## Tools and discovery
 
-The four offered tools search endpoint-catalog metadata, inspect vendor schemas, call a vendor API and batch independent requests. Catalog entries contain operation paths, fields and connection status, never task record contents or goals. Search/pagination selectors can be omitted. The account-list route remains available to existing direct API clients. Requests specify method, exact path, query `params` and write `body` separately. Containers accept objects or serialized JSON objects; omitted or JSON null containers are empty. Arrays, scalar JSON and Python `None` text produce recoverable validation errors without mutations. This supports nested JSON encoding without changing the native function-call grammar. A query string embedded in the path fails with HTTP400. A schema-valid filter does not match a record that lacks its field; this applies to equality, membership and ordered comparisons. Search/filter results paginate, and cursors are scoped to the vendor, collection and query. POST requires an idempotency key; replay returns the same object, while conflicting reuse returns409. PATCH and DELETE act on item paths. Amounts are integer cents. No operation reaches a real external account.
+| Tool | Purpose |
+| --- | --- |
+| `workspace_catalog` | Search endpoint metadata by operation, domain, collection or field; inspect account connection status. |
+| `workspace_schema` | Get a vendor’s exact paths, field aliases, methods and query parameters. |
+| `workspace_request` | Read or modify records with `GET`, `POST`, `PATCH` or `DELETE`. |
+| `workspace_parallel` | Batch up to 20 independent requests; results preserve input order and individual status codes. |
 
-The system prompt states only the fictional workspace, the tool categories, the 50-turn limit and final-state completion. Workflow facts and placement rules are in discoverable policy records; task surfaces vary which facts they state. Instructions quote every literal field value, write value templates as `<placeholder>`, name the collection for each created message or draft, and request only changes to visible state. Native records carry exactly their collection's schema fields. The stock `simple_agent.max_steps` reads the caller’s `AGENT_MAX_ASSISTANT_TURNS` selection (200 by default), matching the wrapper’s typed `runtime.agent_max_assistant_turns`. The context and response-token ceilings remain independent and can end an episode earlier. `workspace_parallel` preserves result order and each individual status; dependencies belong in separate calls.
+Catalog results contain API metadata. Task records and document contents must be fetched with requests. The server also retains `/workspace_accounts` for direct clients; it is not a fifth tool exposed in task rows.
 
-The tasks include onboarding, leave cover, ownership handoff, renewal arithmetic, territory reassignment, contact verification, payment reconciliation, expense thresholds, credit adjustments, file publication, redaction, indexes, message triage, deduplication, incident escalation and cross-store digests. Variants change task namespace, business values and boundary cases, record count, physical account placement, vendor dialects and distractors. The source contains no external task corpus, model-generated task text or benchmark-derived inputs. Names, addresses, documents and tools are authored in a `gw_` fictional namespace. `ROOT_SEED`, task IDs and source hashes define immutable V4 construction; changes to constructed tasks or worlds require a new revision. Grader fixes are separately bound by the locked engine source hash and invalidate earlier source qualification.
+There are 18 fictional vendors: three in each domain. Each task connects two per domain and distributes records across them. Vendors share business concepts but use different URL prefixes, collection names and field aliases. Calling a disconnected account returns 401; schema discovery does not connect it.
 
-The server reconstructs initial state and goals from canonical task IDs. Callers cannot supply initial records, goals, rewards or grader scripts. Each native cookie owns one independent world; one resource worker owns that state. Reseeding restores deterministic state, close releases it, and old outstanding calls retain only the old detached world. Per-session atomic operations make concurrent calls safe. The server bounds active sessions and returns503 when capacity is exhausted.
+An approved JSON policy document in the file store supplies business values and record-placement rules. A marked superseded policy is a distractor. Records are spread across a domain’s two connected vendors and paginate, so the agent combines results across vendors and pages.
 
-Verification compares final persisted records against the immutable goal state. It checks changed fields, preserved records/fields, required new objects and required deletions; generated create IDs and action order do not affect grading. Created text-file contents and chat/draft bodies allow LF/CRLF line endings and one terminal newline; other content, fields and preserved records remain exact. Extra records or unrelated changes fail. A textual success claim or fabricated action transcript earns nothing. Native verification closes its world after scoring; retrospective replay without state is unsupported. The RLTasks provider adapter projects this same score and closes through its existing lifecycle contract.
+## How tasks are built
 
-Prepare train/validation rows through RLTasks' existing `core.prepare.prepare` codec, using the hash-bound specs in `envs/api_workspace/spec/`. The prepared rows contain prompts, tools and canonical IDs; grader goals stay server-side. Five examples are committed for smoke tests. Bind a prepared train JSONL through the existing dataset-path override below; the default is those five examples. Local files need no registry credentials. Prepare the smoke input in a writable output directory: Gym writes dataset metrics next to the JSONL. The environment uses the wrapper-pinned Gym agent/resource binding and service lifecycle.
+[scenarios.py](scenarios.py) defines 30 workflow templates authored in code and deterministic world construction. A task ID, root seed and V4 source determine the prompt, initial records, policy document and expected changes. Variants change values, names, record counts, vendor connections, placement and instruction layout. Construction uses no model calls or external task corpus.
+
+TRAIN contains 80 variants per family (**2,400 tasks**); VAL contains eight (**240 tasks**). VAL has different seeds but shares TRAIN templates. It is an instance-validation split, not evidence of transfer to unseen workflow families. The pilot selects one TRAIN variant per family.
+
+[RLTasks’ API Workspace codec](https://github.com/Zyphra/rl_tasks/tree/wrapper/envs/api_workspace) prepares rows containing the prompt, four tools and canonical task ID. Expected changes remain server-side. The specs lock source and prompt versions. This source rejects task IDs from other revisions, so prepared data and source must come from the same revision.
+
+## Scoring
+
+[Workspace.score](engine.py) returns **1 for a correct final state and 0 otherwise**. It checks required field updates, deletions and creations, and preservation of unrelated records and fields. Any missing or extra change to the final state fails. Action order and generated IDs for created records do not affect the score.
+
+New file contents and message/draft bodies allow CRLF/LF and one trailing newline; other content and preserved records are exact. Scoring uses stored state, with no model judge. Training cost penalties belong to the consuming run.
+
+## Request and session behavior
+
+- Supply the exact API `path`, query `params` and write `body` separately. Embedded query strings in paths are rejected. Amounts are integer cents.
+- `params` and `body` accept JSON objects, serialized JSON objects or null; malformed containers return validation errors.
+- List/search requests default to **three records per page** and return `next_cursor`. Reuse cursors only with the same vendor, collection and query. Catalog pagination uses `offset`/`next_offset` instead.
+- `POST` requires an idempotency key. Identical retries return the same object; conflicting reuse returns 409. `PATCH` and `DELETE` use item paths.
+- A batch is not atomic: each request succeeds or fails on its own, results return in input order, and all requests share the world’s session lock. Put dependent operations in separate calls.
+- Each session cookie owns an isolated world reconstructed from its task ID. Reseeding resets it. Native verification scores and closes it; the RLTasks provider exposes scoring and close separately.
+
+The stock `simple_agent` limit is `AGENT_MAX_ASSISTANT_TURNS` (**200** when unset), which the wrapper sets from `runtime.agent_max_assistant_turns`. It counts model turns. Context and response-token limits can end an episode earlier.
+
+## Run and inspect
+
+Prepare a dataset using the [RLTasks instructions](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/api_workspace/README.md#prepare-and-run), then use a writable output directory:
 
 ```bash
 gym env test --resources-server api_workspace
@@ -27,8 +57,8 @@ gym eval run --config resources_servers/api_workspace/configs/api_workspace.yaml
   "++api_workspace_agent.responses_api_agents.simple_agent.datasets=[{name:authored_train,type:train,jsonl_fpath:$API_WORKSPACE_DATA_JSONL,license:Apache\ 2.0}]"
 ```
 
-Callers own model sampling, token/context budgets, endpoints and credentials. The quoted output-token setting is a smoke-test invocation, not a change to another lane. Native tests cover full-corpus gold/no-op/tamper state, HTTP401 recovery, strict paths/params, pagination/cursor scope, idempotency, concurrency, reset/close and the actual stock agent tool cycle. These source controls do not establish model success, transfer, training readiness or production adoption; real model rollouts must also be inspected before qualification.
+The config’s default dataset is five example rows. The override above selects prepared rows. Sampling and the output-token value are settings for this example invocation.
 
-The five committed example rows are V4 prompts for smoke tests; no V4 model rollouts are committed. The native source tests include an independent SQL reference derived from visible instructions and initial records without reading the generator's gold operations. Gold, no-op and valid-but-wrong final-state controls remain separate from model calibration.
+Tests in [tests/](tests/) cover goal replay, wrong-state controls, preservation, schemas, API errors and session behavior. Inspect real rollouts for discoverability and answerability; mechanical checks do not establish learnability or transfer.
 
-The RLTasks `spec/pilot.json` selects one canonical variant per family through the same native codec and publisher, producing 30 tasks. V4 reviewed tasks do not require an N4 pass-rate check. The 240 VAL identities use the same construction templates as TRAIN and support in-run validation; they are not a held-out transfer evaluation. Keep VAL out of TRAIN and use independently selected suites for held-out claims.
+Reviewed V4 TRAIN tasks are selected without a policy pass-rate prerequisite. Current model results, mixture choices and production adoption are owned by the consuming run; keep VAL out of TRAIN.
