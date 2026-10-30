@@ -3,6 +3,7 @@
 """Boundary and preservation controls for real HTTP error/status contracts."""
 
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -268,3 +269,17 @@ def test_native_local_dataset_binding_needs_no_registry_credentials(tmp_path):
         ),
         instances,
     )
+
+
+@pytest.mark.parametrize("selected", [None, 200, 73])
+def test_native_agent_turn_limit_follows_caller_selection(monkeypatch, selected):
+    from responses_api_agents.simple_agent.app import SimpleAgentConfig
+
+    if selected is None:
+        monkeypatch.delenv("AGENT_MAX_ASSISTANT_TURNS", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_MAX_ASSISTANT_TURNS", str(selected))
+    config = OmegaConf.load(Path(__file__).parents[1] / "configs/api_workspace.yaml")
+    values = OmegaConf.to_container(config.api_workspace_agent.responses_api_agents.simple_agent, resolve=True)
+    agent = SimpleAgentConfig(host="127.0.0.1", port=9997, name="api_workspace_agent", **values)
+    assert agent.max_steps == (selected if selected is not None else 200)
