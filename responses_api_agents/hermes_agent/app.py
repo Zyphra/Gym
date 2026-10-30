@@ -376,6 +376,10 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
     checkpoints_enabled: bool = False
+    # Hermes' own `mcp_servers` config (tools/mcp_tool.py): stdio or URL servers whose tools Hermes
+    # registers beside its built-ins. A benchmark that ships its tools as an MCP server selects it
+    # here; the mapping is written to config.yaml unchanged. Absent by default.
+    mcp_servers: Optional[dict[str, dict[str, Any]]] = None
     # Offer OpenHands' `finish(message)` tool; the turn that calls it ends the run as completed.
     finish_tool: bool = False
 
@@ -519,6 +523,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 "enabled": self.config.checkpoints_enabled,
             },
         }
+        if self.config.mcp_servers:
+            config["mcp_servers"] = self.config.mcp_servers
         if self.config.context_window is not None:
             config["model"] = {"default": self._model_name(), "context_length": self.config.context_window}
             reserve = self.config.max_tokens or 0
@@ -543,6 +549,12 @@ class HermesAgent(SimpleResponsesAPIAgent):
         with open(os.path.join(hermes_home, "config.yaml"), "w") as _f:
             _f.write(self._build_config())
         os.environ["HERMES_HOME"] = hermes_home
+        if self.config.mcp_servers:
+            # Hermes discovers MCP servers when `model_tools` is first imported, which is before this
+            # config exists; discovery is idempotent, so run it again against the config just written.
+            from tools.mcp_tool import discover_mcp_tools  # pyright: ignore[reportMissingImports]
+
+            discover_mcp_tools()
 
     def _model_name(self) -> str:
         return self.config.model or str(self.config.model_server.name)
