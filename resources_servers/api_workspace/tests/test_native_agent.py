@@ -48,15 +48,25 @@ def resource_http(app):
 
 
 @pytest.mark.asyncio
-async def test_native_agent_recovers_401_and_completes_world_without_mask(monkeypatch):
+@pytest.mark.parametrize("probe", ["unconnected_vendor", "absent_filter_field"])
+async def test_native_agent_recovers_tool_queries_and_completes_world_without_mask(monkeypatch, probe):
     monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
     transport = server_utils.set_global_aiohttp_client(server_utils.GlobalAIOHTTPAsyncClientConfig())
     native = server()
     identity = "api-workspace-v4:train:hr_location:0000"
     scenario = scenario_from_id(identity)
     unavailable = next(v for v in VENDORS.values() if v.function == "hr" and v.name not in scenario.connected)
+    connected = next(VENDORS[name] for name in scenario.connected if VENDORS[name].function == "hr")
+    first_call = {"vendor": unavailable.name, "method": "GET", "path": unavailable.path("employees")}
+    if probe == "absent_filter_field":
+        first_call = {
+            "vendor": connected.name,
+            "method": "GET",
+            "path": connected.path("employees"),
+            "params": {"filters": {connected.field("manager"): "middle"}},
+        }
     stages = [
-        [("workspace_request", {"vendor": unavailable.name, "method": "GET", "path": unavailable.path("employees")})],
+        [("workspace_request", first_call)],
         [("workspace_accounts", {"function": "hr", "connected_only": True})],
         [
             ("workspace_schema", {"vendor": name})
@@ -123,7 +133,9 @@ async def test_native_agent_recovers_401_and_completes_world_without_mask(monkey
     await model_site.start()
     model_port = model_site._server.sockets[0].getsockname()[1]
     try:
-        with resource_http(native.setup_webserver()) as resource_port:
+        app = native.setup_webserver()
+        native.setup_exception_middleware(app)
+        with resource_http(app) as resource_port:
             config = OmegaConf.create(
                 {
                     "resources": {
@@ -150,7 +162,7 @@ async def test_native_agent_recovers_401_and_completes_world_without_mask(monkey
                 ),
                 server_client=client,
             )
-            response, trace, _, _ = await agent._create_episode(
+            response, trace, _, resource_cookies = await agent._create_episode(
                 NeMoGymResponseCreateParamsNonStreaming(input=[{"role": "user", "content": scenario.prompt}]),
                 model_url_path="/v1/responses",
                 resources_server_cookies=seed.cookies,
@@ -159,11 +171,30 @@ async def test_native_agent_recovers_401_and_completes_world_without_mask(monkey
             )
             assert len(received) == 5
             tool_outputs = [item for item in received[1]["input"] if item.get("type") == "function_call_output"]
-            assert json.loads(tool_outputs[0]["output"])["status"] == 401
-            assert trace.tool_calls[0].error_type == "http_401"
+            tool_result = json.loads(tool_outputs[0]["output"])
+            if probe == "unconnected_vendor":
+                assert tool_result["status"] == 401
+                assert trace.tool_calls[0].error_type == "http_401"
+            else:
+                assert tool_result["status"] == 200
+                assert tool_result["items"] == []
+                assert trace.tool_calls[0].error_type is None
             assert trace.invocations[0].status == "completed"
             assert response.output[-1].type == "message"
             assert next(iter(native._sessions.values())).world.score()["reward"] == 1.0
+            verified = await client.post(
+                "resources",
+                "/verify",
+                json={
+                    "task_id": identity,
+                    "responses_create_params": {"input": []},
+                    "response": response.model_dump(mode="json"),
+                },
+                cookies=resource_cookies,
+            )
+            assert verified.status == 200
+            assert (await verified.json())["reward"] == 1.0
+            assert not native._sessions
     finally:
         await model_runner.cleanup()
         await transport.close()
