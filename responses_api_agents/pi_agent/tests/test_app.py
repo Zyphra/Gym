@@ -17,7 +17,10 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -577,3 +580,97 @@ class TestConfigYaml:
         assert inner["entrypoint"] == "app.py"
         assert inner["concurrency"] == 8
         assert inner["command"] == "pi"
+
+
+class TestInstructionDelivery:
+    """A real child process stands in for the Pi CLI and records what it was given."""
+
+    @staticmethod
+    async def _run(tmp_path, instruction, collect_observations):
+        recorder = tmp_path / "pi"
+        record = tmp_path / "record.json"
+        recorder.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"json.dump({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}, open({str(record)!r}, 'w'))\n"
+        )
+        recorder.chmod(0o755)
+        agent = _make_agent(command=str(recorder), working_directory=str(tmp_path))
+        with (
+            patch.object(agent, "_write_pi_config"),
+            patch.object(agent, "_workspace_root", return_value=tmp_path / "w"),
+        ):
+            (tmp_path / "w").mkdir()
+            result = await agent._run_pi(instruction, None, collect_observations=collect_observations)
+        assert result.return_code == 0
+        return json.loads(record.read_text())
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("collect_observations", [True, False])
+    @pytest.mark.parametrize(
+        "instruction", ["--install-types does not work with --python-executable", "-v flag crashes", "@file is broken"]
+    )
+    async def test_cli_syntax_instruction_arrives_on_stdin(self, tmp_path, instruction, collect_observations):
+        seen = await self._run(tmp_path, instruction, collect_observations)
+        assert seen["stdin"] == instruction
+        assert instruction not in seen["argv"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("collect_observations", [True, False])
+    async def test_ordinary_instruction_stays_positional(self, tmp_path, collect_observations):
+        seen = await self._run(tmp_path, "Fix the bug --carefully", collect_observations)
+        assert seen["argv"][-1] == "Fix the bug --carefully"
+        assert seen["stdin"] == ""
+
+    @pytest.mark.asyncio
+    async def test_large_instruction_does_not_block_on_the_pipe(self, tmp_path):
+        instruction = "-" + "x" * (1024 * 1024)
+        assert (await self._run(tmp_path, instruction, True))["stdin"] == instruction
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not os.environ.get("TASK_STOCK_PI_RUNTIME"), reason="native Pi runtime not supplied")
+    async def test_native_cli_receives_the_instruction_verbatim(self, tmp_path) -> None:
+        requests = []
+
+        class Model(BaseHTTPRequestHandler):
+            def do_POST(self):
+                requests.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                chunk = {"id": "1", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "done"}}]}
+                stop = {"id": "1", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                for data in (json.dumps(chunk), json.dumps(stop), "[DONE]"):
+                    self.wfile.write(f"data: {data}\n\n".encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Model)
+        Thread(target=server.serve_forever, daemon=True).start()
+        instruction = "--install-types does not work with --python-executable\n\nReproduce with mypy."
+        runtime = Path(os.environ["TASK_STOCK_PI_RUNTIME"])
+        (tmp_path / "w").mkdir()
+        agent = _make_agent(
+            command=f"{runtime}/bin/node {runtime}/bin/pi",
+            working_directory=str(tmp_path),
+            model="fixture/fixture-policy",
+            models_config={
+                "providers": {
+                    "fixture": {
+                        "baseUrl": f"http://127.0.0.1:{server.server_port}/v1",
+                        "apiKey": "unused",
+                        "api": "openai-completions",
+                        "models": [{"id": "fixture-policy"}],
+                    }
+                }
+            },
+        )
+        try:
+            with patch.object(agent, "_workspace_root", return_value=tmp_path / "w"):
+                result = await agent._run_pi(instruction, None)
+        finally:
+            server.shutdown()
+        assert result.return_code == 0
+        user = [message["content"] for message in requests[0]["messages"] if message["role"] == "user"]
+        assert instruction in json.dumps(user, ensure_ascii=False).replace("\\n", "\n")

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -153,6 +154,13 @@ def parse_pi_events(stdout: str | bytes) -> tuple[list[Any], dict[str, int]]:
             )
 
     return output_items, {"input_tokens": input_tokens, "output_tokens": output_tokens}
+
+
+async def _write_stdin(stream: asyncio.StreamWriter, data: bytes) -> None:
+    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+        stream.write(data)
+        await stream.drain()
+    stream.close()
 
 
 async def _read_pi_stdout(stream: asyncio.StreamReader) -> tuple[str, list[tuple[float, dict[str, Any]]]]:
@@ -605,13 +613,17 @@ class PiAgent(SimpleResponsesAPIAgent):
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
         cmd += self.config.extra_args
-        cmd.append(instruction)
+        # Pi's argument parser has no end-of-options marker: a positional starting with "-" is an option and one
+        # starting with "@" a file reference, whatever the task text says. Such an instruction arrives on stdin.
+        piped_instruction = instruction.encode() if instruction.startswith(("-", "@")) else None
+        if piped_instruction is None:
+            cmd.append(instruction)
 
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=self.config.working_directory or str(work_dir),
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL if piped_instruction is None else asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
@@ -619,6 +631,11 @@ class PiAgent(SimpleResponsesAPIAgent):
             assert proc.stdout is not None and proc.stderr is not None
             events: list[tuple[float, dict[str, Any]]] = []
             if collect_observations:
+                stdin_task = (
+                    None
+                    if piped_instruction is None
+                    else asyncio.create_task(_write_stdin(proc.stdin, piped_instruction))
+                )
                 stdout_task = asyncio.create_task(_read_pi_stdout(proc.stdout))
                 stderr_task = asyncio.create_task(proc.stderr.read())
                 output_task = asyncio.gather(stdout_task, stderr_task, proc.wait())
@@ -641,7 +658,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                         True,
                     )
             else:
-                output_task = asyncio.create_task(proc.communicate())
+                output_task = asyncio.create_task(proc.communicate(piped_instruction))
                 try:
                     stdout, stderr = await asyncio.wait_for(asyncio.shield(output_task), timeout=self.config.timeout)
                 except asyncio.TimeoutError:
@@ -659,6 +676,8 @@ class PiAgent(SimpleResponsesAPIAgent):
                         True,
                     )
 
+            if collect_observations and stdin_task is not None:
+                await stdin_task
             if proc.returncode not in (0, None):
                 LOG.warning("pi exited %d: %s", proc.returncode, stderr.decode(errors="replace")[:500])
             output_items, usage = parse_pi_events(stdout)
