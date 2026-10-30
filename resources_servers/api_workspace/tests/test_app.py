@@ -454,7 +454,8 @@ def test_created_message_and_draft_text_accepts_line_endings(family, collection,
     created["body"] = created["body"].replace("\n", line_ending) + line_ending
     assert world.score()["reward"] == 1
     # The exception applies only to created text, not preserved world contents.
-    preserved = next(iter(world.records[goal["vendor"]][collection][key] for key in original))
+    preserved_id = next(iter(scenario.records[goal["vendor"]]["messages"]))
+    preserved = world.records[goal["vendor"]]["messages"][preserved_id]
     preserved["body"] += "\n"
     assert world.score()["reward"] == 0
 
