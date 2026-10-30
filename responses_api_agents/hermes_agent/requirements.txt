@@ -1,2 +1,2 @@
 -e nemo-gym[dev] @ ../../
-hermes-agent @ git+https://github.com/Zyphra/hermes-agent@85a3dfb182f30b2261a035c1611deb51df657158
+hermes-agent @ git+https://github.com/Zyphra/hermes-agent@0877d91f005451b1a0d801ad7c5ab91a05131e9a

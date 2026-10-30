@@ -111,3 +111,12 @@ summary tokens. Thinking and the visible-summary target remain unchanged;
 `compression_target_ratio` only controls recent-tail retention. Choose an output
 budget that fits the policy model's context window together with the summary input.
 Requires the Hermes runtime's summary-output-budget configuration support.
+
+## Local command output budget
+
+The pinned Hermes source bounds command output while it drains the process.
+Above 64 MiB it kills the owned command group and returns exit125 with a bounded
+head/tail observation, so runaway output cannot keep growing the agent's buffer.
+Finite file-operation reads remain complete within that budget; terminal display
+keeps its existing presentation limit. Existing sealed runtime archives need to
+be rebuilt and selected explicitly to consume this source change.
