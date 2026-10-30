@@ -405,6 +405,8 @@ class Workspace:
             if q.casefold() not in canonical_json(row).casefold():
                 return False
             for key, condition in filters.items():
+                if key not in row:
+                    return False
                 operator, value = next(iter(condition.items())) if isinstance(condition, dict) else ("eq", condition)
                 actual = row[key]
                 if not {
