@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import json
 from collections import Counter
 from typing import Dict, List
@@ -122,6 +123,14 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
         "customer_relationship_manager",
     ]
     tool_env = get_tools(toolkits)
+    initialize_effect_tracking(tool_env)
+    for action in actions:
+        execute_tracked_action(tool_env, action["name"], json.loads(action["arguments"]))
+    return tool_env
+
+
+def initialize_effect_tracking(tool_env):
+    """Capture seeded identities before the first live or replayed operation."""
     tool_env["stable_ids"] = {
         name: set(frame[id_column]) if id_column is not None else set()
         for name, (frame, id_column) in _state_tables(tool_env).items()
@@ -130,26 +139,32 @@ def execute_actions_and_reset_state(actions: List[Dict[str, str]]):
     # Every email an action sends, as sent. A later delete removes the row from
     # the mailbox, but the recipient already has the message, so grading keeps it.
     tool_env["sent_emails"] = []
+    tool_env["observations"] = []
 
-    # Execute the actions
-    for action in actions:
-        emails_before = set(tool_env["containers"]["email"]._emails["email_id"])
-        try:
-            tool_env["functions"][action["name"]](**json.loads(action["arguments"]))
-        except Exception as e:
-            print("Error executing tool: ", e)
+
+def execute_tracked_action(tool_env, name, arguments):
+    """Execute once and retain real effects, including writes before an error."""
+    emails_before = set(tool_env["containers"]["email"]._emails["email_id"])
+    try:
+        result = tool_env["functions"][name](**arguments)
+    except Exception as error:
+        result = f"Error executing tool '{name}': {error}"
+    finally:
         emails = tool_env["containers"]["email"]._emails
         tool_env["sent_emails"].extend(emails[~emails["email_id"].isin(emails_before)].to_dict(orient="records"))
         # Once a seeded record is removed, reusing its ID does not restore its
         # identity. Track this per replay so delete/create order can also vary.
-        for name, (frame, id_column) in _state_tables(tool_env).items():
-            if id_column is not None and action.get("name", "").startswith(name + "_"):
+        for table, (frame, id_column) in _state_tables(tool_env).items():
+            if id_column is not None:
                 # Canonicalization rejects non-scalar IDs. Keep them out of
                 # hash-based identity tracking so they reach that validation.
-                tool_env["stable_ids"][name].intersection_update(
+                tool_env["stable_ids"][table].intersection_update(
                     value for value in frame[id_column] if pd.api.types.is_scalar(value)
                 )
-    return tool_env
+    tool_env["observations"].append(
+        {"tool": name, "arguments": copy.deepcopy(arguments), "result": copy.deepcopy(result)}
+    )
+    return result
 
 
 def _state_tables(tool_env):
@@ -243,12 +258,24 @@ def is_correct(
     if error:
         return False
     predicted_env = execute_actions_and_reset_state(predicted_actions)
+    return state_matches_reference(predicted_env, ground_truth_actions, reject_noop_reference=reject_noop_reference)
+
+
+def state_matches_reference(predicted_env, ground_truth_actions, *, reject_noop_reference=False):
+    """Compare server-owned final tables to a fresh reference replay.
+
+    Submitted action lists and assistant reports cannot create predicted effects.
+    Missing session tracking is an unavailable verifier, never inferred success.
+    """
+    if "stable_ids" not in predicted_env or "sent_emails" not in predicted_env:
+        raise ValueError("session effect tracking is unavailable")
     reference_env = execute_actions_and_reset_state(ground_truth_actions)
+    requested_fields = _reference_update_fields(reference_env)
+    seed_env = execute_actions_and_reset_state([])
+    seed = _state_tables(seed_env)
     predicted = _state_tables(predicted_env)
     reference = _state_tables(reference_env)
     if reject_noop_reference:
-        seed_env = execute_actions_and_reset_state([])
-        seed = _state_tables(seed_env)
         unchanged = True
         for name, (reference_frame, id_column) in reference.items():
             expected = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
@@ -263,7 +290,54 @@ def is_correct(
         reference_rows = _canonical_rows(reference_frame, id_column, reference_env["stable_ids"][name], name)
         if predicted_rows is None or reference_rows is None or predicted_rows != reference_rows:
             return False
+        if id_column is not None and not _preserves_reference_untouched_fields(
+            predicted[name][0],
+            reference_frame,
+            seed[name][0],
+            id_column,
+            reference_env["stable_ids"][name],
+            requested_fields.get(name, {}),
+        ):
+            return False
     # The final mailbox hides a wrong email that was sent and then deleted.
     predicted_sent = _sent_email_rows(predicted_env)
     reference_sent = _sent_email_rows(reference_env)
     return predicted_sent is not None and reference_sent is not None and predicted_sent == reference_sent
+
+
+def _reference_update_fields(reference_env):
+    targets = {
+        "calendar_update_event": ("calendar", "event_id"),
+        "project_management_update_task": ("project_management", "task_id"),
+        "customer_relationship_manager_update_customer": ("customer_relationship_manager", "customer_id"),
+    }
+    requested = {}
+    for observation in reference_env["observations"]:
+        target = targets.get(observation["tool"])
+        if target is not None:
+            name, key = target
+            args = observation["arguments"]
+            requested.setdefault(name, {}).setdefault(args.get(key), set()).add(args.get("field"))
+    return requested
+
+
+def _preserves_reference_untouched_fields(predicted, reference, seed, id_column, stable_ids, requested_fields):
+    """Unrequested changes cannot hide behind normalization of requested writes."""
+    if predicted[id_column].duplicated().any():
+        return False
+    ids = reference.loc[reference[id_column].isin(stable_ids), id_column]
+    if not ids.isin(predicted[id_column]).all():
+        return False
+    expected = reference.set_index(id_column).loc[ids]
+    initial = seed.set_index(id_column).loc[ids]
+    actual = predicted.set_index(id_column).loc[ids]
+    unchanged = expected.eq(initial) | (expected.isna() & initial.isna())
+    # An explicitly requested idempotent update can leave the seed unchanged.
+    # Its equivalent validated spellings still use the ordinary comparison.
+    for identity, fields in requested_fields.items():
+        if identity in unchanged.index:
+            for field in fields:
+                if field in unchanged.columns:
+                    unchanged.loc[identity, field] = False
+    matches = actual.eq(expected) | (actual.isna() & expected.isna())
+    return bool((matches | ~unchanged).all(axis=None))

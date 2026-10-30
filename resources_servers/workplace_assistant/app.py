@@ -27,7 +27,12 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY
-from resources_servers.workplace_assistant.utils import get_tools, is_correct
+from resources_servers.workplace_assistant.utils import (
+    execute_tracked_action,
+    get_tools,
+    initialize_effect_tracking,
+    state_matches_reference,
+)
 
 
 class WorkbenchResourcesServerConfig(BaseResourcesServerConfig):
@@ -88,6 +93,7 @@ class WorkbenchResourcesServer(SimpleResourcesServer):
             "customer_relationship_manager",
         ]
         self.session_id_to_tool_env[session_id] = get_tools(toolkits)
+        initialize_effect_tracking(self.session_id_to_tool_env[session_id])
         return BaseSeedSessionResponse()
 
     async def route_to_python_function(self, path: str, body: WorkbenchRequest, request: Request) -> WorkbenchResponse:
@@ -104,8 +110,7 @@ class WorkbenchResourcesServer(SimpleResourcesServer):
         args = {key: value for key, value in body.model_dump(exclude_unset=True).items() if value is not None}
 
         try:
-            function = tool_env["functions"][path]
-            result = function(**args)
+            result = execute_tracked_action(tool_env, path, args)
             return WorkbenchResponse(output=result)
         except Exception as e:
             return WorkbenchResponse(
@@ -115,34 +120,13 @@ class WorkbenchResourcesServer(SimpleResourcesServer):
     async def verify(self, request: Request, body: WorkbenchVerifyRequest) -> WorkbenchVerifyResponse:
         session_id = request.session[SESSION_ID_KEY]
         try:
-            ground_truth = body.ground_truth
-            response = body.response.output
-
-            total_score = 0.0
-
-            # Convert list of ResponseFunctionToolCall objects into list of dictionaries
-            predicted_function_calls = []
-
-            for message in response:
-                if message.type == "function_call":
-                    predicted_function_calls.append(message.model_dump())
-
-            predicted_chat_content = []
-
-            for message in response:
-                if message.type == "output_text":
-                    predicted_chat_content.append(message.model_dump())
-
-            total_score += (
-                is_correct(
-                    predicted_function_calls,
-                    ground_truth,
-                    None,
-                    reject_noop_reference=self.config.reject_noop_reference,
-                )
-                * 1.0
+            tool_env = self.session_id_to_tool_env.get(session_id)
+            if tool_env is None:
+                raise HTTPException(status_code=409, detail="Session state unavailable for effect verification")
+            reward = state_matches_reference(
+                tool_env, body.ground_truth, reject_noop_reference=self.config.reject_noop_reference
             )
-            return WorkbenchVerifyResponse(**body.model_dump(), reward=total_score)
+            return WorkbenchVerifyResponse(**body.model_dump(), reward=float(reward))
         finally:
             self.session_id_to_tool_env.pop(session_id, None)
 
