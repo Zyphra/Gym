@@ -438,3 +438,36 @@ def test_instructions_name_literal_values_and_spaced_numbers():
 def test_previous_revision_identities_are_not_constructed():
     with pytest.raises(ValueError):
         scenario_from_id("api-workspace-v3:train:hr_onboarding:0000")
+
+
+@pytest.mark.parametrize("family,collection", [("mail_reply", "drafts"), ("chat_roster", "messages")])
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_created_message_and_draft_text_accepts_line_endings(family, collection, line_ending):
+    scenario = scenario_from_id(f"api-workspace-v4:train:{family}:0000")
+    world = Workspace(scenario)
+    for call in gold_calls(scenario):
+        world.request(**call)
+    assert world.score()["reward"] == 1
+    goal = next(goal for goal in scenario.creates if goal["collection"] == collection)
+    original = scenario.records[goal["vendor"]][collection]
+    created = next(row for key, row in world.records[goal["vendor"]][collection].items() if key not in original)
+    created["body"] = created["body"].replace("\n", line_ending) + line_ending
+    assert world.score()["reward"] == 1
+    # The exception applies only to created text, not preserved world contents.
+    preserved = next(iter(world.records[goal["vendor"]][collection][key] for key in original))
+    preserved["body"] += "\n"
+    assert world.score()["reward"] == 0
+
+
+@pytest.mark.parametrize("family,collection", [("mail_reply", "drafts"), ("chat_roster", "messages")])
+@pytest.mark.parametrize("suffix", ["\n\n", " ", "\nextra"])
+def test_created_message_and_draft_text_rejects_content_changes(family, collection, suffix):
+    scenario = scenario_from_id(f"api-workspace-v4:train:{family}:0000")
+    world = Workspace(scenario)
+    for call in gold_calls(scenario):
+        world.request(**call)
+    goal = next(goal for goal in scenario.creates if goal["collection"] == collection)
+    original = scenario.records[goal["vendor"]][collection]
+    created = next(row for key, row in world.records[goal["vendor"]][collection].items() if key not in original)
+    created["body"] += suffix
+    assert world.score()["reward"] == 0

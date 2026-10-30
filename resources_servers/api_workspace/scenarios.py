@@ -56,7 +56,8 @@ FAMILIES = (
 )
 SYSTEM_PROMPT = """You are working in a fictional workspace containing simulated business records.
 The available tools provide an API catalog, vendor schemas and HTTP requests.
-You have at most 50 model turns. Completion is determined by the resulting workspace state.
+Follow the current workspace operating policy, including its rules for placing new records.
+Completion is determined by the resulting workspace state within the available turn and context budget.
 """
 
 

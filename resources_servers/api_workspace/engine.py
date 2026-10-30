@@ -160,10 +160,11 @@ def canonical_json(value: Any) -> str:
 
 
 def _creation_for_score(collection: str, row: dict[str, Any]) -> str:
-    # Text-file tasks specify lines, not an operating-system line ending or
+    # Created text specifies lines, not an operating-system line ending or
     # whether the last line has a terminator. Preserve every other character.
-    if collection == "files" and isinstance(row.get("content"), str):
-        row = {**row, "content": row["content"].replace("\r\n", "\n").removesuffix("\n")}
+    text_field = "content" if collection == "files" else "body" if collection in {"drafts", "messages"} else None
+    if text_field is not None and isinstance(row.get(text_field), str):
+        row = {**row, text_field: row[text_field].replace("\r\n", "\n").removesuffix("\n")}
     return canonical_json(row)
 
 
