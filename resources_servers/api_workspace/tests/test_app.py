@@ -268,7 +268,7 @@ def test_corpus_split_prompt_authority_and_noncanonical_ids():
     assert len(task_ids("val")) == 240
     assert not set(task_ids("train")) & set(task_ids("val"))
     row = row_from_id(task_ids("train")[0])
-    assert "50 model turns" in row["responses_create_params"]["input"][0]["content"]
+    assert "available turn and context budget" in row["responses_create_params"]["input"][0]["content"]
     assert not {"records", "updates", "creates", "deletes", "goals"} & row.keys()
     for identity in (
         "api-workspace-v4:train:hr_onboarding:0",
@@ -427,7 +427,8 @@ def test_contact_verification_requests_a_new_verified_address():
 
 def test_instructions_name_literal_values_and_spaced_numbers():
     assert (
-        "at most 50 model turns" in row_from_id(task_ids("train")[0])["responses_create_params"]["input"][0]["content"]
+        "Follow the current workspace operating policy"
+        in row_from_id(task_ids("train")[0])["responses_create_params"]["input"][0]["content"]
     )
     for identity in task_ids("train"):
         prompt = scenario_from_id(identity).prompt
@@ -440,7 +441,7 @@ def test_previous_revision_identities_are_not_constructed():
         scenario_from_id("api-workspace-v3:train:hr_onboarding:0000")
 
 
-@pytest.mark.parametrize("family,collection", [("mail_reply", "drafts"), ("chat_roster", "messages")])
+@pytest.mark.parametrize("family,collection", [("mail_reply", "drafts"), ("crm_pipeline", "messages")])
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
 def test_created_message_and_draft_text_accepts_line_endings(family, collection, line_ending):
     scenario = scenario_from_id(f"api-workspace-v4:train:{family}:0000")
@@ -460,7 +461,7 @@ def test_created_message_and_draft_text_accepts_line_endings(family, collection,
     assert world.score()["reward"] == 0
 
 
-@pytest.mark.parametrize("family,collection", [("mail_reply", "drafts"), ("chat_roster", "messages")])
+@pytest.mark.parametrize("family,collection", [("mail_reply", "drafts"), ("crm_pipeline", "messages")])
 @pytest.mark.parametrize("suffix", ["\n\n", " ", "\nextra"])
 def test_created_message_and_draft_text_rejects_content_changes(family, collection, suffix):
     scenario = scenario_from_id(f"api-workspace-v4:train:{family}:0000")
