@@ -1470,6 +1470,47 @@ class TestProcessSingleDatapoint:
         assert metrics["mask_sample"] is False
         sandbox.stop.assert_awaited_once()
 
+    @pytest.mark.parametrize(
+        "text,fractional,expected_reward,unreadable",
+        [
+            ("0.5", False, 1.0, False),
+            ("0.5", True, 0.5, False),
+            ("1.0", True, 1.0, False),
+            ("0", True, 0.0, False),
+            ("1.5", True, 0.0, True),
+            ("-0.1", True, 0.0, True),
+            ("nan", True, 0.0, True),
+        ],
+    )
+    async def test_fractional_reward_is_reported_only_when_selected(
+        self, tmp_path: Path, text, fractional, expected_reward, unreadable
+    ) -> None:
+        cfg = _make_instance_config(tmp_path, fractional_reward=fractional)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.verifier_dir / "reward.txt").write_text(text)
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=verifier), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        metrics = app.TerminalBenchMetrics.model_validate_json(cfg.metrics_fpath.read_text())
+        assert metrics.verifier_reward_unreadable is unreadable
+        assert metrics.reward(fractional=fractional) == expected_reward
+
+    def test_fractional_reward_is_strict_and_default_off(self, tmp_path: Path) -> None:
+        assert _make_instance_config(tmp_path).fractional_reward is False
+        with pytest.raises(ValidationError, match="fractional_reward"):
+            _make_instance_config(tmp_path, fractional_reward="true")
+
+    def test_fractional_timeout_failure_scores_zero(self) -> None:
+        metrics = app.TerminalBenchMetrics(resolved=True, verifier_reward=0.5, agent_timed_out=True)
+        metrics.apply_timeout_policy(agent_timeout_is_failure=True)
+        assert metrics.reward(fractional=True) == 0.0
+
     async def test_unresolved_when_no_reward_file(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path)
         sandbox = SimpleNamespace(
