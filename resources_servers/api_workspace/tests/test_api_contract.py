@@ -136,8 +136,12 @@ def test_missing_schema_field_does_not_match_or_mutate(condition):
         identity = next(iter(employees))
         patched = client.post(
             "/workspace_request",
-            json={"vendor": vendor.name, "method": "PATCH", "path": vendor.path("employees", identity),
-                  "body": {vendor.field("manager"): "middle"}},
+            json={
+                "vendor": vendor.name,
+                "method": "PATCH",
+                "path": vendor.path("employees", identity),
+                "body": {vendor.field("manager"): "middle"},
+            },
         )
         assert patched.status_code == 200
         original = canonical_json(world.records)
