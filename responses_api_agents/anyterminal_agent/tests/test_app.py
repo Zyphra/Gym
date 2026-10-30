@@ -1330,6 +1330,43 @@ def test_harness_oom_requires_both_process_exit_and_kernel_event(harness_exit, o
 
 
 class TestProcessSingleDatapoint:
+    @pytest.mark.parametrize("phase", ["create", "exec", "close", "exec-and-close"])
+    async def test_sandbox_exception_is_persisted_with_original_disposition(self, tmp_path: Path, phase) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+        message = "image environment snapshot failed: error_type='timeout'; timed out after 60s"
+
+        class FailingProvider:
+            async def create(self, spec):
+                if phase == "create":
+                    raise RuntimeError(message)
+                return SandboxHandle(sandbox_id="box", provider_name="failure", raw=None)
+
+            async def exec(self, handle, command, **kwargs):
+                if phase in ("exec", "exec-and-close"):
+                    raise RuntimeError(message + ": " + "x" * 3000)
+                if "bash /tests/test.sh" in command:
+                    (cfg.verifier_dir / "reward.txt").write_text("1.0")
+                return SandboxExecResult("", "", 0)
+
+            async def close(self, handle):
+                if phase in ("close", "exec-and-close"):
+                    raise OSError("cleanup did not drain")
+
+            async def aclose(self):
+                pass
+
+        with patch(
+            "responses_api_agents.anyterminal_agent.app.AsyncSandbox",
+            side_effect=lambda provider, spec: AsyncSandbox(FailingProvider(), spec),
+        ), patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+            resolved = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["sandbox_failed"] is True and metrics["mask_sample"] is True
+        assert metrics["error_detail"].startswith("OSError: cleanup did not drain" if phase == "close" else "RuntimeError: " + message)
+        assert len(metrics["error_detail"]) <= 2000
+        assert resolved is (phase == "close")
+
     @pytest.fixture(autouse=True)
     def _no_real_provider(self):
         # AsyncSandbox is mocked below, so the provider it's built with is never used —
