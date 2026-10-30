@@ -1,7 +1,7 @@
 {
     "name": "example",
     "type": "example",
-    "jsonl_fpath": "/shared/home/rob/verl-wrapper-runs/fresh-wrapper-owner-20261018/a12-handoffs/api-workspace-d-v1/admission-20261028/observed-examples/example.jsonl",
+    "jsonl_fpath": "resources_servers/api_workspace/data/example.jsonl",
     "num_repeats": 1,
     "source": null,
     "gitlab_identifier": null,
@@ -17,10 +17,10 @@
     },
     "Json-dumped number of words (proxy for token count)": {
         "Total # non-null values": 5,
-        "Average": 345.8,
-        "Min": 339.0,
-        "Max": 354.0,
-        "Standard deviation": 6.42
+        "Average": 354.2,
+        "Min": 340.0,
+        "Max": 366.0,
+        "Standard deviation": 9.98
     },
     "Number of turns": {
         "Total # non-null values": 5,

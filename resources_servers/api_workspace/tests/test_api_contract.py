@@ -3,6 +3,7 @@
 """Boundary and preservation controls for real HTTP error/status contracts."""
 
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,7 +19,7 @@ from resources_servers.api_workspace.tests.test_app import gold_calls, server
 @pytest.fixture
 def http_world():
     native = server()
-    identity = "api-workspace-v3:train:acct_reconcile:0000"
+    identity = "api-workspace-v4:train:acct_reconcile:0000"
     with TestClient(native.setup_webserver()) as client:
         assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
         world = next(iter(native._sessions.values())).world
@@ -115,13 +116,15 @@ def test_missing_schema_field_does_not_match_or_mutate(condition):
     app = native.setup_webserver()
     # Production catches unexpected resource exceptions outside session handling.
     native.setup_exception_middleware(app)
-    identity = "api-workspace-v3:train:hr_location:0000"
+    identity = "api-workspace-v4:train:hr_location:0000"
     with TestClient(app) as client:
         assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
         world = next(iter(native._sessions.values())).world
         vendor = next(VENDORS[name] for name in world.scenario.connected if VENDORS[name].function == "hr")
         employees = world.records[vendor.name]["employees"]
-        assert employees and all("manager" not in row for row in employees.values())
+        # Native records carry every schema field; remove one to exercise records persisted without it.
+        for row in employees.values():
+            del row["manager"]
         request = {
             "vendor": vendor.name,
             "method": "GET",
@@ -216,7 +219,7 @@ def test_native_verify_scores_real_world_then_releases_it(http_world):
 def test_grader_rejects_wrong_valid_values_extra_collections_and_missing_rows():
     from resources_servers.api_workspace.engine import Workspace
 
-    scenario = scenario_from_id("api-workspace-v3:train:hr_location:0000")
+    scenario = scenario_from_id("api-workspace-v4:train:hr_location:0000")
     world = Workspace(scenario)
     for call in gold_calls(scenario):
         world.request(**call)
@@ -266,3 +269,17 @@ def test_native_local_dataset_binding_needs_no_registry_credentials(tmp_path):
         ),
         instances,
     )
+
+
+@pytest.mark.parametrize("selected", [None, 200, 73])
+def test_native_agent_turn_limit_follows_caller_selection(monkeypatch, selected):
+    from responses_api_agents.simple_agent.app import SimpleAgentConfig
+
+    if selected is None:
+        monkeypatch.delenv("AGENT_MAX_ASSISTANT_TURNS", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_MAX_ASSISTANT_TURNS", str(selected))
+    config = OmegaConf.load(Path(__file__).parents[1] / "configs/api_workspace.yaml")
+    values = OmegaConf.to_container(config.api_workspace_agent.responses_api_agents.simple_agent, resolve=True)
+    agent = SimpleAgentConfig(host="127.0.0.1", port=9997, name="api_workspace_agent", **values)
+    assert agent.max_steps == (selected if selected is not None else 200)
