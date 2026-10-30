@@ -114,6 +114,13 @@ SWE-bench and SWE-bench Multilingual use the official `make_test_spec` and
 `get_eval_report` path. R2E-Gym requires every fail-to-pass and pass-to-pass test
 to report `PASSED`.
 
+A configuration may set `swe_grader` to a trusted `module:function(instance, patch)` that
+returns `{"script": ..., "grade": callable(log) -> bool}`. AnySWE then runs the script
+(it must apply the patch and run the tests) in the grading sandbox and takes `grade(log)`
+as the verdict, instead of the pinned swebench's `make_test_spec` and `get_eval_report`.
+Use it for a dataset whose official grader differs from the pinned release. Unset keeps
+the default path.
+
 Resolved patches receive reward `1`; other completed attempts receive `0`.
 Agent timeouts, evaluation timeouts, sandbox failures, and accidental successes
 after max-iteration or context-window termination set `mask_sample=true`.
