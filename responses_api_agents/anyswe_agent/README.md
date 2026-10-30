@@ -1,22 +1,84 @@
-# anyswe_agent
+# AnySWE
 
-AnySWE runs a Gym agent inside a SWE task image, extracts its repository patch,
-and grades the patch in a fresh OpenSandbox environment. It supports SWE-bench,
-SWE-bench Multilingual, and R2E-Gym.
+AnySWE is the shared Gym runner for repository-repair tasks. The agent receives
+an issue and a repository at the task's base commit, edits the code inside the
+task image with its own harness, and submits a patch. The runner extracts the
+patch and grades it in a fresh sandbox with private tests; the verdict is the
+reward. The harness and the dataset are separate choices: running another
+harness over the same instances does not create a new task, and the dataset,
+not the harness, selects the grader.
 
-## Concurrency
+## Datasets and graders
 
-`concurrency: null` runs requests without an agent-level semaphore; the Pi and
-Hermes configs select it. Positive integer values keep a bounded semaphore.
-Zero and negative values are rejected rather than creating a permanently
-blocked queue. Other configurations retain the default 256 request limit.
-Sandbox resources and the model server retain their own admission controls.
+| Dataset (population) | Grader | Role and task binding |
+| --- | --- | --- |
+| SWE-bench Verified | Default path: pinned `swebench` 4.1.0 `make_test_spec` and `get_eval_report`. | Held-out evaluation. [Verified binding](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/swe/splits/swe_openhands/README.md); `prepare.py` below builds rows from `princeton-nlp/SWE-bench_Verified`. |
+| SWE-bench Multilingual (300-instance locked test split) | The RLTasks binding sets `swe_grader`: the dataset's own `eval_script` behind the patch-apply chain, scored with `swebench` 5.0.2 `get_eval_report`. | Evaluation only. [Binding](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/swe/splits/swebench_multilingual/README.md). |
+| R2E-Gym (dataset name contains `R2E-Gym`) | Built-in: the image's `run_tests.sh` (or the row's `eval_script`) runs under `pytest -rA`; every `FAIL_TO_PASS` and `PASS_TO_PASS` test must report `PASSED`, and the required list must be nonempty. | R2E test directories are removed from the agent sandbox before the agent starts. |
+| Scale-SWE (17,202 TRAIN tasks in the pinned source inventory) | `private_grader`: a verifier running the Prime-derived scorer; every expected test (`FAIL_TO_PASS` plus `PASS_TO_PASS`) must pass. | Training. Emitted rows are only the tasks named by an admitted-image authority map. [Binding](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/swe/splits/scale_swe/README.md). |
+| SWE-Gym (2,396 admitted issues; 7,188 rows = three harness copies) | `private_grader`: the pinned `swegym` builder, commands and parser, not `swebench`. Every `FAIL_TO_PASS` test must be `PASSED`; `XFAIL` does not count. | Training. [Binding](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/swe/splits/swe_gym/README.md). |
+
+Counts describe each source's locked inventory or recipe, not the rows a given
+run samples. For each rollout AnySWE picks the first matching grader: a
+configured `private_grader`, then an R2E-Gym dataset name, then a configured
+`swe_grader`, then the default SWE-bench path.
+
+## How a rollout is scored
+
+1. **Agent.** The harness runs inside the task image. Before it starts, the
+   runner snapshots the repository, including changes already present in the
+   image. Afterwards it emits `git diff --binary` against that snapshot, with
+   untracked files included, so the submitted patch holds only the agent's edits.
+2. **Grading.** A nonempty patch goes to a fresh grading sandbox, where the
+   dataset's private tests run; they are kept from the agent. The default
+   SWE-bench and R2E paths apply the patch with `git apply`, then `--reject`,
+   then `patch --fuzz=5`; a private grader applies it in its own command. An
+   empty patch is not graded and earns `0`.
+3. **Reward.** Resolved patches receive reward `1`; other completed attempts
+   receive `0`. An integrity violation reported by the sandbox policy forces
+   `resolved=false`.
+4. **Masks.** `mask_sample=true` marks outcomes that say nothing about the
+   policy: an agent timeout; an evaluation timeout; a sandbox, grader or
+   harness error; and a resolved patch whose episode ended on a max-iteration or
+   context-window error unless the harness reported that stop as its expected
+   budget stop. An unresolved patch after an ordinary max-iteration or
+   context-window stop keeps its `0`. Keep masked samples out of the success
+   denominator, and do not treat every timeout as the same event.
+
+Each rollout includes the trajectory, patch, reward, grading fields and
+`mask_sample`.
 
 Sandbox failures retain their private exception in `sandbox_error.txt` under the
 request's results directory. The native response publishes only that file's
 `artifact_path` alongside the existing class-level error and mask, so callers
 can retain the locator without copying private diagnostics. A locator does not
 guarantee later file retention; responses that never reach this writer have none.
+
+A `private_grader` configuration names `target` (`module:function(payload,
+patch)` returning the grading command, working directory, environment and
+files), the row `metadata_key` holding the private payload, an
+`unresolved_return_code` and an optional `timeout_return_code`. Exit `0`
+resolves, the unresolved code is an ordinary `0` reward, the timeout code is an
+evaluation timeout, and any other result is a grader error and masked. Called
+with no patch, the same target supplies the setup command that runs before the
+agent starts. A configuration may also set `swe_grader`, a trusted
+`module:function(instance, patch)` returning `{"script": ..., "grade":
+callable(log) -> bool}`: AnySWE runs the script (which must apply the patch and
+run the tests) in the grading sandbox and takes `grade(log)` as the verdict,
+instead of the pinned `swebench` path. `test_authority_restore`, a trusted
+`module:function(instance, patch)` returning `{files, command}`, runs in the
+default SWE-bench grader after the candidate patch applies and before the hidden
+tests. All three are unset by default.
+
+## Evaluation boundary
+
+SWE-bench Verified and Multilingual are evaluation sets: do not mix their rows
+into TRAIN data. A shared harness name is not a matched protocol. Scores compare
+only under the same dataset binding, grader, grading-network policy, prompt and
+turn and time budgets. The RLTasks
+[official-parity cell](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/swe/splits/swe_official/README.md)
+changes the grading network, output capture, turn cap and visible prompt while
+keeping the agent offline; it is not full upstream parity.
 
 ## Run
 
@@ -108,25 +170,15 @@ assets remain excluded from the overlay.
 Private task images can pass registry credentials through
 `sandbox_spec.provider_options.image_auth`.
 
-## Reward
+## Concurrency
 
-SWE-bench and SWE-bench Multilingual use the official `make_test_spec` and
-`get_eval_report` path. R2E-Gym requires every fail-to-pass and pass-to-pass test
-to report `PASSED`.
+`concurrency: null` runs requests without an agent-level semaphore; the Pi and
+Hermes configs select it. Positive integer values keep a bounded semaphore.
+Zero and negative values are rejected rather than creating a permanently
+blocked queue. Other configurations retain the default 256 request limit.
+Sandbox resources and the model server retain their own admission controls.
 
-A configuration may set `swe_grader` to a trusted `module:function(instance, patch)` that
-returns `{"script": ..., "grade": callable(log) -> bool}`. AnySWE then runs the script
-(it must apply the patch and run the tests) in the grading sandbox and takes `grade(log)`
-as the verdict, instead of the pinned swebench's `make_test_spec` and `get_eval_report`.
-Use it for a dataset whose official grader differs from the pinned release. Unset keeps
-the default path.
-
-Resolved patches receive reward `1`; other completed attempts receive `0`.
-Agent timeouts, evaluation timeouts, sandbox failures, and accidental successes
-after max-iteration or context-window termination set `mask_sample=true`.
-
-Each rollout includes the trajectory, patch, reward, grading fields, and
-`mask_sample`.
+## Runtime notes
 
 SWE and terminal episodes pass their stable instance identity as the native
 executor's placement preference. Samples of the same instance can share the

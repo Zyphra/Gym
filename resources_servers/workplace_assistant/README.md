@@ -1,11 +1,25 @@
 # Description
 
-1. Environment: This is a tool use - multi step agentic environment that tests the agents ability to execute tasks in a workplace setting. Workplace assistant contains a sandbox environment with five databases, 27 tools, and 690 tasks. These tasks represent common business activities, such as sending emails and scheduling meetings.
+1. Environment: This is a tool use - multi step agentic environment that tests the agents ability to execute tasks in a workplace setting. Workplace assistant contains a sandbox environment with five databases and 27 tools. Its tasks represent common business activities, such as sending emails and scheduling meetings. Task counts depend on the source population; see Task populations below.
 2. Domain: Business activities
 3. Source of prompts: 
-- Full set of prompts (1260): https://huggingface.co/datasets/nvidia/Nemotron-RL-agent-workplace_assistant
+- Prompts: https://huggingface.co/datasets/nvidia/Nemotron-RL-agent-workplace_assistant
 4. Example prompt: Reply to carlos's last email about 'Task Update on Develop prototype for report generation' with 'Thanks for the update - I will get back to you tomorrow.'
 
+
+## Task populations
+
+The upstream description's figures of 690 tasks and 1,260 prompts are not row
+counts of the pinned splits. The committed dataset metrics
+(`data/train_metrics.json`, `data/validation_metrics.json`) record 1,255 TRAIN and
+545 validation examples. A training source built from them has its own counts:
+the RLTasks
+[`workbench-full-stock-plus-hard-v1`](https://github.com/Zyphra/rl_tasks/blob/wrapper/datasets/workbench-full-stock-plus-hard-v1.yaml)
+recipe starts from the 1,255 TRAIN rows, removes 140 held-out parents and 177
+full-reward no-op rows, and adds 235 generated rows, giving 938 stock plus 235
+generated (1,173) rows. The
+[RLTasks WorkBench binding README](https://github.com/Zyphra/rl_tasks/blob/wrapper/envs/nemo_gym/training/workbench/README.md)
+tabulates each population.
 
 Commands - 
 Spin up server:
