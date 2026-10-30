@@ -549,6 +549,12 @@ class HermesAgent(SimpleResponsesAPIAgent):
         with open(os.path.join(hermes_home, "config.yaml"), "w") as _f:
             _f.write(self._build_config())
         os.environ["HERMES_HOME"] = hermes_home
+        if self.config.mcp_servers:
+            # Hermes discovers MCP servers when `model_tools` is first imported, which is before this
+            # config exists; discovery is idempotent, so run it again against the config just written.
+            from tools.mcp_tool import discover_mcp_tools  # pyright: ignore[reportMissingImports]
+
+            discover_mcp_tools()
 
     def _model_name(self) -> str:
         return self.config.model or str(self.config.model_server.name)

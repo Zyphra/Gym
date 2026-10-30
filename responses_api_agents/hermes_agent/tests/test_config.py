@@ -69,6 +69,46 @@ def test_mcp_servers_reach_hermes_config_unchanged(tmp_path, monkeypatch, mcp_se
     assert generated.get("mcp_servers") == (mcp_servers or None)
 
 
+_SERVER = """
+import asyncio
+import mcp.types as types
+from mcp.server.lowlevel import Server
+from mcp.server.stdio import stdio_server
+
+server = Server("gym_probe")
+
+@server.list_tools()
+async def list_tools():
+    return [types.Tool(name="probe_echo", description="echo", inputSchema={"type": "object"})]
+
+@server.call_tool()
+async def call_tool(name, arguments):
+    return [types.TextContent(type="text", text="ok")]
+
+async def main():
+    async with stdio_server() as (read, write):
+        await server.run(read, write, server.create_initialization_options())
+
+asyncio.run(main())
+"""
+
+
+def test_mcp_server_tools_register_when_config_is_written_after_hermes_import(tmp_path, monkeypatch):
+    pytest.importorskip("mcp")
+    import sys
+
+    from tools.registry import registry  # pyright: ignore[reportMissingImports]
+
+    script = tmp_path / "server.py"
+    script.write_text(_SERVER)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "unused"))
+    HermesAgent(
+        config=_config(mcp_servers={"gym_probe": {"command": sys.executable, "args": [str(script)]}}),
+        server_client=ServerClient.model_construct(),
+    )
+    assert "mcp_gym_probe_probe_echo" in registry.get_all_tool_names()
+
+
 if __name__ == "__main__":
     test_module_parses()
     test_config_yaml_parses()
