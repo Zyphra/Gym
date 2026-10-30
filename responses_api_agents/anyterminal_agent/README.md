@@ -1,5 +1,11 @@
 # anyterminal_agent
 
+Sandbox startup, execution and cleanup exceptions persist their type and message
+in `nemo_gym_metrics.json`'s `error_detail` (at most 2,000 characters), alongside
+the existing infrastructure and masking fields. When execution and cleanup both
+fail, the initiating error comes first. Existing memory-kill attribution takes
+precedence; this diagnostic field does not change reward or masking policy.
+
 Runs any Gym agent inside a Terminal Bench task container and evaluates the result
 by running the task's `tests/test.sh` in the same container. Works with
 `hermes_agent`, `claude_code_agent`, `terminus_2_agent`, `pi_agent` (`configs/anyterminal_pi.yaml`),

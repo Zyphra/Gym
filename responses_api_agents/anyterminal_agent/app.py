@@ -1062,6 +1062,7 @@ class RunTerminalAgent(BaseModel):
         agent_timed_out = container_timed_out = False
         agent_return_code = eval_return_code = eval_error_type = None
         sandbox_failed = False
+        sandbox_problem = None
         agent_run_time = eval_run_time = None
         integrity = None
         verifier_memory_before = verifier_memory_after = {}
@@ -1110,12 +1111,17 @@ class RunTerminalAgent(BaseModel):
             print(f"[{cfg.task_name}] verifier integrity refused: {integrity_problem}", flush=True)
         except Exception as e:
             sandbox_failed = True
+            sandbox_problem = f"{type(e).__name__}: {e}"[:2000]
             print(f"[{cfg.task_name}] sandbox run failed: {e}", flush=True)
         finally:
             try:
                 await sandbox.stop()
             except Exception as e:
                 sandbox_failed = True
+                cleanup_problem = f"{type(e).__name__}: {e}"
+                sandbox_problem = (
+                    f"{sandbox_problem}; cleanup: {cleanup_problem}" if sandbox_problem else cleanup_problem
+                )[:2000]
                 print(f"[{cfg.task_name}] sandbox cleanup failed: {e}", flush=True)
             finally:
                 if integrity is not None:
@@ -1180,7 +1186,7 @@ class RunTerminalAgent(BaseModel):
             agent_run_time=agent_run_time,
             eval_run_time=eval_run_time,
             total_run_time=total_run_time,
-            error_detail=memory_kill or verifier_kill,
+            error_detail=memory_kill or verifier_kill or sandbox_problem,
             verifier_phase_memory_events=verifier_phase_events or None,
             memory_failure_phase="verifier"
             if verifier_phase_kill
