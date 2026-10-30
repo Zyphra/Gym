@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import math
 import os
 import re
 import shlex
@@ -54,6 +55,13 @@ from nemo_gym.sandbox.providers.docker import DockerCreateConfig, DockerProvider
 from nemo_gym.sandbox.providers.registry import create_provider
 from nemo_gym.server_utils import apply_rollout_prefix
 from nemo_gym.setup_timeout import setup_timeout_seconds
+from responses_api_agents.anyterminal_agent.continue_until_timeout import (
+    PASS_REWARD,
+    SOLVED_REWARD,
+    continuation_instruction,
+    signal_command,
+    task_continues_until_timeout,
+)
 from responses_api_agents.anyterminal_agent.task_network import TaskNetwork
 
 
@@ -176,6 +184,11 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     verifier_return_code: Optional[int] = None
     verifier_error_type: Optional[str] = None
     error_detail: Optional[str] = None
+    # The final verifier's reward.txt value, kept whole (``resolved`` is only its sign or threshold).
+    verifier_reward: Optional[float] = None
+    # continue_until_timeout: agent phases run and the hidden verifier's reward after each of them.
+    continue_phases: Optional[int] = None
+    checkpoints: Optional[list[dict[str, Any]]] = None
 
     ray_queue_time: Optional[float] = None
     agent_run_time: Optional[float] = None
@@ -474,6 +487,25 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
         description="auto, an absolute prepared dependency directory for local sandboxes, or a remote runtime archive/URL",
     )
     agent_timeout_is_failure: bool = Field(default=False, strict=True)
+    continue_until_timeout: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Honour each task's [agent].continue_until_timeout, as LHTB's Harbor does: run the agent in phases of at "
+            "most checkpoint_interval_s, grade after each with the agent frozen, and re-invoke it with a binary "
+            "rejection until the verifier passes or the agent budget ends. The budget ending is the normal end of "
+            "such a task, not an agent timeout. Needs a bind-mount sandbox provider."
+        ),
+    )
+    checkpoint_interval_s: int = Field(default=1800, gt=0)
+    scalar_reward: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "Report the verifier's reward.txt value as the reward and call a row resolved at or above 0.95, "
+            "for tasks with partial-credit graders. Off: reward is 1 when reward.txt is positive, else 0."
+        ),
+    )
     tb_agent_timeout: int = 1800
     # When set, overrides the per-task agent_timeout_sec from the dataset for every task.
     global_agent_timeout: Optional[int] = Field(default=None, gt=0)
@@ -848,16 +880,19 @@ class RunTerminalAgent(BaseModel):
         env.update(cfg.agent_environment)
         return env
 
-    async def _run_agent(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> tuple[float, bool, bool, int]:
+    async def _run_agent(
+        self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig, *, timeout_s: float | None = None
+    ) -> tuple[float, bool, bool, int]:
         from core.sandbox.memory_evidence import memory_event_delta, sandbox_memory_snapshot
 
         t0 = time.time()
         before = sandbox_memory_snapshot(sandbox)
-        update_metrics(cfg.metrics_fpath, {"agent_started_at": time.time()}, cfg.task_name)
+        if timeout_s is None:
+            update_metrics(cfg.metrics_fpath, {"agent_started_at": time.time()}, cfg.task_name)
         try:
             result = await sandbox.exec(
                 _apt_root_sandbox(cfg) + (cfg.agent_command_str or ""),
-                timeout_s=cfg.tb_agent_timeout,
+                timeout_s=cfg.tb_agent_timeout if timeout_s is None else timeout_s,
                 user="root",
                 env=self._agent_env(cfg),
             )
@@ -885,6 +920,99 @@ class RunTerminalAgent(BaseModel):
             detail = result.stderr or result.stdout or ""
             print(f"[{cfg.task_name}] agent exit {result.return_code}: {detail[-2000:]}", flush=True)
         return time.time() - t0, result.error_type == "timeout", result.error_type == "sandbox", result.return_code
+
+    async def _signal_agent_tree(self, sandbox: AsyncSandbox, signal: str) -> None:
+        result = await sandbox.exec(signal_command(signal), timeout_s=60, user="root")
+        if result.return_code != 0 or result.error_type:
+            raise RuntimeError(f"agent process tree could not be signalled with SIG{signal}")
+
+    async def _interim_verify(
+        self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig, integrity: Any, phase: int
+    ) -> Optional[float]:
+        """Grade the current state with the agent frozen, then hide the grader before it resumes.
+
+        The tests, the verifier's output and the agent's tmux descendants are the
+        only things LHTB's Harbor withholds or freezes; the thaw and the removal
+        run on every exit path so the agent is never left frozen or able to read them.
+        """
+        reward = None
+        await self._signal_agent_tree(sandbox, "STOP")
+        try:
+            await self._stage_tests(cfg)
+            integrity.purge()
+            started_ns = time.time_ns()
+            integrity.mark_dispatch(started_ns)
+            _elapsed, timed_out, return_code, error_type = await self._run_eval(sandbox, cfg)
+            if error_type == "sandbox":
+                raise RuntimeError("sandbox failed during the interim verifier")
+            if not timed_out:
+                try:
+                    reward = integrity.read_reward()
+                except ValueError:  # includes VerifierIntegrityRefused; the final verifier decides
+                    reward = None
+                except OSError:
+                    reward = None
+            snapshot = cfg.persistent_dir / "interim_verifier" / f"phase-{phase:04d}"
+            snapshot.parent.mkdir(exist_ok=True)
+            shutil.copytree(cfg.verifier_dir, snapshot, symlinks=True, ignore_dangling_symlinks=True)
+            (snapshot / "dispatch.json").write_text(
+                json.dumps({"return_code": return_code, "error_type": error_type, "timed_out": timed_out})
+            )
+        finally:
+            shutil.rmtree(cfg.persistent_dir / "staging" / "tests", ignore_errors=True)
+            integrity.purge()
+            await sandbox.exec("rm -rf /tests /pytest.ini", timeout_s=60, user="root")
+            await self._signal_agent_tree(sandbox, "CONT")
+        return reward
+
+    async def _run_agent_until_timeout(
+        self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig, integrity: Any
+    ) -> tuple[float, bool, bool, int]:
+        """Agent phases with a hidden verifier after each; see ``continue_until_timeout.py``.
+
+        Every phase is a fresh agent run on the same instance, as LHTB's Harbor
+        runs it: project and shell state persist, the conversation restarts.
+        """
+        base_instruction = (cfg.persistent_dir / "instruction.txt").read_text()
+        started = time.monotonic()
+        deadline = started + cfg.tb_agent_timeout
+        update_metrics(cfg.metrics_fpath, {"agent_started_at": time.time()}, cfg.task_name)
+        checkpoints: list[dict[str, Any]] = []
+        phase = 0
+        return_code = 0
+        sandbox_failed = False
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                _elapsed, _timed_out, sandbox_failed, return_code = await self._run_agent(
+                    sandbox, cfg, timeout_s=min(remaining, cfg.checkpoint_interval_s)
+                )
+                for name in ("response.json", "agent_result.json"):
+                    produced = cfg.persistent_dir / name
+                    if produced.is_file():
+                        produced.replace(cfg.persistent_dir / f"{produced.stem}-phase-{phase:04d}{produced.suffix}")
+                if sandbox_failed:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                reward = await self._interim_verify(sandbox, cfg, integrity, phase)
+                checkpoints.append(
+                    {"phase": phase, "elapsed_s": round(time.monotonic() - started, 1), "reward": reward}
+                )
+                if reward is not None and reward >= PASS_REWARD:
+                    break
+                phase += 1
+                (cfg.persistent_dir / "instruction.txt").write_text(
+                    continuation_instruction(base_instruction, phase=phase, remaining_s=remaining)
+                )
+        finally:
+            (cfg.persistent_dir / "instruction.txt").write_text(base_instruction)
+            self._continue_summary = {"continue_phases": phase + 1, "checkpoints": checkpoints}
+        # Spending the budget is how a continue_until_timeout task ends; the final verifier grades it.
+        return time.monotonic() - started, False, sandbox_failed, return_code
 
     async def _stage_tests(self, cfg: AnyTerminalInstanceConfig) -> None:
         """Copy the task's test files into the staging dir, visible to the sandbox at /tests."""
@@ -1047,6 +1175,7 @@ class RunTerminalAgent(BaseModel):
         cfg = self.config
         cfg.verifier_dir.mkdir(parents=True, exist_ok=True)
         (cfg.persistent_dir / "staging").mkdir(parents=True, exist_ok=True)
+        continues = cfg.continue_until_timeout and task_continues_until_timeout(Path(cfg.problem_info["task_dir"]))
         t0 = time.time()
 
         sandbox = AsyncSandbox(
@@ -1067,6 +1196,7 @@ class RunTerminalAgent(BaseModel):
         verifier_memory_before = verifier_memory_after = {}
         integrity_problem = reward_problem = None
         resolved = False
+        reward_value = None
         try:
             if self._uses_bind_mounts(cfg):
                 integrity = VerifierIntegrity(cfg.verifier_dir, cfg.persistent_dir)
@@ -1074,7 +1204,17 @@ class RunTerminalAgent(BaseModel):
             update_metrics(cfg.metrics_fpath, {"sandbox_ready_at": time.time()}, cfg.task_name)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_runtime(sandbox, cfg)
-            agent_run_time, agent_timed_out, sandbox_failed, agent_return_code = await self._run_agent(sandbox, cfg)
+            if continues:
+                (
+                    agent_run_time,
+                    agent_timed_out,
+                    sandbox_failed,
+                    agent_return_code,
+                ) = await self._run_agent_until_timeout(sandbox, cfg, integrity)
+            else:
+                agent_run_time, agent_timed_out, sandbox_failed, agent_return_code = await self._run_agent(
+                    sandbox, cfg
+                )
             await self._stage_tests(cfg)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_tests(sandbox, cfg)
@@ -1121,7 +1261,8 @@ class RunTerminalAgent(BaseModel):
                 if integrity is not None:
                     try:
                         if integrity_problem is None:
-                            resolved = integrity.read_reward() > 0
+                            reward_value = integrity.read_reward()
+                            resolved = reward_value > 0
                     except VerifierIntegrityRefused as e:
                         integrity_problem = str(e)[:512]
                     except (ValueError, OSError) as e:
@@ -1155,9 +1296,12 @@ class RunTerminalAgent(BaseModel):
         reward_path = cfg.verifier_dir / "reward.txt"
         if integrity is None:
             try:
-                resolved = float(reward_path.read_text().strip()) > 0
+                reward_value = float(reward_path.read_text().strip())
+                resolved = reward_value > 0
             except (ValueError, OSError) as e:
                 reward_problem = f"{type(e).__name__}: {e}"
+        if cfg.scalar_reward:
+            resolved = reward_value is not None and reward_value >= SOLVED_REWARD
         # test.sh writes 0 or 1; a completed eval without a readable reward is a verifier failure.
         verifier_reward_unreadable = bool(
             reward_problem and eval_run_time is not None and not (container_timed_out or sandbox_failed)
@@ -1177,6 +1321,8 @@ class RunTerminalAgent(BaseModel):
             verifier_integrity_problem=integrity_problem,
             verifier_return_code=eval_return_code,
             verifier_error_type=eval_error_type,
+            verifier_reward=reward_value,
+            **getattr(self, "_continue_summary", {}),
             agent_run_time=agent_run_time,
             eval_run_time=eval_run_time,
             total_run_time=total_run_time,
@@ -1276,6 +1422,13 @@ async def run_terminal_episode(params_dict: dict) -> Dict[str, Any]:
     return _terminal_response(params).model_dump(mode="json")
 
 
+def _reward(metrics: TerminalBenchMetrics, scalar_reward: bool) -> float:
+    """The row reward: the verifier's own value for partial-credit tasks, else 1 when resolved."""
+    if scalar_reward:
+        return metrics.verifier_reward or 0.0
+    return 1.0 if metrics.resolved else 0.0
+
+
 ### Agent server
 
 
@@ -1311,6 +1464,8 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         workspace = Path(__file__).parent
         provider_name = next(iter(self.config.sandbox_provider), "docker")
         remote_provider = provider_name not in {"apptainer", "docker", "enroot", "native_enroot"}
+        if self.config.continue_until_timeout and remote_provider:
+            raise ValueError("continue_until_timeout needs a bind-mount sandbox provider")
         runtime_source = self.config.agent_runtime_source
         agent_deps_dir = workspace
         agent_deps_archive = None
@@ -1406,7 +1561,11 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         # (swebench_agent_timeout + swebench_tests_timeout + 600).
         effective_agent_timeout = config_overrides.get("tb_agent_timeout", self.config.tb_agent_timeout)
         effective_eval_timeout = config_overrides.get("tb_eval_timeout", self.config.tb_eval_timeout)
-        required_ttl = effective_agent_timeout + effective_eval_timeout + 600
+        verifications = 1
+        if self.config.continue_until_timeout and task_continues_until_timeout(task_dir):
+            # One hidden verifier pass per checkpoint, then the final one.
+            verifications += math.ceil(effective_agent_timeout / self.config.checkpoint_interval_s)
+        required_ttl = effective_agent_timeout + effective_eval_timeout * verifications + 600
         if required_ttl > self.config.tb_sandbox_ttl:
             config_overrides["tb_sandbox_ttl"] = required_ttl
 
@@ -1488,6 +1647,8 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
 
             meta, response.metadata = response.metadata, None
             metrics = TerminalBenchMetrics.model_validate_json(meta["metrics"])
+            instance_config = AnyTerminalInstanceConfig.model_validate_json(meta["instance_config"])
+            scalar_reward = instance_config.scalar_reward
 
             return AnyTerminalVerifyResponse(
                 responses_create_params=body.responses_create_params.model_dump()
@@ -1497,10 +1658,10 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
                     "model": response.model,
                 },
                 response=response,
-                reward=1.0 if metrics.resolved else 0.0,
+                reward=_reward(metrics, scalar_reward),
                 done_reason="context_exhausted" if meta.get("stop_reason") == "context_exhausted" else None,
                 **metrics.model_dump(),
-                instance_config=AnyTerminalInstanceConfig.model_validate_json(meta["instance_config"]).model_dump(),
+                instance_config=instance_config.model_dump(),
             )
 
 
