@@ -1355,15 +1355,20 @@ class TestProcessSingleDatapoint:
             async def aclose(self):
                 pass
 
-        with patch(
-            "responses_api_agents.anyterminal_agent.app.AsyncSandbox",
-            side_effect=lambda provider, spec: AsyncSandbox(FailingProvider(), spec),
-        ), patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+        with (
+            patch(
+                "responses_api_agents.anyterminal_agent.app.AsyncSandbox",
+                side_effect=lambda provider, spec: AsyncSandbox(FailingProvider(), spec),
+            ),
+            patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)),
+        ):
             resolved = await RunTerminalAgent(config=cfg).process_single_datapoint()
 
         metrics = json.loads(cfg.metrics_fpath.read_text())
         assert metrics["sandbox_failed"] is True and metrics["mask_sample"] is True
-        assert metrics["error_detail"].startswith("OSError: cleanup did not drain" if phase == "close" else "RuntimeError: " + message)
+        assert metrics["error_detail"].startswith(
+            "OSError: cleanup did not drain" if phase == "close" else "RuntimeError: " + message
+        )
         assert len(metrics["error_detail"]) <= 2000
         assert resolved is (phase == "close")
 
