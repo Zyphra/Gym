@@ -348,6 +348,12 @@ class AnySweAgentConfig(BaseResponsesAPIAgentConfig):
     swebench_agent_timeout: int = 2700
     concurrency: Optional[int] = Field(default=256, gt=0)
     private_grader: Optional[PrivateGraderConfig] = None
+    swe_grader: Optional[str] = Field(
+        default=None,
+        description="Trusted module:function(instance, patch) returning {'script': bash text that applies the "
+        "patch and runs the tests, 'grade': callable(log) -> bool}. It replaces the default swebench make_test_spec "
+        "and get_eval_report, for datasets whose official grader differs from the pinned swebench release",
+    )
     test_authority_restore: Optional[str] = Field(
         default=None,
         description="Trusted module:function(instance, patch) returning {files, command}; the default SWE-bench "
@@ -710,21 +716,26 @@ class AnySweSandboxRunner:
         if _dataset_family(params.problem_info.get("dataset_name", "")) == "r2e":
             return await self._grade_r2e_patch(params, patch)
 
-        from swebench.harness.grading import get_eval_report
-        from swebench.harness.test_spec.test_spec import make_test_spec
-
         instance = self._instance_dict(params)
-        test_spec = make_test_spec(instance, namespace="swebench")
         restore = {"files": {}, "command": ""}
-        if params.test_authority_restore is not None:
-            module, _, name = params.test_authority_restore.partition(":")
-            restore = getattr(importlib.import_module(module), name)(instance, patch)
-        eval_script = (
-            'export PYTEST_ADDOPTS="-rA ${PYTEST_ADDOPTS:-}"\n'
-            + self._apply_patch_script()
-            + restore["command"]
-            + test_spec.eval_script
-        )
+        grade = None
+        if params.swe_grader is not None:
+            module, _, name = params.swe_grader.partition(":")
+            plan = getattr(importlib.import_module(module), name)(instance, patch)
+            eval_script, grade = plan["script"], plan["grade"]
+        else:
+            from swebench.harness.test_spec.test_spec import make_test_spec
+
+            test_spec = make_test_spec(instance, namespace="swebench")
+            if params.test_authority_restore is not None:
+                module, _, name = params.test_authority_restore.partition(":")
+                restore = getattr(importlib.import_module(module), name)(instance, patch)
+            eval_script = (
+                'export PYTEST_ADDOPTS="-rA ${PYTEST_ADDOPTS:-}"\n'
+                + self._apply_patch_script()
+                + restore["command"]
+                + test_spec.eval_script
+            )
         spec = self._sandbox_spec(
             params,
             files={
@@ -757,6 +768,10 @@ class AnySweSandboxRunner:
             )
 
         log = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        if grade is not None:
+            return bool(grade(log)), None, None
+        from swebench.harness.grading import get_eval_report
+
         with tempfile.NamedTemporaryFile("w", suffix=".log") as log_file:
             log_file.write(log)
             log_file.flush()
