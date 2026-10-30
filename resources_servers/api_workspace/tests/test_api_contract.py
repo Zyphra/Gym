@@ -18,7 +18,7 @@ from resources_servers.api_workspace.tests.test_app import gold_calls, server
 @pytest.fixture
 def http_world():
     native = server()
-    identity = "api-workspace-v3:train:acct_reconcile:0000"
+    identity = "api-workspace-v4:train:acct_reconcile:0000"
     with TestClient(native.setup_webserver()) as client:
         assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
         world = next(iter(native._sessions.values())).world
@@ -115,13 +115,15 @@ def test_missing_schema_field_does_not_match_or_mutate(condition):
     app = native.setup_webserver()
     # Production catches unexpected resource exceptions outside session handling.
     native.setup_exception_middleware(app)
-    identity = "api-workspace-v3:train:hr_location:0000"
+    identity = "api-workspace-v4:train:hr_location:0000"
     with TestClient(app) as client:
         assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
         world = next(iter(native._sessions.values())).world
         vendor = next(VENDORS[name] for name in world.scenario.connected if VENDORS[name].function == "hr")
         employees = world.records[vendor.name]["employees"]
-        assert employees and all("manager" not in row for row in employees.values())
+        # Native records carry every schema field; remove one to exercise records persisted without it.
+        for row in employees.values():
+            del row["manager"]
         request = {
             "vendor": vendor.name,
             "method": "GET",
@@ -216,7 +218,7 @@ def test_native_verify_scores_real_world_then_releases_it(http_world):
 def test_grader_rejects_wrong_valid_values_extra_collections_and_missing_rows():
     from resources_servers.api_workspace.engine import Workspace
 
-    scenario = scenario_from_id("api-workspace-v3:train:hr_location:0000")
+    scenario = scenario_from_id("api-workspace-v4:train:hr_location:0000")
     world = Workspace(scenario)
     for call in gold_calls(scenario):
         world.request(**call)

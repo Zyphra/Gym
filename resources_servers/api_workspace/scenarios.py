@@ -18,7 +18,7 @@ from typing import Any
 from resources_servers.api_workspace.engine import COLLECTIONS, VENDOR_NAMES, VENDORS, canonical_json
 
 
-REVISION = "api-workspace-v3"
+REVISION = "api-workspace-v4"
 ROOT_SEED = 20261028
 TRAIN_VARIANTS = 80
 VAL_VARIANTS = 8
@@ -56,7 +56,7 @@ FAMILIES = (
 )
 SYSTEM_PROMPT = """You are working in a fictional workspace containing simulated business records.
 The available tools provide an API catalog, vendor schemas and HTTP requests.
-You have at most50 model turns. Completion is determined by the resulting workspace state.
+You have at most 50 model turns. Completion is determined by the resulting workspace state.
 """
 
 
@@ -285,10 +285,7 @@ class _Builder:
                     "name": f"Colleague {self.namespace[3:]} {i}",
                     "email": email,
                     "department": self.department if i % 3 else "Supply Design",
-                    "coordinator": self.manager,
-                    "operations_folder": self.folder_name,
-                    "dispatch_channel": self.channel_name,
-                    "new_records_vendor_order": self.rng.choice(("alphabetical_first", "alphabetical_last")),
+                    "manager": self.manager,
                     "status": "pending" if i % 2 == 0 else "active",
                     "location": "Remote",
                     "start_date": f"2026-11-{i + 1:02d}",
@@ -427,7 +424,7 @@ class _Builder:
                             "account": account,
                             "invoice": f"{self.namespace}-INV-{i}",
                             "employee": email,
-                            "requested_contact": contact,
+                            "requested_contact": f"verified-{contact}",
                             "priority": "high" if i % 2 == 0 else "normal",
                         }
                     ),
@@ -515,6 +512,11 @@ class _Builder:
         )
 
 
+DOCUMENT = (
+    "in the operations folder with coordinator owner, status 'draft', access 'private', shared_with [] and version 1"
+)
+
+
 def _workflow(b: _Builder) -> str:
     f, p, rows = b.family, b.policy, b.rows
     employees, accounts = rows["employees"], rows["accounts"]
@@ -535,9 +537,9 @@ def _workflow(b: _Builder) -> str:
         content = "\n".join(sorted(x["row"]["email"] for x in selected))
         b.document(subject + ".txt", content)
         return (
-            f"Activate pending employees in {b.department}, setting location and cost_center from policy. "
-            f"Save '{subject}.txt' with their emails sorted one per line in the operations folder; use coordinator owner, "
-            "draft status, private access, no sharing, version1. Leave other employees untouched."
+            f"Set status 'active' on pending employees in {b.department}, and set their location and cost_center to the "
+            f"policy values. Save '{subject}.txt' containing their emails sorted one per line, {DOCUMENT}. "
+            "Leave other employees untouched."
         )
     if f == "hr_location":
         b.update(employee, location=p["location"])
@@ -551,15 +553,15 @@ def _workflow(b: _Builder) -> str:
         b.update(rows["leave"][target], status="approved", delegate=delegate)
         b.update(account, owner=delegate)
         return (
-            f"Approve {email}'s requested November leave, with {delegate} as delegate. Transfer only their CRM "
-            "account's owner to that delegate during leave; do not alter the employee record."
+            f"Approve {email}'s requested November leave: set its status 'approved' and delegate {delegate}. Transfer "
+            "only their CRM account's owner to that delegate during leave; do not alter the employee record."
         )
     if f == "hr_conversion":
         b.update(employee, employment_type="employee", cost_center=p["cost_center"])
         b.update(rows["expenses"][target], category="onboarding")
         return (
-            f"Convert contractor {email} to employment_type 'employee' using policy cost_center, and recategorize "
-            "their expense as onboarding. Preserve its approval status and amount."
+            f"Convert contractor {email}: set employment_type 'employee' and set their cost_center to the policy "
+            "cost_center. Set their expense's category to 'onboarding'; preserve its approval status and amount."
         )
     if f == "hr_departure":
         b.update(employee, status="inactive")
@@ -568,7 +570,7 @@ def _workflow(b: _Builder) -> str:
             b.update(x, owner=b.manager)
         b.update(file, owner=b.manager)
         return (
-            f"Offboard {email}: set HR status inactive, transfer all their CRM accounts and their account JSON file "
+            f"Offboard {email}: set HR status 'inactive', transfer all their CRM accounts and their account JSON file "
             "to the coordinator, preserving everything else. Do not delete historical records."
         )
     if f == "crm_renewal":
@@ -577,9 +579,9 @@ def _workflow(b: _Builder) -> str:
         b.update(opp, amount=amount, stage="proposal", close_date=p["effective_date"])
         b.draft(subject, str(amount), [rows["contacts"][target]["row"]["email"]])
         return (
-            f"For {company}'s renewal opportunity apply policy renewal_discount_percent to amount, round down "
-            "to integer cents, set stage proposal and close_date to policy effective_date. Create a draft to the CRM "
-            f"contact with subject '{subject}', body containing only the discounted integer, empty thread and draft status."
+            f"For {company}'s renewal opportunity apply the policy renewal_discount_percent to amount, round down "
+            "to integer cents, set stage 'proposal' and close_date to the policy effective_date. Create a mail draft to the "
+            f"account's CRM contact email with subject '{subject}', body only the discounted integer, empty thread and status 'draft'."
         )
     if f == "crm_territory":
         selected = [x for x in accounts if x["row"]["region"] == b.region]
@@ -591,15 +593,16 @@ def _workflow(b: _Builder) -> str:
                 b.update(x, owner=b.manager)
         return (
             f"Reassign accounts in the policy region ({b.region}) and their opportunities to the coordinator; "
-            "set those accounts' tier priority. Keep opportunities' amounts and stages unchanged."
+            "set those accounts' tier to 'priority'. Keep opportunities' amounts and stages unchanged."
         )
     if f == "crm_contacts":
         new_email = json.loads(mail["row"]["body"])["requested_contact"]
         b.update(rows["contacts"][target], email=new_email, status="verified")
         b.update(mail, status="read", labels=["contact-processed"])
         return (
-            f"Read the mail request for {company}; verify the matching CRM contact using its requested_contact "
-            "email. Mark only that request read with labels exactly [contact-processed]."
+            f"Read the mail request for {company}. Set the matching CRM contact's email to the request's "
+            "requested_contact and its status to 'verified'. Mark only that request status 'read' with labels exactly "
+            '["contact-processed"].'
         )
     if f == "crm_pipeline":
         selected = [x for x in rows["opportunities"] if x["row"]["probability"] >= 60]
@@ -608,17 +611,18 @@ def _workflow(b: _Builder) -> str:
         body = "\n".join(sorted(f"{x['row']['account']}={x['row']['amount']}" for x in selected))
         b.post(body)
         return (
-            "Move qualified opportunities with probability at least60 to stage review. Post their "
-            "account=amount pairs sorted by account, one per line, to dispatch; coordinator sender, empty thread, posted status. "
-            "Do not include lower-probability opportunities."
+            "Set stage 'review' on qualified opportunities with probability at least 60. Post one line per such "
+            "opportunity, '<account>=<amount>', sorted by account, as a chat message in the dispatch channel with coordinator "
+            "sender, empty thread and status 'posted'. Do not include lower-probability opportunities."
         )
     if f == "crm_dormant":
         b.update(account, status="paused")
         b.update(rows["opportunities"][target], stage="on_hold", probability=0)
         b.update(mail, labels=["account-paused"])
         return (
-            f"Pause {company}'s account, put its renewal on_hold with probability0, and label its related mail "
-            "exactly [account-paused]. Leave the mail unread status and all financial records intact."
+            f"Set {company}'s CRM account status to 'paused', set its renewal opportunity stage 'on_hold' with "
+            'probability 0, and set its related mail labels exactly ["account-paused"]. Leave the mail unread status and '
+            "all financial records intact."
         )
     if f == "acct_reconcile":
         settled = {
@@ -630,18 +634,18 @@ def _workflow(b: _Builder) -> str:
                 b.update(x, paid=amount, status="paid" if amount == x["row"]["amount"] else "partial")
         b.document(subject + ".txt", str(sum(settled.values())))
         return (
-            "Reconcile all settled payments to their invoice number: set paid to settled amount, status paid if "
-            "equal to invoice amount, otherwise partial. Ignore pending payments. Save "
-            f"'{subject}.txt' containing only the total settled cents; operations folder,coordinator owner,draft,private,no sharing,version1."
+            "Reconcile all settled payments to their invoice number: set paid to the settled amount, and status 'paid' "
+            "if equal to the invoice amount, otherwise 'partial'. Ignore pending payments. Save "
+            f"'{subject}.txt' containing only the total settled cents, {DOCUMENT}."
         )
     if f == "acct_dispute":
         amount = json.loads(file["row"]["content"])["approved_amount"]
         b.update(invoice, status="disputed", owner=b.manager)
         b.draft(subject, f"{invoice['row']['number']}={amount}", [mail["row"]["sender"]], thread)
         return (
-            f"Flag {company}'s invoice disputed and assign coordinator. Read its account JSON file's approved_amount. "
-            f"Draft to the matching mail sender on that thread, subject '{subject}', body exactly invoice-number=approved_amount, "
-            "draft status. Do not change invoice amount or mark it paid."
+            f"Set {company}'s invoice status 'disputed' and owner coordinator. Read its account JSON file's approved_amount. "
+            f"Create a mail draft to the sender of {company}'s mail request, on that request's thread, subject '{subject}', "
+            "body exactly '<invoice number>=<approved_amount>', status 'draft'. Do not change invoice amount or mark it paid."
         )
     if f == "acct_expenses":
         for x in rows["expenses"]:
@@ -649,8 +653,8 @@ def _workflow(b: _Builder) -> str:
                 x, status="approved" if x["row"]["amount"] <= b.threshold else "review", cost_center=p["cost_center"]
             )
         return (
-            "Process all submitted expenses: amount at or below policy expense_limit becomes approved; above becomes "
-            "review. Set their cost_center to the policy value. Never edit amount, category or employee."
+            "Process all submitted expenses: amount at or below the policy expense_limit gets status 'approved'; above "
+            "gets 'review'. Set their cost_center to the policy value. Never edit amount, category or employee."
         )
     if f == "acct_overdue":
         selected = [x for x in rows["invoices"] if x["row"]["amount"] > b.threshold]
@@ -659,9 +663,9 @@ def _workflow(b: _Builder) -> str:
             b.update(x, status="followup")
             b.draft(f"Followup {x['row']['number']}", str(x["row"]["amount"]), [lookup[x["row"]["account"]]])
         return (
-            "For open invoices strictly above policy expense_limit, mark status followup and create one draft to each "
-            "account's CRM contact: subject 'Followup ' plus invoice number, body only amount cents, empty thread,draft status. "
-            "Leave invoices at or below the limit untouched."
+            "For open invoices strictly above the policy expense_limit, set status 'followup' and create one mail draft "
+            "to each invoice account's CRM contact email: subject 'Followup <invoice number>', body only the invoice amount in "
+            "cents, empty thread, status 'draft'. Leave invoices at or below the limit untouched."
         )
     if f == "acct_credit":
         approved = json.loads(file["row"]["content"])["approved_amount"]
@@ -669,9 +673,9 @@ def _workflow(b: _Builder) -> str:
         b.update(invoice, amount=approved, status="adjusted")
         b.document(subject + ".txt", f"{invoice['row']['number']}={credit}")
         return (
-            f"Use {company}'s account JSON approved_amount to adjust its invoice amount and set status adjusted. "
-            f"Save '{subject}.txt' with invoice-number=old-minus-approved-credit as integer cents; "
-            "operations folder,coordinator owner,draft,private,no sharing,version1. Preserve paid and payment records."
+            f"Set {company}'s invoice amount to the approved_amount in its account JSON file, and its status to 'adjusted'. "
+            f"Save '{subject}.txt' containing only '<invoice number>=<credit>', where credit is the old invoice amount minus "
+            f"approved_amount in integer cents, {DOCUMENT}. Preserve paid and payment records."
         )
     if f == "storage_publish":
         selected = [x for x in rows["files"] if "-account-" in x["row"]["name"] and x["row"]["status"] == "approved"]
@@ -679,9 +683,9 @@ def _workflow(b: _Builder) -> str:
             b.update(x, access="team", shared_with=[b.manager], status="published")
         b.post("\n".join(sorted(x["row"]["name"] for x in selected)))
         return (
-            "Publish approved account JSON files only: status published,access team,shared_with exactly coordinator. "
-            "Post filenames sorted one per line to dispatch using coordinator sender,empty thread,posted status. "
-            "Do not publish drafts or either policy file."
+            "Publish approved account JSON files only: set status 'published', access 'team' and shared_with exactly "
+            "[coordinator]. Post their filenames sorted one per line as a chat message in the dispatch channel with coordinator "
+            "sender, empty thread and status 'posted'. Do not publish drafts or either policy file."
         )
     if f == "storage_archive":
         selected = [
@@ -693,9 +697,9 @@ def _workflow(b: _Builder) -> str:
             b.update(x, status="archived", folder="archive")
         b.document(subject + ".txt", str(len(selected)))
         return (
-            "Archive account JSON files whose content.updated is before policy archive_before; set status archived "
-            f"and folder archive. Save '{subject}.txt' with only the archived count; operations folder,coordinator owner, "
-            "draft,private,no sharing,version1. Keep newer files and policy files intact."
+            "Archive account JSON files whose content.updated is before the policy archive_before: set status 'archived' "
+            f"and folder 'archive'. Save '{subject}.txt' containing only the archived count, {DOCUMENT}. "
+            "Keep newer files and policy files intact."
         )
     if f == "storage_handoff":
         b.update(file, owner=b.manager, shared_with=[email])
@@ -712,9 +716,10 @@ def _workflow(b: _Builder) -> str:
         b.document(subject + ".csv", content, shared_with=[b.manager])
         b.update(rows["folders"][0], shared_with=[b.manager])
         return (
-            f"Join all CRM accounts to their contact emails. Save '{subject}.csv' with account,email rows sorted "
-            "by account,one per line,no header. Use operations folder,coordinator owner,draft,private,shared_with exactly "
-            "coordinator,version1. Share the operations folder with exactly coordinator too."
+            f"Join all CRM accounts to their contact emails. Save '{subject}.csv' with '<account>,<email>' rows sorted "
+            "by account, one per line, no header, in the operations folder with coordinator owner, status 'draft', access "
+            "'private', shared_with exactly [coordinator] and version 1. Also set the operations folder record's shared_with "
+            "to exactly [coordinator]; change no other folder field."
         )
     if f == "storage_redact":
         original = json.loads(file["row"]["content"])
@@ -722,9 +727,10 @@ def _workflow(b: _Builder) -> str:
         b.update(file, content=canonical_json(redacted), version=file["row"]["version"] + 1)
         b.draft(subject, file["row"]["name"], [rows["contacts"][target]["row"]["email"]])
         return (
-            f"Remove only private_phone from {company}'s account JSON content, serialize compact JSON with sorted "
-            f"keys, and increment file version by1. Draft a notice subject '{subject}' to the CRM contact, body only "
-            "the filename,empty thread,draft status. Keep the file private and all other JSON values."
+            f"Remove only private_phone from {company}'s account JSON content and serialize compact JSON with sorted "
+            "keys. Increment the file record's version field by 1; keep every other JSON value, including the version inside "
+            f"the content, unchanged. Create a mail draft to the account's CRM contact email with subject '{subject}', body "
+            "only the filename, empty thread and status 'draft'. Keep the file private."
         )
     if f == "mail_reply":
         b.draft(
@@ -735,8 +741,9 @@ def _workflow(b: _Builder) -> str:
         )
         b.update(mail, status="read", labels=["replied"])
         return (
-            f"For {company}'s mail request, draft a reply to sender on its thread using subject '{subject}' "
-            "and body invoice-number:outstanding-cents (amount minus paid). Mark original read with labels exactly [replied]."
+            f"For {company}'s mail request, create a mail draft replying to its sender on its thread with subject "
+            f"'{subject}', body '<invoice number>:<outstanding cents>' (invoice amount minus paid) and status 'draft'. "
+            "Set the original request status 'read' with labels exactly [\"replied\"]."
         )
     if f == "mail_campaign":
         selected_names = {x["row"]["name"] for x in accounts if x["row"]["region"] == b.region}
@@ -745,9 +752,9 @@ def _workflow(b: _Builder) -> str:
                 b.draft(subject, p["effective_date"], [x["row"]["email"]])
         b.post(str(len(selected_names)))
         return (
-            f"For accounts in policy region create one draft per CRM contact: subject '{subject}',body only "
-            "policy effective_date,empty thread,draft status. Post only recipient count to dispatch,coordinator sender, "
-            "empty thread,posted status. Do not send the drafts."
+            f"For accounts in the policy region create one mail draft per CRM contact email: subject '{subject}', body "
+            "only the policy effective_date value, empty thread, status 'draft'. Post only the recipient count as a chat "
+            "message in the dispatch channel with coordinator sender, empty thread and status 'posted'. Do not send the drafts."
         )
     if f == "mail_triage":
         for x in mails:
@@ -764,17 +771,17 @@ def _workflow(b: _Builder) -> str:
             ),
         )
         return (
-            "Triage request messages by body.priority: high gets labels exactly [urgent],normal gets [routine]; "
-            f"mark each read. Save '{subject}.txt' listing high-priority account names sorted one per line; "
-            "operations folder,coordinator owner,draft,private,no sharing,version1."
+            'Triage request messages by body.priority: high gets labels exactly ["urgent"], normal gets ["routine"]; '
+            f"set each status 'read'. Save '{subject}.txt' listing high-priority account names sorted one per line, "
+            f"{DOCUMENT}."
         )
     if f == "mail_followup":
         b.draft(subject, p["effective_date"], [email], thread)
         b.update(rows["leave"][target], delegate=b.manager)
         return (
-            f"For the employee named in {company}'s request, set their leave delegate coordinator and draft "
-            f"a follow-up to that employee on the request thread: subject '{subject}',body only policy effective_date,draft status. "
-            "Preserve leave approval status."
+            f"For the employee named in {company}'s mail request, set their leave delegate to the coordinator and create "
+            f"a mail draft to that employee on the request thread: subject '{subject}', body only the policy effective_date "
+            "value, status 'draft'. Preserve leave approval status."
         )
     if f == "mail_deduplicate":
         fields = {k: v for k, v in mail["row"].items() if k != "id"}
@@ -785,8 +792,9 @@ def _workflow(b: _Builder) -> str:
         b.post(thread)
         return (
             f"The thread {thread} has duplicate messages across mail accounts. Keep its copy in vendor "
-            f"{mail['vendor']} and set labels exactly [canonical]; delete the other copy. Post only the thread ID "
-            "to dispatch with coordinator sender,empty thread,posted status. Do not delete other messages."
+            f'{mail["vendor"]} and set its labels exactly ["canonical"]; delete the other copy. Post only the thread '
+            "ID as a chat message in the dispatch channel with coordinator sender, empty thread and status 'posted'. "
+            "Do not delete other messages."
         )
     if f == "chat_incident":
         selected = [
@@ -800,17 +808,18 @@ def _workflow(b: _Builder) -> str:
             b.update(inv, owner=b.manager, status="review")
             b.update(x, status="escalated")
         return (
-            "Find dispatch chat cases that are urgent and unresolved in their JSON body. Set those message "
-            "statuses escalated and the linked invoice owner coordinator,status review. Leave routine and resolved cases unchanged."
+            "Find dispatch chat cases that are urgent and unresolved in their JSON body. Set those messages' status "
+            "'escalated', and set each linked invoice's owner to the coordinator and status 'review'. Leave routine and "
+            "resolved cases unchanged."
         )
     if f == "chat_roster":
         members = sorted(x["row"]["email"] for x in employees if x["row"]["department"] == b.department)
         b.update(rows["channels"][0], members=sorted([b.manager, *members]))
         b.document(subject + ".txt", "\n".join(members))
         return (
-            f"Set dispatch channel members to coordinator plus all HR employees in {b.department}, sorted. "
-            f"Save '{subject}.txt' containing only those employees' emails sorted one per line; "
-            "operations folder,coordinator owner,draft,private,no sharing,version1."
+            f"Set dispatch channel members to the coordinator plus all HR employees in {b.department}, sorted. "
+            f"Save '{subject}.txt' containing only those employees' emails (not the coordinator) sorted one per line, "
+            f"{DOCUMENT}."
         )
     if f == "chat_digest":
         amounts = {x["row"]["number"]: x["row"]["amount"] for x in rows["invoices"]}
@@ -820,16 +829,20 @@ def _workflow(b: _Builder) -> str:
         b.post(content)
         b.draft(subject, str(sum(amounts.values())), [b.manager])
         return (
-            "Join every dispatch case to its invoice. Post thread=invoice-amount pairs sorted by thread,one per "
-            f"line,coordinator sender,empty thread,posted status. Draft subject '{subject}' to coordinator,body only "
-            "sum of those invoice cents,empty thread,draft status."
+            "Join every dispatch chat case to its invoice. Post '<case thread>=<invoice amount>' lines sorted by thread, "
+            "one per line, as a chat message in the dispatch channel with coordinator sender, empty thread and status "
+            f"'posted'. Create a mail draft to the coordinator with subject '{subject}', body only the sum of those invoice "
+            "cents, empty thread and status 'draft'."
         )
     if f == "chat_topic":
+        # The folder starts with a previous owner, so the requested ownership transfer is a real state change.
+        rows["folders"][0]["row"]["owner"] = email
         b.update(rows["channels"][0], topic=f"{b.department} | {p['effective_date']} | {p['cost_center']}")
         b.update(rows["folders"][0], owner=b.manager, access="team")
         return (
-            "Read current policy and set dispatch topic to department | effective_date | cost_center with one "
-            "space around each pipe. Transfer operations folder owner to coordinator and access team. Preserve its sharing list."
+            "Read the current policy and set the dispatch channel topic to '<department> | <effective_date> | "
+            "<cost_center>' with one space around each pipe. Set the operations folder record's owner to the coordinator "
+            "and access to 'team'. Preserve its sharing list and the policy files."
         )
     if f == "chat_closeout":
         selected = [x for x in chats if json.loads(x["row"]["body"])["resolved"]]
@@ -838,8 +851,8 @@ def _workflow(b: _Builder) -> str:
             name = json.loads(x["row"]["body"])["account"]
             b.update(next(y for y in accounts if y["row"]["name"] == name), tier="reviewed")
         return (
-            "Close dispatch chat messages whose JSON resolved is true and set their CRM account tier reviewed. "
-            "Preserve message body,account status,and all unresolved cases."
+            "Set status 'closed' on dispatch chat messages whose JSON resolved is true, and set their CRM account tier "
+            "'reviewed'. Preserve message bodies, account status and all unresolved cases."
         )
     raise ValueError("unknown workflow family")
 

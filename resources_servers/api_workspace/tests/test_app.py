@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 
@@ -50,7 +51,7 @@ def gold_calls(scenario):
 def seeded():
     native = server()
     with TestClient(native.setup_webserver()) as client:
-        identity = "api-workspace-v3:train:acct_reconcile:0000"
+        identity = "api-workspace-v4:train:acct_reconcile:0000"
         assert client.post("/seed_session", json={"task_id": identity}).status_code == 200
         yield native, client, scenario_from_id(identity)
 
@@ -86,7 +87,7 @@ def test_all_immutable_tasks_gold_noop_wrong_and_preservation(family):
 def test_created_text_files_accept_line_endings_without_mutating_state(line_ending):
     checked = 0
     for family in FAMILIES:
-        scenario = scenario_from_id(f"api-workspace-v3:train:{family}:0000")
+        scenario = scenario_from_id(f"api-workspace-v4:train:{family}:0000")
         goals = [goal for goal in scenario.creates if goal["collection"] == "files"]
         if not goals:
             continue
@@ -106,7 +107,7 @@ def test_created_text_files_accept_line_endings_without_mutating_state(line_endi
 
 @pytest.mark.parametrize("suffix", ["\n\n", " ", "\nextra"])
 def test_created_text_files_reject_changed_content_and_extra_blank_lines(suffix):
-    scenario = scenario_from_id("api-workspace-v3:train:hr_onboarding:0000")
+    scenario = scenario_from_id("api-workspace-v4:train:hr_onboarding:0000")
     world = Workspace(scenario)
     for call in gold_calls(scenario):
         world.request(**call)
@@ -118,7 +119,7 @@ def test_created_text_files_reject_changed_content_and_extra_blank_lines(suffix)
 
 
 def test_created_text_file_equivalence_does_not_relax_preserved_records():
-    scenario = scenario_from_id("api-workspace-v3:train:hr_onboarding:0000")
+    scenario = scenario_from_id("api-workspace-v4:train:hr_onboarding:0000")
     world = Workspace(scenario)
     for call in gold_calls(scenario):
         world.request(**call)
@@ -244,7 +245,7 @@ def test_parallel_idempotency_order_and_session_isolation(seeded):
 def test_concurrent_independent_clients_reset_and_close():
     native = server()
     app = native.setup_webserver()
-    identity = "api-workspace-v3:train:storage_index:0000"
+    identity = "api-workspace-v4:train:storage_index:0000"
     scenario = scenario_from_id(identity)
 
     def run(index):
@@ -270,10 +271,10 @@ def test_corpus_split_prompt_authority_and_noncanonical_ids():
     assert "50 model turns" in row["responses_create_params"]["input"][0]["content"]
     assert not {"records", "updates", "creates", "deletes", "goals"} & row.keys()
     for identity in (
-        "api-workspace-v3:train:hr_onboarding:0",
-        "api-workspace-v3:train:hr_onboarding:0080",
-        "api-workspace-v3:eval:hr_onboarding:0000",
-        "api-workspace-v3:train:invented:0000",
+        "api-workspace-v4:train:hr_onboarding:0",
+        "api-workspace-v4:train:hr_onboarding:0080",
+        "api-workspace-v4:eval:hr_onboarding:0000",
+        "api-workspace-v4:train:invented:0000",
     ):
         with pytest.raises(ValueError):
             scenario_from_id(identity)
@@ -388,3 +389,52 @@ def test_independent_sql_reference_rederives_every_gold(family):
             body=vendor.wire({"location": "Wrong reference result"}),
         )
         assert world.score()["reward"] == 0
+
+
+def test_native_records_carry_exactly_their_collection_schema():
+    from resources_servers.api_workspace.engine import COLLECTIONS
+
+    for split in ("train", "val"):
+        for identity in task_ids(split):
+            scenario = scenario_from_id(identity)
+            for vendor, collections in scenario.records.items():
+                schema = COLLECTIONS[VENDORS[vendor].function]
+                for collection, rows in collections.items():
+                    for row in rows.values():
+                        assert row.keys() == {"id", *schema[collection]}, (identity, vendor, collection, row.keys())
+                        for key, kind in schema[collection].items():
+                            assert type(row[key]) is kind, (identity, collection, key)
+
+
+def test_every_goal_update_changes_visible_initial_state():
+    for identity in task_ids("train") + task_ids("val"):
+        scenario = scenario_from_id(identity)
+        for goal in scenario.updates:
+            row = scenario.records[goal["vendor"]][goal["collection"]][goal["id"]]
+            assert any(row[key] != value for key, value in goal["fields"].items()), (identity, goal)
+
+
+def test_contact_verification_requests_a_new_verified_address():
+    for identity in task_ids("train"):
+        if ":crm_contacts:" not in identity:
+            continue
+        scenario = scenario_from_id(identity)
+        contact = next(goal for goal in scenario.updates if goal["collection"] == "contacts")
+        before = scenario.records[contact["vendor"]]["contacts"][contact["id"]]
+        assert contact["fields"]["email"] != before["email"]
+        assert contact["fields"]["status"] == "verified" and "'verified'" in scenario.prompt
+
+
+def test_instructions_name_literal_values_and_spaced_numbers():
+    assert (
+        "at most 50 model turns" in row_from_id(task_ids("train")[0])["responses_create_params"]["input"][0]["content"]
+    )
+    for identity in task_ids("train"):
+        prompt = scenario_from_id(identity).prompt
+        assert not re.search(r"\b(?:most|least|probability|version|by)\d", prompt), prompt
+        assert not re.search(r"\binvoice-number\b|\bthread=invoice-amount\b|labels exactly \[[a-z]", prompt), prompt
+
+
+def test_previous_revision_identities_are_not_constructed():
+    with pytest.raises(ValueError):
+        scenario_from_id("api-workspace-v3:train:hr_onboarding:0000")
