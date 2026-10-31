@@ -118,6 +118,11 @@ Agents whose configuration declares `working_directory` (Pi) run their tools in
 the task's working directory unless `agent_kwargs` supplies one, as under
 `anyswe_agent`.
 
+For a rollout-scoped request the harness runs with the rollout id (`NGTB_ROLLOUT_ID`), returns its agent
+observations (context compactions, tool timings) in `response.json`, and `/run` returns them as
+`ng_agent_observations`, as `anyswe_agent` does. A harness that reports none (such as an agent without
+observability) leaves the field out.
+
 Agent dependencies are installed once at startup into a portable Python prefix
 mounted read-only inside the task container at `/agent_deps_mount`. To support a
 new agent, add `responses_api_agents/<agent_dir>/scripts/<agent_dir>_deps.sh` (see

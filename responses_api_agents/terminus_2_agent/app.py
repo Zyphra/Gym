@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import errno
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -34,7 +35,7 @@ from contextlib import ExitStack
 from contextvars import ContextVar
 from pathlib import Path
 from time import time
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
 from fastapi import Request
@@ -57,6 +58,12 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputTokensDetails,
     NeMoGymResponseUsage,
 )
+from nemo_gym.rollout_observability import (
+    AgentInvocation,
+    AgentObservationBundle,
+    ContextCompactionObservation,
+    ObservationGap,
+)
 from nemo_gym.server_utils import get_response_json, raise_for_status
 from responses_api_agents.terminus_2_agent.context_budget import ServedContextTerminus2
 from responses_api_agents.terminus_2_agent.llm import EpisodeTerminatedError, NemoGymLLM
@@ -64,6 +71,9 @@ from responses_api_agents.terminus_2_agent.output import trajectory_to_responses
 
 
 LOG = logging.getLogger(__name__)
+_INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
+_OBSERVATION_SOURCE = "terminus_2"
+_ROOT_INVOCATION_ID = "root"
 # Runs under the harness interpreter; see its docstring for the boundary it keeps.
 COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
 NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
@@ -425,6 +435,67 @@ class LocalTmuxSession(TmuxSession):
 class StandaloneTerminus2(ServedContextTerminus2):
     """Run Terminus-2 in a unique tmux session."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._compactions: list[ContextCompactionObservation] = []
+        self._compaction_trigger = "context_length_exceeded"
+
+    async def _check_proactive_summarization(self, *args: Any, **kwargs: Any) -> Any:
+        self._compaction_trigger = "proactive_free_tokens"
+        try:
+            return await super()._check_proactive_summarization(*args, **kwargs)
+        finally:
+            self._compaction_trigger = "context_length_exceeded"
+
+    async def _summarize(self, chat: Any, original_instruction: str, *args: Any, **kwargs: Any) -> Any:
+        """Record each context summarization Harbor performs as a compaction event.
+
+        Harbor owns the three-call hand-off, so this only observes it: ``tokens_before`` is the chat's
+        token count when the hand-off starts (the served count, which includes hidden reasoning, once
+        the endpoint has reported usage) and ``summary`` is the hand-off prompt the next context receives.
+        A failed or cancelled hand-off is recorded as such; an empty chat is not compacted.
+        """
+        if not chat.messages:
+            return await super()._summarize(chat, original_instruction, *args, **kwargs)
+        tokens_before = None
+        try:
+            counted = self._count_total_tokens(chat)
+            tokens_before = await counted if inspect.isawaitable(counted) else counted
+        except Exception:
+            LOG.debug("Terminus-2 could not count tokens before a compaction", exc_info=True)
+        outcome: Literal["completed", "failed", "aborted"] = "failed"
+        summary = None
+        try:
+            handoff, subagent_refs = await super()._summarize(chat, original_instruction, *args, **kwargs)
+            outcome, summary = "completed", handoff
+            return handoff, subagent_refs
+        except asyncio.CancelledError:
+            outcome = "aborted"
+            raise
+        finally:
+            self._compactions.append(
+                ContextCompactionObservation(
+                    invocation_id=_ROOT_INVOCATION_ID,
+                    observed_at=time(),
+                    trigger=self._compaction_trigger,
+                    tokens_before=tokens_before if type(tokens_before) is int and tokens_before >= 0 else None,
+                    outcome=outcome,
+                    summary=summary if isinstance(summary, str) else None,
+                )
+            )
+
+    def observations(self) -> AgentObservationBundle:
+        """The compactions this run performed, with what the harness cannot report as explicit gaps."""
+        codes = ["model_call_ownership_unavailable"]
+        if self._compactions:
+            codes += ["compaction_model_call_boundary_unavailable", "compaction_tokens_after_unavailable"]
+        gaps = [ObservationGap(code=code, invocation_id=_ROOT_INVOCATION_ID) for code in codes]
+        return AgentObservationBundle(
+            source=_OBSERVATION_SOURCE,
+            records=[AgentInvocation(invocation_id=_ROOT_INVOCATION_ID), *self._compactions],
+            gaps=gaps,
+        )
+
     async def _handle_llm_interaction(self, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
         """Track Terminus-2's consecutive two-response completion handshake."""
         result = await super()._handle_llm_interaction(*args, **kwargs)
@@ -595,6 +666,10 @@ class Terminus2AgentVerifyResponse(BaseVerifyResponse):
     context_length_exceeded_error: int = 0
     agent_failed: bool = False
     agent_error: Optional[str] = None
+    ng_agent_observations: Optional[AgentObservationBundle] = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 class Terminus2Agent(SimpleResponsesAPIAgent):
@@ -668,6 +743,7 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
         body: NeMoGymResponseCreateParamsNonStreaming,
         instruction: str,
         api_base: str,
+        observation_collector: Optional[Callable[[AgentObservationBundle], None]] = None,
     ) -> tuple[dict[str, Any], AgentContext, dict[str, Any], bool, bool]:
         logs_dir = self._logs_dir()
         temporary_workspace: Optional[Path] = None
@@ -690,6 +766,11 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                     timed_out = True
                     LOG.warning("Terminus-2 timed out after %gs", self.config.timeout)
             finally:
+                if observation_collector is not None:
+                    try:
+                        observation_collector(agent.observations())
+                    except Exception:
+                        LOG.exception("failed to return Terminus-2 observations")
                 teardown_kwargs = {} if self.config.teardown_tmux else {"terminate": False}
                 try:
                     await agent.close(environment, **teardown_kwargs)
@@ -734,9 +815,18 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             self.config.model_server.name,
             self._rollout_id(request),
         )
+        rollout_id = self._rollout_id(request)
+        observations: Optional[AgentObservationBundle] = None
+
+        def collect(bundle: AgentObservationBundle) -> None:
+            nonlocal observations
+            observations = bundle
+
+        # Only a rollout-scoped request returns observations, as for every other harness.
+        run_kwargs = {"observation_collector": collect} if isinstance(rollout_id, str) else {}
         async with self.sem:
             trajectory, context, flags, timed_out, finished_naturally = await self._run_terminus(
-                body, instruction, api_base
+                body, instruction, api_base, **run_kwargs
             )
         output_items = trajectory_to_responses(trajectory)
         if not output_items:
@@ -769,7 +859,7 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             output_tokens = context.n_output_tokens or 0
             cached_tokens = context.n_cache_tokens or 0
 
-        return NeMoGymResponse(
+        response = NeMoGymResponse(
             id=f"resp_{uuid4().hex}",
             created_at=int(time()),
             model=self._model_name(body),
@@ -814,6 +904,9 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 "finished_naturally": "true" if finished_naturally else "false",
             },
         )
+        if observations is None:
+            return response
+        return response.model_copy(update={_INTERNAL_OBSERVATIONS_KEY: observations.model_dump(mode="json")})
 
     async def run(self, request: Request, body: Terminus2AgentRunRequest) -> Terminus2AgentVerifyResponse:
         cookies = request.cookies
@@ -835,6 +928,10 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
         await raise_for_status(agent_response)
         cookies = agent_response.cookies
         response_json = await get_response_json(agent_response)
+        raw_observations = response_json.pop(_INTERNAL_OBSERVATIONS_KEY, None)
+        observations = (
+            AgentObservationBundle.model_validate(raw_observations) if isinstance(raw_observations, dict) else None
+        )
 
         verify_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
@@ -868,6 +965,7 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 "context_length_exceeded_error": int(flags.get("context_length_exceeded", False)),
                 "agent_failed": bool(flags.get("agent_error")),
                 "agent_error": flags.get("agent_error"),
+                **({"ng_agent_observations": observations} if observations is not None else {}),
             }
         )
 
