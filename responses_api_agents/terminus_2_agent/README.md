@@ -38,6 +38,15 @@ assistant messages and echoes it on the next request, for training and evaluatio
 Compaction can discard old messages; retained messages keep their reasoning.
 The native summarization subagent's content-only prompt remains unchanged.
 
+Each context summarization Harbor performs (proactive at `proactive_summarization_threshold` free
+tokens, or after a context-length error) is reported as a completed, failed or aborted
+`context_compaction` record in the rollout's agent observations, like Hermes, Pi and OpenHands
+compactions, so a trainer can compare compacted and uncompacted episodes. `tokens_before` is the chat's token
+count when the hand-off starts and `summary` is the hand-off prompt the next context receives; the
+summary's model calls and the post-compaction token count are reported as observation gaps. The fallback
+short summaries Harbor uses when the full hand-off fails are not recorded. Observations are returned only
+for a rollout-scoped request.
+
 A policy completion with an explicit terminal stop reason ends the episode, including when received during compaction. The completed trajectory remains available for grading; a permanent stop is not retried as recoverable context overflow.
 
 Length-limited completions keep their served reasoning and token metadata when

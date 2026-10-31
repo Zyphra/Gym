@@ -64,6 +64,11 @@ from responses_api_agents.anyterminal_agent.continue_until_timeout import (
 from responses_api_agents.anyterminal_agent.task_network import TaskNetwork
 
 
+# The harness runner's response.json carries its observation bundle under this key; the Agent Server
+# moves it to the verify response's ng_agent_observations.
+_INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
+
+
 def _format_container(
     container_formatter: str | list[str], task_name: str, docker_image: str, runtime_image: str | None = None
 ) -> str:
@@ -346,6 +351,7 @@ os.environ["PATH"] = os.environ.get("PATH", os.defpath) + os.pathsep + "/agent_d
 
 MODEL_URL    = os.environ.get("NGTB_MODEL_URL", "")
 MODEL_NAME   = os.environ["NGTB_MODEL_NAME"]
+ROLLOUT_ID   = os.environ.get("NGTB_ROLLOUT_ID")
 INSTRUCTION  = Path("/trajectories_mount/instruction.txt").read_text()
 AGENT_KWARGS = json.loads(os.environ.get("NGTB_AGENT_KWARGS", "{{}}"))
 SAMPLING     = json.loads(os.environ.get("NGTB_SAMPLING", "{{}}"))
@@ -395,7 +401,9 @@ body = NeMoGymResponseCreateParamsNonStreaming(
     model=MODEL_NAME,
     **SAMPLING,
 )
-response = asyncio.run(agent.responses(request=Request({{"type": "http", "path_params": {{}}}}), body=body))
+# A harness returns its agent observations (context compactions, tool timings) only for a rollout-scoped request.
+request = Request({{"type": "http", "path_params": {{"rollout_id": ROLLOUT_ID}} if ROLLOUT_ID else {{}}}})
+response = asyncio.run(agent.responses(request=request, body=body))
 Path("/trajectories_mount/response.json").write_text(response.model_dump_json())
 print(f"agent finished: {{len(response.output)}} output items", flush=True)
 """
@@ -613,6 +621,10 @@ class AnyTerminalInstanceConfig(AnyTerminalAgentConfig, AnyTerminalServerConfig)
 class AnyTerminalVerifyResponse(TerminalBenchMetrics, BaseVerifyResponse):
     instance_config: Dict[str, Any]
     done_reason: Optional[str] = Field(default=None, exclude_if=lambda value: value is None)
+    ng_agent_observations: Optional[AgentObservationBundle] = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
 
 
 def _episode_sandbox_resources(params: AnyTerminalInstanceConfig) -> SandboxResources:
@@ -898,6 +910,8 @@ class RunTerminalAgent(BaseModel):
             env["NGTB_MODEL_URL"] = cfg.model_server_url
         if cfg.problem_info.get("workdir"):
             env["NGTB_TASK_WORKDIR"] = str(cfg.problem_info["workdir"])
+        if cfg.rollout_id:
+            env["NGTB_ROLLOUT_ID"] = cfg.rollout_id
         env.update(cfg.agent_environment)
         return env
 
@@ -1377,12 +1391,13 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
     agent_error = None
     finished_naturally = False
     saved = None
+    observations = None
     harness_error = None
     if response_path.exists():
         try:
             data = json.loads(response_path.read_text())
             data["model"] = params.model_name
-            raw_observations = data.pop("_ng_agent_observations", None)
+            raw_observations = data.pop(_INTERNAL_OBSERVATIONS_KEY, None)
             observations = (
                 AgentObservationBundle.model_validate(raw_observations) if raw_observations is not None else None
             )
@@ -1398,6 +1413,7 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
             if saved.status == "failed" and not agent_error:
                 agent_error = (saved.error.code if saved.error else None) or "failed"
         except (json.JSONDecodeError, ValueError) as e:
+            observations = None
             agent_error = "response_unreadable"
             print(f"[{params.task_name}] response.json unreadable ({e}), treating as empty response", flush=True)
     elif not mask_sample:
@@ -1417,7 +1433,7 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
     }
     update_metrics(params.metrics_fpath, labels, params.task_name)
 
-    return NeMoGymResponse(
+    response = NeMoGymResponse(
         id=f"anyterminal-{params.instance_id}",
         created_at=int(time.time()),
         model=params.model_name,
@@ -1435,6 +1451,9 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
             "instance_config": _safe_config_json(params),
         },
     )
+    if observations is None or params.rollout_id is None:
+        return response
+    return response.model_copy(update={_INTERNAL_OBSERVATIONS_KEY: observations.model_dump(mode="json")})
 
 
 async def run_terminal_episode(params_dict: dict) -> Dict[str, Any]:
@@ -1666,6 +1685,12 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
             response = await self._responses(body.responses_create_params, self.rollout_id_from_run(body))
 
             meta, response.metadata = response.metadata, None
+            response_payload = response.model_dump(mode="json")
+            raw_observations = response_payload.pop(_INTERNAL_OBSERVATIONS_KEY, None)
+            observations = (
+                AgentObservationBundle.model_validate(raw_observations) if isinstance(raw_observations, dict) else None
+            )
+            response = NeMoGymResponse.model_validate(response_payload)
             metrics = TerminalBenchMetrics.model_validate_json(meta["metrics"])
             instance_config = AnyTerminalInstanceConfig.model_validate_json(meta["instance_config"])
 
@@ -1681,6 +1706,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
                 done_reason="context_exhausted" if meta.get("stop_reason") == "context_exhausted" else None,
                 **metrics.model_dump(),
                 instance_config=instance_config.model_dump(),
+                ng_agent_observations=observations,
             )
 
 
