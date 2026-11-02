@@ -20,6 +20,11 @@ verification (gold/no-op/wrong = 1/0/0). No model, judge or Python sandbox is
 substituted for an outcome claim: the tool route is a deterministic fixture,
 and model compliance and sandbox qualification remain separate.
 
+A rollout-scoped run that records its trajectory also returns `ng_agent_observations`:
+each dispatched tool call with its measured timing, and no `context_compaction`
+record, since the agent sends its whole history on every turn. A trainer reads it
+as an observed episode with zero compactions.
+
 # Licensing information
 Code: Apache 2.0
 Data: N/A
