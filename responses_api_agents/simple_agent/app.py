@@ -52,8 +52,10 @@ from nemo_gym.rollout_correlation import (
 )
 from nemo_gym.rollout_observability import (
     AgentInvocation,
+    AgentObservationBundle,
     ModelCallRef,
     ObservationGap,
+    ToolCallObservation,
     TrajectoryRecord,
     TrajectoryToolCall,
     TrajectoryTurn,
@@ -62,6 +64,21 @@ from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypo
 
 
 _INTERNAL_TRAJECTORY_KEY = "_ng_trajectory"
+_OBSERVATION_SOURCE = "simple_agent"
+
+
+def _agent_observations(trajectory: TrajectoryRecord) -> AgentObservationBundle:
+    """The run's standard agent observations: every tool call it dispatched, with its timing.
+
+    The agent sends its whole history on every turn and never compacts it, so the bundle
+    holds no context-compaction record: an observed run with zero compactions.
+    """
+    return AgentObservationBundle(
+        source=_OBSERVATION_SOURCE,
+        records=[
+            ToolCallObservation.model_validate(call.model_dump(exclude={"output"})) for call in trajectory.tool_calls
+        ],
+    )
 
 
 def _is_policy_context_exhaustion(error: ClientResponseError) -> bool:
@@ -434,6 +451,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             else:
                 trajectory.gaps.append(ObservationGap(code="resolution_unavailable", invocation_id="root"))
             result["ng_trajectory"] = trajectory.model_dump(mode="json")
+            result["ng_agent_observations"] = _agent_observations(trajectory).model_dump(mode="json")
         return SimpleAgentVerifyResponse.model_validate(result)
 
     async def aggregate_metrics(self, body: AggregateMetricsRequest = Body()) -> AggregateMetrics:
