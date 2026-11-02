@@ -37,7 +37,12 @@ from nemo_gym.openai_utils import (
     NeMoGymSummary,
 )
 from nemo_gym.rollout_collection import _attach_trajectory_record
-from nemo_gym.rollout_observability import TrajectoryRecord
+from nemo_gym.rollout_observability import (
+    AgentObservationBundle,
+    ContextCompactionObservation,
+    ToolCallObservation,
+    TrajectoryRecord,
+)
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.simple_agent.app import (
     ModelServerRef,
@@ -313,6 +318,16 @@ class TestApp:
         ]
 
         result_data = result.model_dump(mode="json")
+        # The standard observation bundle: the dispatched tool call with its timing, and no compaction
+        # record, since this agent never compacts its history.
+        bundle = AgentObservationBundle.model_validate(result_data["ng_agent_observations"])
+        assert bundle.source == "simple_agent" and bundle.gaps == []
+        assert not any(isinstance(record, ContextCompactionObservation) for record in bundle.records)
+        [observed] = bundle.records
+        [produced] = result_data["ng_trajectory"]["tool_calls"]
+        assert type(observed) is ToolCallObservation
+        assert observed.model_dump(mode="json") == {key: value for key, value in produced.items() if key != "output"}
+        assert (observed.tool_call_id, observed.tool_name, observed.status) == ("call-1", "lookup", "failed")
         result_data["ng_model_call_capture"] = {
             "calls": [
                 {
@@ -407,6 +422,8 @@ class TestApp:
             "/verify",
         ]
         assert "ng_trajectory" not in result.model_dump(mode="json")
+        # Without its rollout-scoped trajectory, the run claims no observations.
+        assert "ng_agent_observations" not in result.model_dump(mode="json")
 
     async def test_responses_continues_on_malformed_tool_call_arguments(self, monkeypatch: MonkeyPatch) -> None:
         """Malformed JSON in a tool-call's arguments must not crash the rollout.
