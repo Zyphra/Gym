@@ -1403,7 +1403,10 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
             )
             saved = NeMoGymResponse.model_validate(data)
             agent_stop_reason = (saved.metadata or {}).get("stop_reason")
-            harness_error = harness_response_error(saved, observations)
+            # The mask verdict reads only what an unscoped harness run returns. The bundle of a
+            # rollout-scoped run is telemetry and never changes which episodes are masked: Hermes
+            # reports zero usage, so its bundle would mask every run that recorded no model call.
+            harness_error = harness_response_error(saved, None if params.rollout_id else observations)
             output_items = saved.output
             tools = saved.tools or []
             # The inner harness's own failure label (hermes status/error,

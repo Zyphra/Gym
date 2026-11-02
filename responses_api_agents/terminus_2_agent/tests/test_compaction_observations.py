@@ -224,3 +224,111 @@ async def test_a_rollout_scoped_request_returns_the_observations_through_run(pol
     # The resources server verifies the response the harness produced, not its observation channel.
     verified_response = agent.server_client.post.await_args_list[-1].kwargs["json"]["response"]
     assert _INTERNAL_OBSERVATIONS_KEY not in verified_response
+
+
+@pytest.fixture
+async def overflowing_endpoint():
+    """A chat endpoint whose first call overflows the context, then answers harbor's hand-off and the next turn."""
+    requests: list[dict] = []
+
+    async def complete(request):
+        requests.append(await request.json())
+        if len(requests) == 1:
+            message = "This model's maximum context length is 3000 tokens. However, you requested 9000 tokens."
+            return web.json_response({"error": {"message": message, "type": "invalid_request_error"}}, status=400)
+        messages = requests[-1]["messages"]
+        # Harbor's own hand-off prompts: summary, questions, then answers; any other call is a turn.
+        roles = (
+            "next agent needs to understand everything" in messages[-1]["content"],
+            messages[0]["content"].startswith("You are picking up work from a previous AI agent"),
+            messages[-1]["content"].startswith("The next agent has a few questions for you"),
+        )
+        reply = REPLIES[roles.index(True)] if any(roles) else {"content": '{"analysis": "go on"}'}
+        usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        message = {"role": "assistant", **reply}
+        return web.json_response({"choices": [{"message": message, "finish_reason": "stop"}], "usage": usage})
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", complete)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    llms: list[NemoGymLLM] = []
+
+    def llm(max_input_tokens: int) -> NemoGymLLM:
+        model_info = {"max_input_tokens": max_input_tokens, "max_output_tokens": 1000}
+        llms.append(NemoGymLLM(model_name="policy", api_base=f"http://127.0.0.1:{port}/v1", model_info=model_info))
+        return llms[-1]
+
+    try:
+        yield llm, requests
+    finally:
+        for client in llms:
+            await client.aclose()
+        await runner.cleanup()
+
+
+async def _overflow(agent: StandaloneTerminus2, chat: Chat):
+    """Harbor's own context-length path: unwind the history, compact it, then send the turn again."""
+    return await agent._query_llm(chat, "next turn", (None, None, None), FIXTURE["instruction"], _Screen())
+
+
+async def test_an_overflow_hand_off_reports_the_history_size_before_harbor_unwinds_it(overflowing_endpoint, tmp_path):
+    make_llm, requests = overflowing_endpoint
+    probe = _agent(tmp_path, make_llm(10**6))
+    kept = _chat(probe._llm)
+    kept._messages = kept.messages[:2]
+    # Harbor frees 4000 tokens: a window that keeps the first exchange and drops the last one.
+    llm = make_llm(probe._count_total_tokens(kept) + 4000)
+    agent = _agent(tmp_path, llm)
+    chat = _chat(llm)
+    overflowing = agent._count_total_tokens(chat)
+    assert overflowing > probe._count_total_tokens(kept)
+
+    reply = await _overflow(agent, chat)
+
+    assert len(requests) == 5 and reply.content == '{"analysis": "go on"}'
+    # The summary call saw the unwound history (one exchange and its prompt), not the overflowing one.
+    assert len(requests[1]["messages"]) == 3
+    [compaction] = _compactions(agent.observations())
+    assert (compaction.outcome, compaction.trigger) == ("completed", "context_length_exceeded")
+    assert compaction.tokens_before == overflowing
+    assert compaction.summary.startswith("Here are the answers")
+    # The pending size is consumed: a later hand-off counts its own history.
+    await agent._summarize(_chat(llm), FIXTURE["instruction"], _Screen())
+    assert [c.tokens_before for c in _compactions(agent.observations())] == [overflowing, overflowing]
+    assert agent._unwound_from_tokens is None
+
+
+async def test_a_history_unwound_to_nothing_is_a_compaction_without_a_summary(overflowing_endpoint, tmp_path):
+    make_llm, requests = overflowing_endpoint
+    # A window smaller than the 4000 tokens Harbor frees: it unwinds every exchange.
+    llm = make_llm(3000)
+    agent = _agent(tmp_path, llm)
+    chat = _chat(llm)
+    overflowing = agent._count_total_tokens(chat)
+
+    reply = await _overflow(agent, chat)
+
+    # No hand-off subagent ran: the next context restarts from the instruction alone.
+    assert len(requests) == 2 and requests[1]["messages"] == [{"role": "user", "content": FIXTURE["instruction"]}]
+    assert reply.content == '{"analysis": "go on"}'
+    [compaction] = _compactions(agent.observations())
+    assert (compaction.outcome, compaction.summary, compaction.tokens_before) == ("completed", None, overflowing)
+
+
+async def test_recording_a_compaction_never_changes_the_hand_off(policy, tmp_path):
+    llm, requests = policy
+    agent = _agent(tmp_path, llm)
+
+    with patch(
+        "responses_api_agents.terminus_2_agent.app.ContextCompactionObservation", side_effect=ValueError("broken")
+    ):
+        handoff, refs = await agent._summarize(_chat(llm), FIXTURE["instruction"], _Screen())
+
+    assert len(requests) == 3 and len(refs) == 3 and handoff.startswith("Here are the answers")
+    bundle = agent.observations()
+    assert _compactions(bundle) == []
+    assert "compaction_observation_failed" in {gap.code for gap in bundle.gaps}

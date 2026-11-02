@@ -11,6 +11,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from harbor.models.agent.context import AgentContext
 
+from nemo_gym.openai_utils import (
+    NeMoGymResponse,
+    NeMoGymResponseInputTokensDetails,
+    NeMoGymResponseOutputMessage,
+    NeMoGymResponseOutputText,
+    NeMoGymResponseOutputTokensDetails,
+    NeMoGymResponseUsage,
+)
 from nemo_gym.rollout_observability import (
     AgentInvocation,
     AgentObservationBundle,
@@ -142,3 +150,61 @@ def test_an_unreadable_response_returns_no_observations(tmp_path):
 
     assert _INTERNAL_OBSERVATIONS_KEY not in response.model_dump(mode="json")
     assert json.loads(response.metadata["metrics"])["agent_error"] == "response_unreadable"
+
+
+def _no_call_failure(*, scoped_bundle: bool) -> dict:
+    """A harness response that failed before any model call: Hermes' shape, which always reports zero usage."""
+    response = NeMoGymResponse(
+        id="resp-hermes",
+        created_at=0,
+        model="policy",
+        object="response",
+        output=[
+            NeMoGymResponseOutputMessage(
+                id="msg-padded",
+                content=[NeMoGymResponseOutputText(text="Connection error.", annotations=[])],
+                role="assistant",
+                status="completed",
+                type="message",
+            )
+        ],
+        parallel_tool_calls=True,
+        tool_choice="auto",
+        tools=[],
+        status="failed",
+        error={"code": "server_error", "message": "Connection error."},
+        usage=NeMoGymResponseUsage(
+            input_tokens=0,
+            input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=0),
+            output_tokens=0,
+            output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=0),
+            total_tokens=0,
+        ),
+    ).model_dump(mode="json")
+    bundle = AgentObservationBundle(source="hermes", records=[AgentInvocation(invocation_id="root", status="failed")])
+    return response | {_INTERNAL_OBSERVATIONS_KEY: bundle.model_dump(mode="json")} if scoped_bundle else response
+
+
+def _labels(response) -> dict:
+    return json.loads(response.metadata["metrics"])
+
+
+def test_a_rollout_scoped_bundle_is_forwarded_without_changing_the_mask_verdict(tmp_path):
+    """Forwarding the bundle is telemetry: the episode is masked exactly as the unscoped run was."""
+    scoped = app._terminal_response(_episode(tmp_path / "scoped", _no_call_failure(scoped_bundle=True), "rollout-7"))
+    before = app._terminal_response(_episode(tmp_path / "before", _no_call_failure(scoped_bundle=False), None))
+
+    assert (scoped.status, scoped.error) == (before.status, before.error) == (None, None)
+    assert _labels(scoped)["mask_sample"] is _labels(before)["mask_sample"] is False
+    assert _labels(scoped)["agent_error"] == _labels(before)["agent_error"] == "server_error"
+    forwarded = scoped.model_dump(mode="json")[_INTERNAL_OBSERVATIONS_KEY]
+    assert AgentObservationBundle.model_validate(forwarded).records[0].status == "failed"
+
+
+def test_an_unscoped_harness_witness_still_decides_the_mask_verdict(tmp_path):
+    """A bundle the harness returns without a rollout id (Pi's no-call witness) keeps masking its run."""
+    response = app._terminal_response(_episode(tmp_path, _no_call_failure(scoped_bundle=True), None))
+
+    assert response.status == "failed" and response.error.message == "Connection error."
+    assert _labels(response)["mask_sample"] is True
+    assert _INTERNAL_OBSERVATIONS_KEY not in response.model_dump(mode="json")
