@@ -42,10 +42,12 @@ Each context summarization Harbor performs (proactive at `proactive_summarizatio
 tokens, or after a context-length error) is reported as a completed, failed or aborted
 `context_compaction` record in the rollout's agent observations, like Hermes, Pi and OpenHands
 compactions, so a trainer can compare compacted and uncompacted episodes. `tokens_before` is the chat's token
-count when the hand-off starts and `summary` is the hand-off prompt the next context receives; the
-summary's model calls and the post-compaction token count are reported as observation gaps. The fallback
-short summaries Harbor uses when the full hand-off fails are not recorded. Observations are returned only
-for a rollout-scoped request.
+count when compaction starts (after a context-length error, before Harbor unwinds the overflowing history)
+and `summary` is the hand-off prompt the next context receives; the summary's model calls and the
+post-compaction token count are reported as observation gaps. A history Harbor unwinds to nothing restarts
+from the instruction: it is a completed compaction with no summary. The fallback short summaries Harbor uses
+when the full hand-off fails are not recorded. Recording never changes the hand-off's result. Observations
+are returned only for a rollout-scoped request.
 
 A policy completion with an explicit terminal stop reason ends the episode, including when received during compaction. The completed trajectory remains available for grading; a permanent stop is not retried as recoverable context overflow.
 

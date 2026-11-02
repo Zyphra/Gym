@@ -439,6 +439,23 @@ class StandaloneTerminus2(ServedContextTerminus2):
         super().__init__(*args, **kwargs)
         self._compactions: list[ContextCompactionObservation] = []
         self._compaction_trigger = "context_length_exceeded"
+        # Harbor unwinds an overflowing history before summarizing what is left: its size before unwinding.
+        self._unwound_from_tokens: Optional[int] = None
+        self._compaction_observation_failed = False
+
+    def _unwind_messages_to_free_tokens(self, chat: Any, *args: Any, **kwargs: Any) -> Any:
+        """Keep the size of the history Harbor unwinds when the context overflows, before it summarizes."""
+        self._unwound_from_tokens = None
+        try:
+            counted = self._count_total_tokens(chat)
+            if inspect.isawaitable(counted):
+                # A Harbor that counts asynchronously also unwinds asynchronously; the size stays unknown.
+                getattr(counted, "close", lambda: None)()
+            elif type(counted) is int and counted >= 0:
+                self._unwound_from_tokens = counted
+        except Exception:
+            LOG.debug("Terminus-2 could not count tokens before unwinding", exc_info=True)
+        return super()._unwind_messages_to_free_tokens(chat, *args, **kwargs)
 
     async def _check_proactive_summarization(self, *args: Any, **kwargs: Any) -> Any:
         self._compaction_trigger = "proactive_free_tokens"
@@ -451,44 +468,55 @@ class StandaloneTerminus2(ServedContextTerminus2):
         """Record each context summarization Harbor performs as a compaction event.
 
         Harbor owns the three-call hand-off, so this only observes it: ``tokens_before`` is the chat's
-        token count when the hand-off starts (the served count, which includes hidden reasoning, once
-        the endpoint has reported usage) and ``summary`` is the hand-off prompt the next context receives.
-        A failed or cancelled hand-off is recorded as such; an empty chat is not compacted.
+        token count when compaction starts (before Harbor unwinds an overflowing history, else when the
+        hand-off starts; the served count, which includes hidden reasoning, once the endpoint has
+        reported usage) and ``summary`` is the hand-off prompt the next context receives. A failed or
+        cancelled hand-off is recorded as such; an empty chat is not compacted unless Harbor unwound an
+        overflowing history to it. Recording never changes the hand-off's result or error.
         """
-        if not chat.messages:
+        tokens_before, self._unwound_from_tokens = self._unwound_from_tokens, None
+        if not chat.messages and tokens_before is None:
             return await super()._summarize(chat, original_instruction, *args, **kwargs)
-        tokens_before = None
-        try:
-            counted = self._count_total_tokens(chat)
-            tokens_before = await counted if inspect.isawaitable(counted) else counted
-        except Exception:
-            LOG.debug("Terminus-2 could not count tokens before a compaction", exc_info=True)
+        if tokens_before is None:
+            try:
+                counted = self._count_total_tokens(chat)
+                tokens_before = await counted if inspect.isawaitable(counted) else counted
+            except Exception:
+                LOG.debug("Terminus-2 could not count tokens before a compaction", exc_info=True)
         outcome: Literal["completed", "failed", "aborted"] = "failed"
         summary = None
         try:
             handoff, subagent_refs = await super()._summarize(chat, original_instruction, *args, **kwargs)
-            outcome, summary = "completed", handoff
+            # Harbor hands off with three subagent calls. A history it unwound to nothing restarts from
+            # the instruction instead: the context was still compacted, with no summary.
+            outcome, summary = "completed", handoff if subagent_refs is not None else None
             return handoff, subagent_refs
         except asyncio.CancelledError:
             outcome = "aborted"
             raise
         finally:
-            self._compactions.append(
-                ContextCompactionObservation(
-                    invocation_id=_ROOT_INVOCATION_ID,
-                    observed_at=time(),
-                    trigger=self._compaction_trigger,
-                    tokens_before=tokens_before if type(tokens_before) is int and tokens_before >= 0 else None,
-                    outcome=outcome,
-                    summary=summary if isinstance(summary, str) else None,
+            try:
+                self._compactions.append(
+                    ContextCompactionObservation(
+                        invocation_id=_ROOT_INVOCATION_ID,
+                        observed_at=time(),
+                        trigger=self._compaction_trigger,
+                        tokens_before=tokens_before if type(tokens_before) is int and tokens_before >= 0 else None,
+                        outcome=outcome,
+                        summary=summary if isinstance(summary, str) else None,
+                    )
                 )
-            )
+            except Exception:
+                LOG.debug("Terminus-2 could not record a compaction", exc_info=True)
+                self._compaction_observation_failed = True
 
     def observations(self) -> AgentObservationBundle:
         """The compactions this run performed, with what the harness cannot report as explicit gaps."""
         codes = ["model_call_ownership_unavailable"]
         if self._compactions:
             codes += ["compaction_model_call_boundary_unavailable", "compaction_tokens_after_unavailable"]
+        if self._compaction_observation_failed:
+            codes.append("compaction_observation_failed")
         gaps = [ObservationGap(code=code, invocation_id=_ROOT_INVOCATION_ID) for code in codes]
         return AgentObservationBundle(
             source=_OBSERVATION_SOURCE,

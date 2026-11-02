@@ -121,7 +121,8 @@ the task's working directory unless `agent_kwargs` supplies one, as under
 For a rollout-scoped request the harness runs with the rollout id (`NGTB_ROLLOUT_ID`), returns its agent
 observations (context compactions, tool timings) in `response.json`, and `/run` returns them as
 `ng_agent_observations`, as `anyswe_agent` does. A harness that reports none (such as an agent without
-observability) leaves the field out.
+observability) leaves the field out. The bundle is telemetry only: the episode's mask verdict reads just
+what an unscoped harness run returns, so forwarding it never changes which episodes are masked.
 
 Agent dependencies are installed once at startup into a portable Python prefix
 mounted read-only inside the task container at `/agent_deps_mount`. To support a
