@@ -206,6 +206,60 @@ def test_mail_send_requires_encoded_rfc2822_and_parses_headers():
     assert sent["subject"] == "Hi there" and sent["body"] == "Line one\nLine two\n" and sent["labels"] == ["SENT"]
 
 
+@pytest.mark.parametrize(
+    "app, method, path, params, body",
+    [
+        ("mail", "GET", "/mail/v1/users/me/messages", {"pageToken": True}, None),
+        ("mail", "GET", "/mail/v1/users/me/messages/{message}", {"format": []}, None),
+        ("sheets", "GET", "/v4/spreadsheets/{sheet}/values/Teams!A1:B2", {"majorDimension": ["ROWS"]}, None),
+        (
+            "sheets",
+            "POST",
+            "/v4/spreadsheets/{sheet}/values:batchUpdate",
+            None,
+            {"valueInputOption": ["RAW"], "data": []},
+        ),
+        (
+            "sheets",
+            "POST",
+            "/v4/spreadsheets/{sheet}/values/Teams!A:E:append",
+            {"valueInputOption": "RAW", "insertDataOption": {}},
+            {"values": [["x"]]},
+        ),
+        ("chat", "GET", "/api/users.info", {"user": ["U1"]}, None),
+    ],
+)
+def test_json_values_of_the_wrong_type_are_api_errors(app, method, path, params, body):
+    """A policy's wrongly typed JSON value gets the vendor's own error reply, never a server exception."""
+    scenario = scenario_from_id(f"{REVISION_V5}:train:rx_budget_alerts:0001")
+    world = Workspace(scenario)
+    vendor = _connected(scenario, app)
+    store = world.records[vendor.name]
+    ids = {
+        name: next(iter(store.get(key) or [""])) for name, key in (("message", "messages"), ("sheet", "spreadsheets"))
+    }
+    url = vendor.base + path.format(**ids)
+    status, reply = realapi.fetch(
+        world, method, url, json.dumps(params) if params else None, json.dumps(body) if body else None
+    )
+    assert (status, reply.get("ok")) == (200, False) if app == "chat" else status == 400
+
+
+def test_crm_search_rejects_unhashable_filters_and_compares_infinite_values():
+    for identity in task_ids("train", REVISION_V5)[:24]:
+        scenario = scenario_from_id(identity)
+        crm = _connected(scenario, "crm")
+        if crm.dialect == "rest":
+            break
+    world = Workspace(scenario)
+    url = f"{crm.base}/crm/v3/objects/deals/search"
+    for item in ({"propertyName": ["amount"], "operator": "EQ"}, {"propertyName": "amount", "operator": ["EQ"]}):
+        assert realapi.fetch(world, "POST", url, body=json.dumps({"filterGroups": [{"filters": [item]}]}))[0] == 400
+    infinite = {"filterGroups": [{"filters": [{"propertyName": "amount", "operator": "GT", "value": float("inf")}]}]}
+    status, reply = realapi.fetch(world, "POST", url, body=json.dumps(infinite))
+    assert status == 200 and reply["results"] == []
+
+
 def test_a1_ranges_values_envelopes_and_value_input_option():
     titles = ["Intake Log", "Rules"]
     assert parse_a1("'Intake Log'!B2:D9", titles) == realapi.A1Range("Intake Log", 2, 2, 9, 4, False)

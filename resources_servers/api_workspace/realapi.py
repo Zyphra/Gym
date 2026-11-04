@@ -271,6 +271,8 @@ def _token(scope: dict[str, Any], offset: int) -> str:
 def _offset(scope: dict[str, Any], token: Any, name: str) -> int:
     if token is None or token == "":
         return 0
+    if not isinstance(token, str):
+        raise _bad(f"Invalid {name}; reuse the token returned for the same request.")
     try:
         digest, offset = b64url_decode(token).decode().split(":")
     except (ValueError, UnicodeDecodeError, AttributeError) as error:
@@ -528,7 +530,7 @@ def _mail(world: Any, vendor: RealVendor, method: str, path: str, query: dict, p
         raise _wrong_method(method, path, "GET")
     _only(query, {"format"})
     form = query.get("format", "full")
-    if form not in {"full", "metadata", "minimal", "raw"}:
+    if form not in ("full", "metadata", "minimal", "raw"):
         raise _bad("format must be full, metadata, minimal or raw.")
     return 200, _mail_resource(identity, row, form)
 
@@ -720,7 +722,7 @@ def _value_input(query: dict[str, Any], payload: Any, operation: str, extra: set
     if isinstance(payload, dict) and "valueInputOption" in payload:
         raise _bad(f"valueInputOption is a query parameter for {operation}; move it from the body to params.")
     _only(query, {"valueInputOption", "includeValuesInResponse", *extra})
-    if query.get("valueInputOption") not in {"RAW", "USER_ENTERED"}:
+    if query.get("valueInputOption") not in ("RAW", "USER_ENTERED"):
         raise _bad(
             f"'valueInputOption' is required for {operation}. Pass it as a query parameter: RAW or USER_ENTERED."
         )
@@ -787,7 +789,7 @@ def _sheets(world: Any, vendor: RealVendor, method: str, path: str, query: dict,
         if not isinstance(ranges, list) or not ranges or not all(isinstance(x, str) for x in ranges):
             raise _bad("ranges is required: one A1 range or a list of A1 ranges.")
         dimension = query.get("majorDimension", "ROWS")
-        if dimension not in {"ROWS", "COLUMNS"}:
+        if dimension not in ("ROWS", "COLUMNS"):
             raise _bad("majorDimension must be ROWS or COLUMNS.")
         values = []
         for text in ranges:
@@ -801,7 +803,7 @@ def _sheets(world: Any, vendor: RealVendor, method: str, path: str, query: dict,
             raise _bad("values.batchUpdate takes valueInputOption and data in the JSON body, not in params.")
         if not isinstance(payload, dict) or set(payload) - {"valueInputOption", "data", "includeValuesInResponse"}:
             raise _bad('Body must be {"valueInputOption": "RAW", "data": [{"range": "...", "values": [[...]]}]}.')
-        if payload.get("valueInputOption") not in {"RAW", "USER_ENTERED"}:
+        if payload.get("valueInputOption") not in ("RAW", "USER_ENTERED"):
             raise _bad("'valueInputOption' is required in the batchUpdate body: RAW or USER_ENTERED.")
         data = payload.get("data")
         if not isinstance(data, list) or not data or not all(isinstance(x, dict) for x in data):
@@ -831,7 +833,7 @@ def _sheets(world: Any, vendor: RealVendor, method: str, path: str, query: dict,
     if operation == "update" and method == "GET":
         _only(query, {"majorDimension", "valueRenderOption"})
         dimension = query.get("majorDimension", "ROWS")
-        if dimension not in {"ROWS", "COLUMNS"}:
+        if dimension not in ("ROWS", "COLUMNS"):
             raise _bad("majorDimension must be ROWS or COLUMNS.")
         return 200, _read(sheet, target, dimension)
     if operation == "clear":
@@ -853,7 +855,7 @@ def _sheets(world: Any, vendor: RealVendor, method: str, path: str, query: dict,
     if operation == "append" and method != "POST":
         raise _wrong_method(method, path, "POST")
     _value_input(query, payload, f"values.{operation}", {"insertDataOption"} if operation == "append" else set())
-    if operation == "append" and query.get("insertDataOption", "INSERT_ROWS") not in {"INSERT_ROWS", "OVERWRITE"}:
+    if operation == "append" and query.get("insertDataOption", "INSERT_ROWS") not in ("INSERT_ROWS", "OVERWRITE"):
         raise _bad("insertDataOption must be INSERT_ROWS or OVERWRITE.")
     if not isinstance(payload, dict):
         raise _bad('Invalid JSON payload: the body must be an object such as {"values": [["a", "b"]]}.')
@@ -862,7 +864,7 @@ def _sheets(world: Any, vendor: RealVendor, method: str, path: str, query: dict,
     if "range" in payload and parse_a1(str(payload["range"]), titles) != target:
         raise _bad("The body range must match the range in the URL.")
     dimension = payload.get("majorDimension", "ROWS")
-    if dimension not in {"ROWS", "COLUMNS"}:
+    if dimension not in ("ROWS", "COLUMNS"):
         raise _bad("majorDimension must be ROWS or COLUMNS.")
     matrix = _matrix(payload, "data", dimension)
     if operation == "update":
@@ -1020,7 +1022,7 @@ def _chat_read(world: Any, store: dict, vendor: RealVendor, name: str, query: di
                 return {"ok": True, "user": _user_resource(key, row)}
         raise _slack("users_not_found")
     if name == "users.info":
-        if set(query) != {"user"} or query["user"] not in store["users"]:
+        if set(query) != {"user"} or not isinstance(query["user"], str) or query["user"] not in store["users"]:
             raise _slack("user_not_found", "users.info requires a user ID such as U04AB12CD.")
         return {"ok": True, "user": _user_resource(query["user"], store["users"][query["user"]])}
     if set(query) - {"channel", "limit", "cursor"}:
@@ -1147,7 +1149,7 @@ def _crm_compare(actual: Any, operator: str, value: Any) -> bool:
     if isinstance(actual, int):
         try:
             value = int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
     else:
         actual, value = str(actual).lower(), str(value).lower()
@@ -1169,7 +1171,7 @@ def _crm_search(store: dict, kind: str, payload: Any, scope: dict) -> dict[str, 
         )
     schema = APPS["crm"][kind]
     groups = payload.get("filterGroups", [])
-    operators = {"EQ", "NEQ", "LT", "LTE", "GT", "GTE", "CONTAINS_TOKEN", "IN", "NOT_IN", "HAS_PROPERTY"}
+    operators = ("EQ", "NEQ", "LT", "LTE", "GT", "GTE", "CONTAINS_TOKEN", "IN", "NOT_IN", "HAS_PROPERTY")
     if not isinstance(groups, list):
         raise _crm_error(400, "VALIDATION_ERROR", "filterGroups must be a list of {filters: [...]} objects.")
     for group in groups:
@@ -1179,7 +1181,7 @@ def _crm_search(store: dict, kind: str, payload: Any, scope: dict) -> dict[str, 
         for item in filters:
             if (
                 not isinstance(item, dict)
-                or item.get("propertyName") not in {*schema, "id"}
+                or item.get("propertyName") not in (*schema, "id")
                 or item.get("operator") not in operators
             ):
                 raise _crm_error(
