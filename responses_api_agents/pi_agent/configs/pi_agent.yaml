@@ -13,6 +13,7 @@ pi_agent:
       thinking: null
       system_prompt: null
       timeout: 900
+      max_turns: null
       extra_args: []
       # written to ~/.pi/agent/models.json
       models_config:

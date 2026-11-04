@@ -19,6 +19,7 @@ import copy
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 from asyncio import Semaphore
@@ -67,6 +68,13 @@ from responses_api_agents.pi_agent.setup_pi import ensure_pi
 
 LOG = logging.getLogger(__name__)
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
+TURN_LIMIT_EXTENSION = Path(__file__).with_name("turn_limit.ts")
+TURN_LIMIT_MARKER = "pi_gym_turn_limit"
+# The model endpoint's context-overflow errors, as Pi's own overflow detection reads them.
+_CONTEXT_OVERFLOW = re.compile(
+    r"context[_ ]length[_ ]exceeded|maximum context length|reduce the length of the messages|exceeds the context window",
+    re.IGNORECASE,
+)
 
 
 class _PiRunResult(NamedTuple):
@@ -76,6 +84,47 @@ class _PiRunResult(NamedTuple):
     events: list[tuple[float, dict[str, Any]]]
     return_code: Optional[int] = 0
     timed_out: bool = False
+    stderr: str = ""
+    budget_stop: Optional[tuple[str, str]] = None
+
+
+def pi_budget_stop(
+    stdout: str | bytes, stderr: str | bytes, *, max_turns: Optional[int], context_window: int
+) -> Optional[tuple[str, str]]:
+    """``(stop_reason, detail)`` when Pi ended on a budget rather than a failure or its own finish.
+
+    The reasons are the ones the OpenHands adapter reports, so AnySWE grades the partial patch the same way:
+
+    * ``max_iterations``: ``turn_limit.ts`` aborted the request after the last of ``max_turns`` turns.
+    * ``context_exhausted``: the last request failed on the context window and Pi's overflow recovery
+      did not recover it, or the last reply was cut where the window ends.
+    """
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    last = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        message = event.get("message") if isinstance(event, dict) and event.get("type") == "message_end" else None
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            last = message
+    if last is None:
+        return None
+    stop = last.get("stopReason")
+    error = last.get("errorMessage") if isinstance(last.get("errorMessage"), str) else ""
+    if stop == "aborted" and max_turns is not None and TURN_LIMIT_MARKER in stderr:
+        return "max_iterations", f"Pi reached max_turns={max_turns}"
+    if stop == "error" and _CONTEXT_OVERFLOW.search(error):
+        return "context_exhausted", error[:500]
+    usage = last.get("usage") if isinstance(last.get("usage"), dict) else {}
+    used = sum(int(usage.get(key) or 0) for key in ("input", "cacheRead", "output"))
+    if stop == "length" and used >= context_window:
+        return "context_exhausted", f"reply cut at the {context_window}-token context window"
+    return None
 
 
 def parse_pi_events(stdout: str | bytes) -> tuple[list[Any], dict[str, int]]:
@@ -491,6 +540,7 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     compaction_enabled: Optional[bool] = None
     context_window: int = 262144
     max_output_tokens: int = 131072
+    max_turns: Optional[int] = Field(default=None, ge=1)
     pi_version: Optional[str] = None
 
     @property
@@ -612,6 +662,9 @@ class PiAgent(SimpleResponsesAPIAgent):
             cmd += ["--thinking", self.config.thinking]
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
+        if self.config.max_turns is not None:
+            cmd += ["--extension", str(TURN_LIMIT_EXTENSION)]
+            env["PI_GYM_MAX_TURNS"] = str(self.config.max_turns)
         cmd += self.config.extra_args
         # Pi's argument parser has no end-of-options marker: a positional starting with "-" is an option and one
         # starting with "@" a file reference, whatever the task text says. Such an instruction arrives on stdin.
@@ -646,7 +699,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 except asyncio.TimeoutError:
                     if proc.returncode is None:
                         proc.kill()
-                    (stdout, events), _, _ = await output_task
+                    (stdout, events), stderr, _ = await output_task
                     LOG.warning("pi timed out after %ds", self.config.timeout)
                     output_items, usage = parse_pi_events(stdout)
                     return _PiRunResult(
@@ -656,6 +709,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                         events,
                         proc.returncode,
                         True,
+                        stderr.decode(errors="replace"),
                     )
             else:
                 output_task = asyncio.create_task(proc.communicate(piped_instruction))
@@ -664,7 +718,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 except asyncio.TimeoutError:
                     if proc.returncode is None:
                         proc.kill()
-                    stdout, _ = await output_task
+                    stdout, stderr = await output_task
                     LOG.warning("pi timed out after %ds", self.config.timeout)
                     output_items, usage = parse_pi_events(stdout)
                     return _PiRunResult(
@@ -674,6 +728,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                         events,
                         proc.returncode,
                         True,
+                        (stderr or b"").decode(errors="replace"),
                     )
 
             if collect_observations and stdin_task is not None:
@@ -681,7 +736,18 @@ class PiAgent(SimpleResponsesAPIAgent):
             if proc.returncode not in (0, None):
                 LOG.warning("pi exited %d: %s", proc.returncode, stderr.decode(errors="replace")[:500])
             output_items, usage = parse_pi_events(stdout)
-            return _PiRunResult(output_items, usage, self.config.model, events, proc.returncode)
+            budget_stop = pi_budget_stop(
+                stdout, stderr, max_turns=self.config.max_turns, context_window=self.config.context_window
+            )
+            return _PiRunResult(
+                output_items,
+                usage,
+                self.config.model,
+                events,
+                proc.returncode,
+                stderr=stderr.decode(errors="replace"),
+                budget_stop=budget_stop,
+            )
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -711,10 +777,15 @@ class PiAgent(SimpleResponsesAPIAgent):
             collect_observations=collect_observations,
         )
         output_items, usage, model_name, events = result.output, result.usage, result.model, result.events
+        # A budget stop ends `pi --print` with exit 1 like a failure; it is the expected end of the run.
         process_error = (
             "process_timeout"
             if result.timed_out
-            else (f"process_exit_{result.return_code}" if result.return_code not in (0, None) else None)
+            else (
+                f"process_exit_{result.return_code}"
+                if result.return_code not in (0, None) and result.budget_stop is None
+                else None
+            )
         )
         observed_output_items = list(output_items)
         if not observed_output_items and events:
@@ -747,7 +818,11 @@ class PiAgent(SimpleResponsesAPIAgent):
             status="incomplete" if result.timed_out else ("failed" if process_error else None),
             error=(ResponseError(code="server_error", message=f"Pi {process_error}") if process_error else None),
             metadata=(
-                {"agent_error": process_error, "pi_return_code": str(result.return_code)} if process_error else None
+                {"agent_error": process_error, "pi_return_code": str(result.return_code)}
+                if process_error
+                else {"stop_reason": result.budget_stop[0], "pi_stop_detail": result.budget_stop[1]}
+                if result.budget_stop
+                else None
             ),
             tool_choice=body.tool_choice,
             tools=body.tools,
@@ -770,7 +845,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                     self.config.model_server,
                     [*conversation_input, *observed_output_items],
                     transcript_available=bool(observed_output_items),
-                    return_code=result.return_code,
+                    return_code=None if result.budget_stop else result.return_code,
                     timed_out=result.timed_out,
                 )
             except Exception:
