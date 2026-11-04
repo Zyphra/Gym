@@ -452,3 +452,68 @@ def test_summary_output_budget_reaches_compressor_request(monkeypatch, tmp_path,
     assert body["chat_template_kwargs"] == main["chat_template_kwargs"]
     assert compressor.tail_token_budget == int(compressor.threshold_tokens * 0.20)
     assert any(SUMMARY_TEXT in (message.get("content") or "") for message in main["messages"])
+
+
+TEMPLATE_COPY = (
+    "## Goal\nFix the fixture bug.\n\n## Progress\n### Done\nRead app.py.\n### In Progress\nEditing.\n\n"
+    "## Critical Context\nError: KeyError 'x'.\n```python\n# Goal\nprint(1)\n```\n"
+)
+
+
+def test_first_summary_copy_cuts_only_a_restart_at_the_first_heading():
+    from responses_api_agents.hermes_agent.app import _first_summary_copy
+
+    twice = TEMPLATE_COPY + "\n" + TEMPLATE_COPY.replace("app.py", "lib.py")
+    assert _first_summary_copy(twice) == TEMPLATE_COPY.rstrip()
+    # Case and inner whitespace of the restarted heading do not matter; the level does.
+    assert _first_summary_copy(TEMPLATE_COPY + "\n##   GOAL\nagain\n") == TEMPLATE_COPY.rstrip()
+    assert _first_summary_copy(TEMPLATE_COPY + "\n### Goal\nsub\n") == TEMPLATE_COPY + "\n### Goal\nsub\n"
+    # A heading inside a code fence, a repeated later heading, or one copy: unchanged.
+    for text in (
+        TEMPLATE_COPY,
+        TEMPLATE_COPY + "\n## Progress\nmore\n",
+        "```\n## Goal\n```\n## Goal\nonly copy\n",
+        "",
+        "no headings at all",
+    ):
+        assert _first_summary_copy(text) == text
+
+
+def _duplicated_summary_run(monkeypatch, tmp_path, **config):
+    twice = TEMPLATE_COPY + "\n" + TEMPLATE_COPY
+    summary = {"status": 200, "choice": {"message": {"role": "assistant", "content": twice}, "finish_reason": "stop"}}
+    native_agents: list = []
+    with _PolicyFixture(summary) as policy:
+        app = _agent(tmp_path, monkeypatch, policy.server.server_port, native_agents, **config)
+        try:
+            (response,) = _run(app, "rollout-twice")
+        finally:
+            _close(native_agents)
+        summaries, mains = policy.summaries(), policy.mains()
+    return response, native_agents[0].context_compressor, summaries, mains
+
+
+def test_duplicated_template_is_rejected_by_the_native_guard_without_the_option(monkeypatch, tmp_path):
+    response, compressor, summaries, mains = _duplicated_summary_run(monkeypatch, tmp_path)
+    from agent.context_compressor import SUMMARY_PREFIX
+
+    assert response.status == "completed" and len(summaries) == 1 and len(mains) == 1
+    assert compressor.summary_rejections == {"duplicate_section_heading": 1}
+    assert not any(SUMMARY_PREFIX in (m.get("content") or "") for m in mains[0][1]["messages"])
+
+
+def test_keep_first_copy_accepts_the_first_copy_of_a_duplicated_template(monkeypatch, tmp_path):
+    response, compressor, summaries, mains = _duplicated_summary_run(
+        monkeypatch, tmp_path, compression_summary_keep_first_copy=True
+    )
+    from agent.context_compressor import SUMMARY_PREFIX
+
+    assert response.status == "completed" and len(summaries) == 1 and len(mains) == 1
+    assert compressor.summary_rejections == {}
+    # The summary request itself is unchanged: same budget, no tools.
+    ((_, body),) = summaries
+    assert body["max_tokens"] == 32768 and "tools" not in body
+    compacted = [m["content"] for m in mains[0][1]["messages"] if SUMMARY_PREFIX in (m.get("content") or "")]
+    assert len(compacted) == 1
+    assert compacted[0].startswith(f"{SUMMARY_PREFIX}\n{TEMPLATE_COPY.rstrip()}")
+    assert compacted[0].count("## Goal") == 1
