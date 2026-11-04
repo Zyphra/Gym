@@ -508,6 +508,23 @@ class TestResponses:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
+        "flags, stop_reason",
+        [
+            ({"turn_cap": True}, "max_turns"),
+            ({"turn_cap": True, "stop_reason": "turn_limit"}, "turn_limit"),  # the endpoint stop is the cause
+            ({"turn_cap": False}, None),
+        ],
+    )
+    async def test_harness_turn_cap_is_a_named_stop(self, flags, stop_reason) -> None:
+        agent = _make_agent()
+        agent._run_terminus = AsyncMock(return_value=({"steps": []}, AgentContext(), flags, False, False))
+        body = NeMoGymResponseCreateParamsNonStreaming(model="model", input="task")
+        with patch.object(Terminus2Agent, "resolve_model_base_url", return_value="http://model/v1"):
+            response = await agent.responses(request=None, body=body)
+        assert response.metadata.get("stop_reason") == stop_reason
+        assert response.metadata["finished_naturally"] == "false"
+
+    @pytest.mark.parametrize(
         ("flags", "timed_out", "confirmed", "expected"),
         [
             ({}, False, True, True),  # task_complete confirmed twice

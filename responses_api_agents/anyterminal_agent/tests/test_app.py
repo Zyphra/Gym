@@ -1227,6 +1227,29 @@ class TestTerminalResponseLabels:
         assert metrics["mask_sample"] is False
         assert metrics["agent_failed"] is False
 
+    @pytest.mark.parametrize("inner, done", [("max_turns", "max_turns"), ("max_iterations", "max_turns")])
+    def test_harness_turn_cap_is_carried_as_the_turn_cap_done_reason(self, tmp_path: Path, inner, done) -> None:
+        # Terminus names its own cap max_turns, Hermes max_iterations (OpenHands' label); both are a turn cap.
+        cfg = _make_instance_config(tmp_path)
+        update_metrics(cfg.metrics_fpath, {"resolved": False})
+        (cfg.persistent_dir / "response.json").write_text(
+            json.dumps(self._response(status="incomplete", metadata={"stop_reason": inner}))
+        )
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        response = app._terminal_response(cfg)
+        assert response.metadata["stop_reason"] == inner
+        assert app._NAMED_AGENT_STOPS[inner] == done
+        assert json.loads(response.metadata["metrics"])["mask_sample"] is False
+
+    def test_other_inner_stop_reasons_are_not_carried(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        (cfg.persistent_dir / "response.json").write_text(
+            json.dumps(self._response(status="completed", metadata={"stop_reason": "turn_limit"}))
+        )
+        (cfg.persistent_dir / "agent_result.json").write_text(json.dumps({"return_code": 0, "error_type": None}))
+        assert "stop_reason" not in app._terminal_response(cfg).metadata
+        assert app._NAMED_AGENT_STOPS.get("turn_limit") is None
+
     def _response(self, **fields) -> dict:
         return {
             "id": "inner",

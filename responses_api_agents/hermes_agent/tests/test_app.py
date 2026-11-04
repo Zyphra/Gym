@@ -764,6 +764,7 @@ class TestFinishTool:
         )
         assert len(requests) == 1
         assert episode.response.status == "completed"
+        assert "stop_reason" not in episode.response.metadata
 
     def test_finish_is_the_agents_own_completion(self, monkeypatch, tmp_path) -> None:
         episode, _ = self._run(monkeypatch, tmp_path, [_tool_turn(("finish", {"message": "done"}))], finish_tool=True)
@@ -806,6 +807,7 @@ class TestFinishedNaturally:
         assert len(requests) == 2
         assert episode.response.status == "completed"
         assert episode.response.metadata["finished_naturally"] == "false"
+        assert episode.response.metadata.get("stop_reason") != "max_iterations"
 
     def test_turn_cap_summary_is_not_the_agents_completion(self, monkeypatch, tmp_path) -> None:
         episode, requests = self._run(
@@ -816,6 +818,9 @@ class TestFinishedNaturally:
         )
         assert episode.response.output[-1].content[0].text == "summary"
         assert episode.response.metadata["finished_naturally"] == "false"
+        # Named with OpenHands' label for the same stop.
+        assert episode.response.status == "incomplete"
+        assert episode.response.metadata["stop_reason"] == "max_iterations"
 
     @pytest.mark.parametrize(
         "result",

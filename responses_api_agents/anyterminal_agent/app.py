@@ -305,6 +305,15 @@ def _file_lock(file_path: Path, label: str, max_wait: float = 7200.0, poll_inter
         shutil.rmtree(lock_path, ignore_errors=True)
 
 
+# Harness stop labels carried to done_reason. A harness turn cap is "max_turns" whatever the harness
+# calls it (Terminus "max_turns", Hermes/OpenHands "max_iterations"), the wrapper's turn-cap label.
+_NAMED_AGENT_STOPS = {
+    "context_exhausted": "context_exhausted",
+    "max_turns": "max_turns",
+    "max_iterations": "max_turns",
+}
+
+
 def _safe_config_json(params: "AnyTerminalInstanceConfig", indent: Optional[int] = None) -> str:
     """Serialize config without secrets."""
 
@@ -1448,7 +1457,7 @@ def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
         status="failed" if harness_error is not None else None,
         error=harness_error,
         metadata={
-            **({"stop_reason": agent_stop_reason} if agent_stop_reason == "context_exhausted" else {}),
+            **({"stop_reason": agent_stop_reason} if agent_stop_reason in _NAMED_AGENT_STOPS else {}),
             "input": json.dumps(params.body.model_dump(mode="json").get("input") or []),
             "metrics": params.metrics_fpath.read_text(),
             "instance_config": _safe_config_json(params),
@@ -1706,7 +1715,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
                 },
                 response=response,
                 reward=metrics.reward(fractional=instance_config.fractional_reward),
-                done_reason="context_exhausted" if meta.get("stop_reason") == "context_exhausted" else None,
+                done_reason=_NAMED_AGENT_STOPS.get(meta.get("stop_reason")),
                 **metrics.model_dump(),
                 instance_config=instance_config.model_dump(),
                 ng_agent_observations=observations,
