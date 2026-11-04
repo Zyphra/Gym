@@ -15,6 +15,7 @@
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -850,3 +851,40 @@ class TestFinishedNaturally:
         assert not _finished_naturally(
             result, finished_by_tool=False, ended_by_endpoint=False, interrupted=False, failed=False
         )
+
+
+class TestHiddenHarnessMounts:
+    """The installed Hermes LocalEnvironment runs terminal and file-tool commands without the harness mounts."""
+
+    def test_terminal_and_file_reads_see_hidden_paths_empty(self, monkeypatch, tmp_path) -> None:
+        import subprocess as sp
+
+        from nemo_gym import hidden_mounts
+
+        probe = sp.run([sys.executable, "-I", hidden_mounts.__file__, "--", "true"], capture_output=True, text=True)
+        if probe.returncode != 0:
+            pytest.skip(f"no mount namespace here: {probe.stderr.strip()}")
+        mount = tmp_path / "trajectories_mount"
+        mount.mkdir()
+        (mount / "params.json").write_text('{"secret": "grader"}')
+        monkeypatch.setattr(hidden_mounts, "HARNESS_MOUNTS", (str(mount),))
+        import tools.environments.local as local
+
+        monkeypatch.setattr(local, "_find_bash", local._find_bash)  # restored after the test
+        from responses_api_agents.hermes_agent import app as hermes_app
+
+        hermes_app._hide_harness_mounts_from_shell()
+        hermes_app._hide_harness_mounts_from_shell()  # idempotent
+        assert local._find_bash.hides_harness_mounts is True
+        env = local.LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        listing = env.execute(f"ls -A {mount}; echo rc=$?")
+        assert listing["output"].strip() == "rc=0"
+        read = env.execute(f"cat {mount}/params.json")
+        assert "grader" not in read["output"] and read["returncode"] != 0
+        # The harness process itself still reads the file.
+        assert "grader" in (mount / "params.json").read_text()
+
+    def test_off_by_default(self) -> None:
+        from responses_api_agents.hermes_agent.app import HermesAgentConfig
+
+        assert HermesAgentConfig.model_fields["hide_harness_mounts"].default is False

@@ -382,6 +382,9 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     mcp_servers: Optional[dict[str, dict[str, Any]]] = None
     # Offer OpenHands' `finish(message)` tool; the turn that calls it ends the run as completed.
     finish_tool: bool = False
+    # Run every shell command (terminal and file tools) without the runner, Gym and harness-runtime
+    # mounts, as a benchmark's task container shows them (nemo_gym/hidden_mounts.py).
+    hide_harness_mounts: bool = False
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -427,6 +430,31 @@ def _route_compression_calls() -> None:
 
     call_llm.routes_compression = True
     context_compressor.call_llm = call_llm
+
+
+def _hide_harness_mounts_from_shell() -> None:
+    """Point Hermes' shell lookup at a ``bash`` stand-in that hides the harness mounts.
+
+    Hermes runs every terminal command and every file-tool command through
+    ``tools.environments.local._find_bash()``'s shell; the stand-in enters a new
+    mount namespace, covers the harness mounts and execs that same shell, so the
+    command keeps its pid, session, stdio, timeout and exit status. The harness
+    process itself keeps every mount. Process-wide and idempotent.
+    """
+    import tools.environments.local as local  # pyright: ignore[reportMissingImports]
+
+    from nemo_gym import hidden_mounts
+
+    native = local._find_bash
+    if getattr(native, "hides_harness_mounts", False):
+        return
+    wrapper = hidden_mounts.shell_wrapper(tempfile.mkdtemp(prefix="hermes-shell-"), native())
+
+    def find_bash() -> str:
+        return wrapper
+
+    find_bash.hides_harness_mounts = True
+    local._find_bash = find_bash
 
 
 def _policy_compression_route(agent, summary_temperature: float | None) -> Callable[..., Any]:
@@ -608,6 +636,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
 
         agent._build_api_kwargs = _patched_build_api_kwargs
         compression_route = None
+        if self.config.hide_harness_mounts:
+            _hide_harness_mounts_from_shell()
         if self.config.compression_enabled:
             _route_compression_calls()
             compression_route = _policy_compression_route(agent, self.config.compression_summary_temperature)
