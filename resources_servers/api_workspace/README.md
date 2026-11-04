@@ -4,6 +4,8 @@ API Workspace is an offline simulation of fictional SaaS vendors for HR, CRM, ac
 
 Example: approve leave and transfer a CRM account to the delegate while preserving the employee record. Other workflows cover invoices, expenses, files, email and chat.
 
+Two revisions share the server, task identities, session lifecycle and final-state grader. V4 (`api-workspace-v4`) uses the vendor/path tools below. V5 (`api-workspace-v5`) serves multi-app workflows through real-API conventions; see [V5: real-API conventions](#v5-real-api-conventions). Each task ID names its revision, and a session exposes only that revision's tools.
+
 ## Tools and discovery
 
 | Tool | Purpose |
@@ -25,13 +27,34 @@ An approved JSON policy document in the file store supplies business values and 
 
 TRAIN contains 80 variants per family (**2,400 tasks**); VAL contains eight (**240 tasks**). VAL has different seeds but shares TRAIN templates. It is an instance-validation split, not evidence of transfer to unseen workflow families. The pilot selects one TRAIN variant per family.
 
-[RLTasks’ API Workspace codec](https://github.com/Zyphra/rl_tasks/tree/wrapper/envs/api_workspace) prepares rows containing the prompt, four tools and canonical task ID. Expected changes remain server-side. The specs lock source and prompt versions. This source rejects task IDs from other revisions, so prepared data and source must come from the same revision.
+[RLTasks’ API Workspace codec](https://github.com/Zyphra/rl_tasks/tree/wrapper/envs/api_workspace) prepares rows containing the prompt, the revision's tools and canonical task ID. Expected changes remain server-side. The specs lock source and prompt versions. This source constructs V4 and V5 task IDs and rejects any other revision, so prepared data and source must come from the same source.
 
 ## Scoring
 
 [Workspace.score](engine.py) returns **1 for a correct final state and 0 otherwise**. It checks required field updates, deletions and creations, and preservation of unrelated records and fields. Any missing or extra change to the final state fails. Action order and generated IDs for created records do not affect the score.
 
 New file contents and message/draft bodies allow CRLF/LF and one trailing newline; other content and preserved records are exact. Scoring uses stored state, with no model judge. Training cost penalties belong to the consuming run.
+
+## V5: real-API conventions
+
+V5 tasks use three tools instead of the V4 four:
+
+| Tool | Purpose |
+| --- | --- |
+| `workspace_search` | BM25 search over endpoint metadata: URL, method, where each parameter goes (path, query or body), request example and connection status. |
+| `workspace_fetch` | Send `method` and an absolute `url`; `params` is a JSON-encoded object of query parameters and `body` a JSON-encoded request body. Returns `{status, body}`. |
+| `workspace_codec` | base64url encode or decode UTF-8 text. |
+
+Each world connects one of two fictional vendors per app; the other answers 401. [realapi.py](realapi.py) implements the conventions:
+
+- **Mail:** list returns IDs and page tokens; a message's body is base64url in `payload.body.data`; sending takes `{"raw": base64url(RFC 2822 message)}` plus an optional `threadId`; label changes take label IDs.
+- **Spreadsheets:** A1 ranges in the URL path, `valueInputOption` as a query parameter (in the body for `values:batchUpdate`), `{"values": [[...]]}` envelopes, `:append` after the last table row.
+- **Chat:** method endpoints; reads use GET with params and writes POST a JSON body. Channels and users are addressed by ID. Failures return HTTP 200 with `ok: false`.
+- **CRM:** one vendor speaks REST with `{"properties": {...}}` envelopes, filter-group search and `paging.next.after`; the other speaks GraphQL with `first`/`after`/`filter` connections and update/create mutations.
+
+[scenarios.py](scenarios.py) defines 12 multi-app workflow templates (`rx_*`). Each reads a current policy stated either in a mailbox email or in a spreadsheet tab, next to a superseded version, writes to at least two apps, and has guards: recipients that must not be emailed and records that must stay unchanged. Variants change names, counts, values, decision boundaries, connected vendors (including REST or GraphQL CRM), policy location and prompt layout. TRAIN has 80 variants per template (**960 tasks**) and VAL eight (**96 tasks**) from different seeds. Construction uses no model calls, external task corpus or benchmark records.
+
+The reward is the same binary final-state score as V4. `/verify` also returns `task_evidence.api_workspace_grading`: each required update, creation and deletion is one assertion, broken guards are added to the denominator, and `partial` is passed over that total. It is recorded for analysis and never changes the reward. V4 sessions return the same record.
 
 ## Request and session behavior
 
@@ -59,6 +82,6 @@ gym eval run --config resources_servers/api_workspace/configs/api_workspace.yaml
 
 The config’s default dataset is five example rows. The override above selects prepared rows. Sampling and the output-token value are settings for this example invocation.
 
-Tests in [tests/](tests/) cover goal replay, wrong-state controls, preservation, schemas, API errors and session behavior. Inspect real rollouts for discoverability and answerability; mechanical checks do not establish learnability or transfer.
+Tests in [tests/](tests/) cover goal replay, wrong-state controls, preservation, schemas, API errors and session behavior. [test_real_api.py](tests/test_real_api.py) sends every V5 task's gold, no-op, missing-step, guard-breaking and wrong-value requests through the V5 handlers. Inspect real rollouts for discoverability and answerability; mechanical checks do not establish learnability or transfer.
 
 Reviewed V4 TRAIN tasks are selected without a policy pass-rate prerequisite. Current model results, mixture choices and production adoption are owned by the consuming run; keep VAL out of TRAIN.

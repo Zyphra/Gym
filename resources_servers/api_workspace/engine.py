@@ -162,10 +162,82 @@ def canonical_json(value: Any) -> str:
 def _creation_for_score(collection: str, row: dict[str, Any]) -> str:
     # Created text specifies lines, not an operating-system line ending or
     # whether the last line has a terminator. Preserve every other character.
-    text_field = "content" if collection == "files" else "body" if collection in {"drafts", "messages"} else None
+    text_field = (
+        "content"
+        if collection == "files"
+        else "body"
+        if collection in {"drafts", "messages"} and "body" in row
+        else "text"
+        if collection == "messages"
+        else None
+    )
     if text_field is not None and isinstance(row.get(text_field), str):
         row = {**row, text_field: row[text_field].replace("\r\n", "\n").removesuffix("\n")}
     return canonical_json(row)
+
+
+def _partial(world: Workspace, expected: dict[str, Any]) -> dict[str, Any]:
+    """Per-assertion record kept beside the binary reward; it never changes the reward.
+
+    Each required update, deletion and creation is one assertion. Preservation of
+    every other record and each named guard (for example a recipient that must not
+    receive mail) counts only when broken, so a no-op scores 0 and full success 1.
+    """
+    scenario, actual_world = world.scenario, world.records
+    passed = 0
+    targeted: dict[tuple[str, str], set[str]] = {}
+    for goal in scenario.updates:
+        key = (goal["vendor"], goal["collection"])
+        targeted.setdefault(key, set()).add(goal["id"])
+        actual = actual_world.get(goal["vendor"], {}).get(goal["collection"], {}).get(goal["id"])
+        passed += actual == expected[goal["vendor"]][goal["collection"]][goal["id"]]
+    for goal in scenario.deletes:
+        targeted.setdefault((goal["vendor"], goal["collection"]), set()).add(goal["id"])
+        passed += goal["id"] not in actual_world.get(goal["vendor"], {}).get(goal["collection"], {})
+    broken = 0
+    for vendor in set(expected) | set(actual_world):
+        collections = expected.get(vendor, {})
+        if set(actual_world.get(vendor, {})) != set(collections):
+            broken += 1
+        for collection, records in collections.items():
+            actual = actual_world.get(vendor, {}).get(collection, {})
+            initial = world.initial.get(vendor, {}).get(collection, {})
+            touched = targeted.get((vendor, collection), set())
+            changed = any(
+                actual.get(identity) != record for identity, record in records.items() if identity not in touched
+            )
+            wanted = sorted(
+                _creation_for_score(collection, goal["fields"])
+                for goal in scenario.creates
+                if goal["vendor"] == vendor and goal["collection"] == collection
+            )
+            made = sorted(
+                _creation_for_score(collection, {k: v for k, v in row.items() if k != "id"})
+                for identity, row in actual.items()
+                if identity not in records and identity not in initial
+            )
+            reintroduced = any(identity in initial and identity not in records for identity in actual)
+            remaining = list(made)
+            for item in wanted:
+                if item in remaining:
+                    remaining.remove(item)
+                    passed += 1
+            broken += bool(changed or remaining or reintroduced)
+    for guard in scenario.guards:
+        rows = actual_world.get(guard["vendor"], {}).get("messages", {})
+        initial = world.initial.get(guard["vendor"], {}).get("messages", {})
+        broken += any(
+            guard["address"] in row.get("to", []) + row.get("cc", []) + row.get("bcc", [])
+            for identity, row in rows.items()
+            if identity not in initial
+        )
+    total = len(scenario.updates) + len(scenario.deletes) + len(scenario.creates)
+    return {
+        "partial": passed / (total + broken) if total + broken else 1.0,
+        "assertions_passed": passed,
+        "assertions_total": total,
+        "guards_broken": broken,
+    }
 
 
 class Workspace:
@@ -480,4 +552,5 @@ class Workspace:
             "task_id": self.scenario.task_id,
             "grading_basis": "final_world_state",
             "state_sha256": hashlib.sha256(canonical_json(self.records).encode()).hexdigest(),
+            "assertions": _partial(self, expected),
         }

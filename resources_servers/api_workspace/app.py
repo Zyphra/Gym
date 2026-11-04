@@ -22,8 +22,9 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.server_utils import SESSION_ID_KEY
+from resources_servers.api_workspace import realapi
 from resources_servers.api_workspace.engine import APIError, Workspace
-from resources_servers.api_workspace.scenarios import scenario_from_id
+from resources_servers.api_workspace.scenarios import REVISION, REVISION_V5, scenario_from_id
 
 
 class APIWorkspaceConfig(BaseResourcesServerConfig):
@@ -94,10 +95,47 @@ class ParallelRequest(BaseModel):
     requests: list[APIRequest] = Field(min_length=1, max_length=20)
 
 
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    query: str
+    top_k: int = Field(default=5, ge=1, le=20)
+    connected_only: bool = False
+
+
+class FetchRequest(BaseModel):
+    """Containers stay untyped here so the API itself explains JSON-string mistakes."""
+
+    model_config = ConfigDict(extra="forbid")
+    method: Any
+    url: Any
+    params: Any = None
+    body: Any = None
+
+
+class CodecRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    operation: Literal["base64url_encode", "base64url_decode"]
+    text: str
+
+
+class WorkspaceVerifyResponse(BaseVerifyResponse):
+    # Named native grading record; the reward stays the binary final-state score.
+    task_evidence: dict[str, dict[str, Any]]
+
+
 @dataclass
 class _Session:
     world: Workspace
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+def _revision_error(session: _Session, revision: str) -> JSONResponse | None:
+    if session.world.scenario.revision == revision:
+        return None
+    return JSONResponse(
+        {"error": {"code": "tool_not_in_revision", "message": "This tool is not part of this task's API surface."}},
+        status_code=400,
+    )
 
 
 class APIWorkspaceResourcesServer(SimpleResourcesServer):
@@ -113,6 +151,9 @@ class APIWorkspaceResourcesServer(SimpleResourcesServer):
         app.post("/workspace_schema")(self.workspace_schema)
         app.post("/workspace_request")(self.workspace_request)
         app.post("/workspace_parallel")(self.workspace_parallel)
+        app.post("/workspace_search")(self.workspace_search)
+        app.post("/workspace_fetch")(self.workspace_fetch)
+        app.post("/workspace_codec")(self.workspace_codec)
         app.post("/close")(self.close_session)
         return app
 
@@ -138,21 +179,34 @@ class APIWorkspaceResourcesServer(SimpleResourcesServer):
             self._sessions[identity] = _Session(Workspace(scenario))
         return {"task_id": scenario.task_id, "namespace": scenario.namespace, "reset": True}
 
+    def _v4_session(self, request: Request) -> tuple[_Session, JSONResponse | None]:
+        session = self._session(request)
+        return session, _revision_error(session, REVISION)
+
     async def workspace_catalog(self, request: Request, body: CatalogRequest) -> JSONResponse:
+        session, refused = self._v4_session(request)
+        if refused is not None:
+            return refused
         try:
-            return JSONResponse(self._session(request).world.catalog(**body.model_dump()))
+            return JSONResponse(session.world.catalog(**body.model_dump()))
         except APIError as error:
             return JSONResponse(error.payload(), status_code=error.status)
 
     async def workspace_accounts(self, request: Request, body: AccountsRequest) -> JSONResponse:
+        session, refused = self._v4_session(request)
+        if refused is not None:
+            return refused
         try:
-            return JSONResponse(self._session(request).world.discover(**body.model_dump()))
+            return JSONResponse(session.world.discover(**body.model_dump()))
         except APIError as error:
             return JSONResponse(error.payload(), status_code=error.status)
 
     async def workspace_schema(self, request: Request, body: SchemaRequest) -> JSONResponse:
+        session, refused = self._v4_session(request)
+        if refused is not None:
+            return refused
         try:
-            return JSONResponse(self._session(request).world.schema(body.vendor))
+            return JSONResponse(session.world.schema(body.vendor))
         except APIError as error:
             return JSONResponse(error.payload(), status_code=error.status)
 
@@ -165,17 +219,48 @@ class APIWorkspaceResourcesServer(SimpleResourcesServer):
                 return error.status, error.payload()
 
     async def workspace_request(self, request: Request, body: APIRequest) -> JSONResponse:
-        status, result = await self._call(self._session(request), body)
+        session, refused = self._v4_session(request)
+        if refused is not None:
+            return refused
+        status, result = await self._call(session, body)
         return JSONResponse(
             result,
             status_code=status,
             headers={"WWW-Authenticate": 'Bearer realm="fictional-workspace"'} if status == 401 else None,
         )
 
-    async def workspace_parallel(self, request: Request, body: ParallelRequest) -> dict[str, Any]:
-        session = self._session(request)
+    async def workspace_parallel(self, request: Request, body: ParallelRequest) -> Any:
+        session, refused = self._v4_session(request)
+        if refused is not None:
+            return refused
         results = await asyncio.gather(*(self._call(session, item) for item in body.requests))
         return {"results": [{"status": status, "body": payload} for status, payload in results]}
+
+    async def workspace_search(self, request: Request, body: SearchRequest) -> JSONResponse:
+        session = self._session(request)
+        refused = _revision_error(session, REVISION_V5)
+        return refused or JSONResponse(realapi.search(session.world, body.query, body.top_k, body.connected_only))
+
+    async def workspace_fetch(self, request: Request, body: FetchRequest) -> JSONResponse:
+        session = self._session(request)
+        refused = _revision_error(session, REVISION_V5)
+        if refused is not None:
+            return refused
+        async with session.lock:
+            status, payload = realapi.fetch(session.world, body.method, body.url, body.params, body.body)
+        return JSONResponse(
+            {"status": status, "body": payload},
+            status_code=200 if status == 204 else status,
+            headers={"WWW-Authenticate": 'Bearer realm="fictional-workspace"'} if status == 401 else None,
+        )
+
+    async def workspace_codec(self, request: Request, body: CodecRequest) -> JSONResponse:
+        session = self._session(request)
+        refused = _revision_error(session, REVISION_V5)
+        if refused is not None:
+            return refused
+        status, payload = realapi.codec(body.operation, body.text)
+        return JSONResponse(payload, status_code=status)
 
     async def score_session(self, request: Request, task_id: str) -> dict[str, Any]:
         session = self._session(request)
@@ -184,10 +269,14 @@ class APIWorkspaceResourcesServer(SimpleResourcesServer):
                 raise HTTPException(409, "workspace_task_identity_mismatch")
             return session.world.score()
 
-    async def verify(self, request: Request, body: WorkspaceVerify) -> BaseVerifyResponse:
+    async def verify(self, request: Request, body: WorkspaceVerify) -> WorkspaceVerifyResponse:
         details = await self.score_session(request, body.task_id)
         await self.close_session(request)
-        return BaseVerifyResponse(**body.model_dump(), reward=details["reward"])
+        return WorkspaceVerifyResponse(
+            **body.model_dump(),
+            reward=details["reward"],
+            task_evidence={"api_workspace_grading": details["assertions"]},
+        )
 
     async def close_session(self, request: Request) -> dict[str, bool]:
         self._sessions.pop(request.session[SESSION_ID_KEY], None)

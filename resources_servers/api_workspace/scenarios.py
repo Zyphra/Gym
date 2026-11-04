@@ -12,10 +12,12 @@ from __future__ import annotations
 import hashlib
 import json
 import random
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from typing import Any
 
 from resources_servers.api_workspace.engine import COLLECTIONS, VENDOR_NAMES, VENDORS, canonical_json
+from resources_servers.api_workspace.realapi import APP_VENDORS, APPS
 
 
 REVISION = "api-workspace-v4"
@@ -145,6 +147,11 @@ class Scenario:
     updates: tuple[dict[str, Any], ...]
     creates: tuple[dict[str, Any], ...]
     deletes: tuple[dict[str, Any], ...]
+    revision: str = REVISION
+    # Named guards, such as a recipient that must not receive mail; graded by the final state.
+    guards: tuple[dict[str, Any], ...] = ()
+    # Session facts the V5 APIs need: the connected mailbox, chat user and clock.
+    context: dict[str, Any] = field(default_factory=dict)
 
 
 class _Builder:
@@ -858,45 +865,1067 @@ def _workflow(b: _Builder) -> str:
     raise ValueError("unknown workflow family")
 
 
+# ---------------------------------------------------------------------------
+# V5: multi-app workflows over real-API conventions (mail, spreadsheets, chat, CRM).
+#
+# Each family writes to at least two apps, reads its rules from a current policy
+# that lives in mail or in a spreadsheet next to a superseded version, and guards
+# recipients and unrelated records. Names, domains, IDs and values are generated
+# here from fictional word lists; no benchmark task, record or assertion is used.
+
+REVISION_V5 = "api-workspace-v5"
+ROOT_SEED_V5 = 20261104
+TRAIN_VARIANTS_V5 = 80
+VAL_VARIANTS_V5 = 8
+FAMILIES_V5 = (
+    "rx_invoice_intake",
+    "rx_escalation_routing",
+    "rx_renewal_quotes",
+    "rx_roster_invites",
+    "rx_label_holds",
+    "rx_payment_reminders",
+    "rx_deal_handoff",
+    "rx_signup_import",
+    "rx_budget_alerts",
+    "rx_offboarding",
+    "rx_refund_review",
+    "rx_vendor_onboarding",
+)
+SYSTEM_PROMPT_V5 = """You are working in a fictional company workspace whose business apps are simulated HTTP APIs.
+Find endpoints with the search tool, then call them with exact URLs, query parameters and request bodies.
+Follow the current policies stated in the workspace's mail and spreadsheets.
+Completion is determined by the resulting workspace state within the available turn and context budget.
+"""
+NOW_V5 = "2026-11-12T16:00:00Z"
+_ORG_HEAD = ("Tarn", "Corrie", "Brack", "Holm", "Skerry", "Fell", "Gill", "Wold", "Mire", "Lyth", "Scaur", "Rigg")
+_ORG_TAIL = ("haven", "stead", "wick", "combe", "mere", "holt", "fold", "ford")
+_ORG_KIND = ("Provisioning", "Outfitters", "Instruments", "Textiles", "Hardware", "Ceramics", "Optics", "Joinery")
+_FIRM_HEAD = (
+    "Bram",
+    "Cinder",
+    "Dusk",
+    "Ember",
+    "Fallow",
+    "Gorse",
+    "Heron",
+    "Inkle",
+    "Juniper",
+    "Kestle",
+    "Larch",
+    "Marten",
+    "Nettle",
+    "Osier",
+    "Pike",
+    "Quarry",
+    "Rook",
+    "Sedge",
+    "Teasel",
+    "Umber",
+    "Vetch",
+    "Yarrow",
+)
+_FIRM_TAIL = ("brook", "gate", "hurst", "ley", "ridge", "shaw", "worth", "field")
+_FIRM_KIND = (
+    "Kilnworks",
+    "Ropery",
+    "Glassworks",
+    "Cartage",
+    "Millwrights",
+    "Chandlery",
+    "Cooperage",
+    "Foundry",
+    "Apiary",
+    "Bindery",
+    "Saddlery",
+    "Tilery",
+)
+_FIRST = (
+    "Ardith",
+    "Belen",
+    "Corvin",
+    "Delphine",
+    "Emrys",
+    "Fennick",
+    "Galen",
+    "Hesper",
+    "Isolde",
+    "Jarrah",
+    "Kestrel",
+    "Linnea",
+    "Marlow",
+    "Nerys",
+    "Oriel",
+    "Perrin",
+    "Quilla",
+    "Sabine",
+    "Tamsin",
+    "Ulric",
+    "Veda",
+    "Ysolde",
+    "Anselm",
+    "Briony",
+    "Caspian",
+    "Elowen",
+    "Florian",
+    "Greer",
+    "Ione",
+    "Lowri",
+)
+_LAST = (
+    "Ashdown",
+    "Brackwell",
+    "Corrigan",
+    "Dunmore",
+    "Elsworth",
+    "Farrow",
+    "Garrick",
+    "Hollis",
+    "Ingram",
+    "Jessop",
+    "Kendrick",
+    "Lockhart",
+    "Marchbank",
+    "Norwood",
+    "Oakes",
+    "Pembury",
+    "Quarrie",
+    "Radley",
+    "Stroud",
+    "Thackeray",
+    "Upton",
+    "Whitlow",
+    "Yelland",
+    "Avenell",
+)
+_LABEL_NAMES = ("Receipts", "Trips", "Archive/2025", "Chase later", "Board papers", "Newsletters")
+_REGIONS = ("north", "south", "east", "west")
+_TEAMS = ("Assembly", "Dispatch", "Fieldwork", "Glazing", "Kiln", "Packing", "Repairs", "Sampling", "Workshop")
+_PROJECTS = ("Lantern", "Bellfounder", "Saltmarsh", "Weathervane", "Quayside", "Larkspur", "Millrace")
+_CATEGORIES = ("packaging", "freight", "catering", "printing", "cleaning", "maintenance")
+
+
+def tools_v5() -> list[dict[str, Any]]:
+    entries = [
+        (
+            "workspace_search",
+            "Search the API catalog of the workspace's mail, spreadsheet, chat and CRM apps by keywords. Returns "
+            "endpoint URLs, parameters, request formats and whether each vendor account is connected; no records.",
+            {
+                "query": {"type": "string"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
+                "connected_only": {"type": "boolean"},
+            },
+            ["query"],
+        ),
+        (
+            "workspace_fetch",
+            "Send an HTTP request to a workspace API. params is a JSON-encoded object of query parameters and body "
+            "is the JSON-encoded request body. Returns the HTTP status and the response body.",
+            {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]},
+                "url": {"type": "string"},
+                "params": {"type": ["string", "null"]},
+                "body": {"type": ["string", "null"]},
+            },
+            ["method", "url"],
+        ),
+        (
+            "workspace_codec",
+            "Encode UTF-8 text as base64url, or decode base64url back to text.",
+            {
+                "operation": {"type": "string", "enum": ["base64url_encode", "base64url_decode"]},
+                "text": {"type": "string"},
+            },
+            ["operation", "text"],
+        ),
+    ]
+    return [
+        {
+            "type": "function",
+            "name": name,
+            "description": description,
+            "strict": False,
+            "parameters": {
+                "type": "object",
+                "properties": fields,
+                "required": required,
+                "additionalProperties": False,
+            },
+        }
+        for name, description, fields, required in entries
+    ]
+
+
+def _trim_grid(grid: list[list[str]]) -> list[list[str]]:
+    rows = []
+    for row in grid:
+        row = [str(cell) for cell in row]
+        while row and row[-1] == "":
+            row.pop()
+        rows.append(row)
+    while rows and not rows[-1]:
+        rows.pop()
+    return rows
+
+
+class _RealBuilder(_Builder):
+    """V5 world construction. Scenario, task identities and final-state grading are shared with V4."""
+
+    def __init__(self, split: str, family: str, variant: int):
+        self.task_id = f"{REVISION_V5}:{split}:{family}:{variant:04d}"
+        digest = hashlib.sha256(f"{ROOT_SEED_V5}:{self.task_id}".encode()).hexdigest()
+        self.rng = random.Random(int(digest, 16))
+        self.namespace = "gw_" + digest[:10]
+        self.family, self.split, self.variant = family, split, variant
+        self.vendor = {app: self.rng.choice(APP_VENDORS[app]) for app in APPS}
+        self.connected = sorted(self.vendor.values())
+        self.records = {name: {collection: {} for collection in APPS[app]} for app, name in self.vendor.items()}
+        self.updates: list[dict[str, Any]] = []
+        self.creates: list[dict[str, Any]] = []
+        self.deletes: list[dict[str, Any]] = []
+        self.guards: list[dict[str, Any]] = []
+        self.staged: dict[tuple[str, str, str], dict[str, Any]] = {}
+        self.serial = 0
+        self.clock = 0
+        self.labels: dict[str, str] = {}
+        self.books: dict[str, dict[str, Any]] = {}
+        head, tail, kind = (self.rng.choice(options) for options in (_ORG_HEAD, _ORG_TAIL, _ORG_KIND))
+        self.organization = f"{head}{tail} {kind}"
+        self.slug = f"{head}{tail}".lower()
+        self.domain = f"{self.slug}-{digest[10:14]}.invalid"
+        self.token = digest[14:18]
+        pairs = self.rng.sample([(first, last) for first in _FIRST for last in _LAST], 40)
+        self.staff = [self.person(first, last, self.domain) for first, last in pairs[:10]]
+        self.names = pairs[10:]
+        self.me = self.staff[0]
+        firms = self.rng.sample([(h, t, k) for h in _FIRM_HEAD for t in _FIRM_TAIL for k in _FIRM_KIND], 9)
+        self.firms = [
+            {
+                "name": f"{h}{t} {k}",
+                "domain": f"{h.lower()}{t}-{self.token}.invalid",
+                "code": (h[:2] + t[:1]).upper(),
+            }
+            for h, t, k in firms
+        ]
+        self.context = {
+            "mailbox": self.me["email"],
+            "chat_user": self.me["user"],
+            "organization": self.organization,
+            "now": NOW_V5,
+        }
+        self.fixture()
+
+    # -- records ------------------------------------------------------------
+    def ident(self, kind: str, length: int) -> str:
+        self.serial += 1
+        return hashlib.sha256(f"{self.task_id}:{kind}:{self.serial}".encode()).hexdigest()[:length]
+
+    def put(self, app: str, collection: str, identity: str, fields: dict[str, Any]) -> dict[str, Any]:
+        name = self.vendor[app]
+        row = {"id": identity, **fields}
+        self.records[name][collection][identity] = row
+        return {"vendor": name, "collection": collection, "id": identity, "row": row}
+
+    def person(self, first: str, last: str, domain: str) -> dict[str, Any]:
+        user = "U" + self.ident("user", 8).upper()
+        email = f"{first}.{last}@{domain}".lower()
+        self.put(
+            "chat",
+            "users",
+            user,
+            {"name": f"{first}.{last}".lower(), "real_name": f"{first} {last}", "email": email, "deleted": False},
+        )
+        return {"name": f"{first} {last}", "email": email, "user": user}
+
+    def outsider(self, firm: dict[str, Any], chat: bool = False) -> dict[str, Any]:
+        first, last = self.names.pop()
+        if chat:
+            return self.person(first, last, firm["domain"])
+        return {"name": f"{first} {last}", "email": f"{first}.{last}@{firm['domain']}".lower(), "user": ""}
+
+    def label(self, name: str) -> str:
+        if name not in self.labels:
+            identity = f"Label_{len(self.labels) + 1}"
+            self.put("mail", "labels", identity, {"name": name, "type": "user"})
+            self.labels[name] = identity
+        return self.labels[name]
+
+    def mail_in(self, sender: str, subject: str, body: str, *, unread: bool = True) -> dict[str, Any]:
+        self.clock += 1
+        date = f"2026-11-{2 + self.clock // 9:02d}T{8 + self.clock % 9:02d}:{(self.clock * 7) % 60:02d}:00Z"
+        return self.put(
+            "mail",
+            "messages",
+            "18" + self.ident("message", 14),
+            {
+                "thread": "18" + self.ident("thread", 14),
+                "sender": sender,
+                "to": [self.me["email"]],
+                "cc": [],
+                "bcc": [],
+                "subject": subject,
+                "body": body,
+                "labels": sorted({"INBOX", *(["UNREAD"] if unread else [])}),
+                "date": date,
+            },
+        )
+
+    def workbook(self, title: str) -> dict[str, Any]:
+        if title not in self.books:
+            identity = "1" + self.ident("spreadsheet", 21)
+            self.books[title] = self.put(
+                "sheets", "spreadsheets", identity, {"title": title, "owner": self.me["email"]}
+            )
+        return self.books[title]
+
+    def tab(self, book: dict[str, Any], title: str, values: list[list[Any]]) -> dict[str, Any]:
+        sheets = self.records[self.vendor["sheets"]]["worksheets"].values()
+        index = sum(row["spreadsheet"] == book["id"] for row in sheets)
+        identity = str(int(self.ident("worksheet", 7), 16))
+        fields = {"spreadsheet": book["id"], "title": title, "index": index, "values": _trim_grid(values)}
+        return self.put("sheets", "worksheets", identity, fields)
+
+    def channel(self, name: str, members: list[str], archived: bool = False) -> dict[str, Any]:
+        topic = self.rng.choice(("", "Daily coordination", "Questions welcome", "Read the pinned notes"))
+        fields = {"name": name, "topic": topic, "members": sorted(set(members)), "archived": archived}
+        return self.put("chat", "channels", "C" + self.ident("channel", 8).upper(), fields)
+
+    def crm(self, collection: str, fields: dict[str, Any]) -> dict[str, Any]:
+        self.serial += 1
+        return self.put("crm", collection, str(100000 + self.serial * 7), fields)
+
+    # -- expected final state ----------------------------------------------
+    def current(self, handle: dict[str, Any], name: str) -> Any:
+        key = (handle["vendor"], handle["collection"], handle["id"])
+        return deepcopy(self.staged.get(key, {}).get(name, handle["row"][name]))
+
+    def change(self, handle: dict[str, Any], **fields: Any) -> None:
+        key = (handle["vendor"], handle["collection"], handle["id"])
+        self.staged.setdefault(key, {}).update(deepcopy(fields))
+
+    def append_rows(self, tab: dict[str, Any], rows: list[list[Any]]) -> None:
+        self.change(tab, values=_trim_grid(self.current(tab, "values") + rows))
+
+    def set_cell(self, tab: dict[str, Any], row: int, column: int, value: str) -> None:
+        grid = self.current(tab, "values")
+        while len(grid) < row:
+            grid.append([])
+        grid[row - 1] += [""] * (column - len(grid[row - 1]))
+        grid[row - 1][column - 1] = value
+        self.change(tab, values=_trim_grid(grid))
+
+    def relabel(self, message: dict[str, Any], add: tuple[str, ...] = (), remove: tuple[str, ...] = ()) -> None:
+        labels = set(self.current(message, "labels"))
+        self.change(message, labels=sorted((labels - set(remove)) | set(add)))
+
+    def expect_mail(self, to: list[str], subject: str, body: str, thread: str = "") -> None:
+        fields = {
+            "thread": thread,
+            "sender": self.me["email"],
+            "to": sorted(to),
+            "cc": [],
+            "bcc": [],
+            "subject": subject,
+            "body": body,
+            "labels": ["SENT"],
+            "date": NOW_V5,
+        }
+        self.creates.append({"vendor": self.vendor["mail"], "collection": "messages", "fields": fields})
+
+    def expect_post(self, channel: dict[str, Any], text: str) -> None:
+        fields = {"channel": channel["id"], "user": self.me["user"], "text": text, "thread_ts": ""}
+        self.creates.append({"vendor": self.vendor["chat"], "collection": "messages", "fields": fields})
+
+    def forbid_mail(self, address: str) -> None:
+        guard = {"type": "not_sent_to", "vendor": self.vendor["mail"], "address": address}
+        if guard not in self.guards:
+            self.guards.append(guard)
+
+    def policy(self, title: str, current: list[tuple[str, str]], previous: list[tuple[str, str]]) -> str:
+        """Place current and superseded rules in mail or a spreadsheet and say where the current ones are."""
+        owner = self.staff[1 + self.rng.randrange(3)]
+        if self.rng.random() < 0.5:
+            for effective, pairs in (("2026-09-01", previous), ("2026-11-01", current)):
+                lines = "\n".join(f"{key}: {value}" for key, value in pairs)
+                body = f"Effective: {effective}\n{lines}\n\n{owner['name']}"
+                self.mail_in(owner["email"], f"{title} - effective {effective}", body, unread=False)
+            return f"the latest '{title}' email from {owner['email']}"
+        book = self.workbook(f"{self.organization} Operating Rules")
+        self.tab(book, f"{title} (superseded)", [["Setting", "Value"], *map(list, previous)])
+        self.tab(book, title, [["Setting", "Value"], *map(list, current)])
+        return f"the '{title}' tab of the '{self.organization} Operating Rules' spreadsheet"
+
+    def fixture(self) -> None:
+        for name in self.rng.sample(_LABEL_NAMES, 3):
+            self.label(name)
+        self.channel(f"{self.slug}-general", [person["user"] for person in self.staff])
+        self.channel(f"{self.slug}-social", [person["user"] for person in self.staff[::2]])
+        for firm in self.firms[-2:]:
+            self.mail_in(
+                f"news@{firm['domain']}",
+                f"{firm['name']} monthly update",
+                f"Highlights from {firm['name']} this month.\nNo action is needed.",
+                unread=self.rng.random() < 0.5,
+            )
+
+    def finish(self, request: str) -> Scenario:
+        for (vendor, collection, identity), fields in self.staged.items():
+            row = self.records[vendor][collection][identity]
+            changed = {key: value for key, value in fields.items() if row[key] != value}
+            if changed:
+                self.updates.append({"vendor": vendor, "collection": collection, "id": identity, "fields": changed})
+        if not self.updates and not self.creates:
+            raise ValueError("V5 variant has no required change")
+        style = (FAMILIES_V5.index(self.family) + self.variant) % 6
+        identity = f"You are {self.me['name']} <{self.me['email']}> in the {self.organization} workspace."
+        prompt = (
+            f"{identity} {request}",
+            f"{request}\n\n{identity}",
+            f"Please handle this today.\n{request}\n\n{identity}",
+            f"Task\n\n{request}\n\nContext\n{identity}",
+            f"{identity}\n\n{request}",
+            f"{request}\n{identity}",
+        )[style]
+        return Scenario(
+            self.task_id,
+            self.namespace,
+            self.family,
+            self.split,
+            self.variant,
+            tuple(self.connected),
+            self.records,
+            prompt,
+            tuple(self.updates),
+            tuple(self.creates),
+            tuple(self.deletes),
+            revision=REVISION_V5,
+            guards=tuple(self.guards),
+            context=dict(self.context),
+        )
+
+
+def _companies(b: _RealBuilder, firms: list[dict[str, Any]], tiers: tuple[str, ...]) -> list[dict[str, Any]]:
+    """CRM company, contact and deal records for firms; returns one bundle per firm."""
+    bundles = []
+    for i, firm in enumerate(firms):
+        tier = tiers[i] if i < len(tiers) else b.rng.choice(tiers)
+        owner = b.staff[1 + i % 5]["email"]
+        company = b.crm(
+            "companies",
+            {
+                "name": firm["name"],
+                "domain": firm["domain"],
+                "tier": tier,
+                "region": b.rng.choice(_REGIONS),
+                "owner": owner,
+            },
+        )
+        contacts = {}
+        for role in ("billing", "operations"):
+            person = b.outsider(firm)
+            contacts[role] = b.crm(
+                "contacts",
+                {
+                    "name": person["name"],
+                    "email": person["email"],
+                    "company": firm["name"],
+                    "role": role,
+                    "lifecycle": "customer",
+                    "owner": owner,
+                },
+            )
+        deal = b.crm(
+            "deals",
+            {
+                "name": f"{firm['name']} supply agreement",
+                "company": firm["name"],
+                "amount": b.rng.randrange(120, 480) * 100,
+                "stage": b.rng.choice(("qualified", "proposal", "negotiation")),
+                "owner": owner,
+                "close_date": f"2026-12-{b.rng.randint(1, 28):02d}",
+            },
+        )
+        b.crm(
+            "deals",
+            {
+                "name": f"{firm['name']} pilot order",
+                "company": firm["name"],
+                "amount": b.rng.randrange(20, 90) * 100,
+                "stage": b.rng.choice(("closed_won", "closed_lost")),
+                "owner": owner,
+                "close_date": f"2026-0{b.rng.randint(3, 9)}-{b.rng.randint(1, 28):02d}",
+            },
+        )
+        bundles.append({"firm": firm, "company": company, "contacts": contacts, "deal": deal, "tier": tier})
+    return bundles
+
+
+def _rx_invoice_intake(b: _RealBuilder) -> str:
+    suppliers = b.firms[:5]
+    blocked = suppliers[: b.rng.choice((1, 2))]
+    allowed = suppliers[len(blocked) :]
+    limit = b.rng.choice((2500, 4000, 6000))
+    where = b.policy(
+        "Payables rules",
+        [("approval_limit", str(limit)), ("blocked_domains", ", ".join(x["domain"] for x in blocked))],
+        [("approval_limit", str(limit + b.rng.choice((-1500, 2000)))), ("blocked_domains", allowed[-1]["domain"])],
+    )
+    book = b.workbook(f"{b.organization} Payables")
+    earlier = allowed[0]
+    logged = [f"{earlier['code']}-{b.rng.randint(10000, 49999)}", earlier["domain"], str(limit // 2), "approve"]
+    log = b.tab(book, "Intake Log", [["Invoice", "Supplier domain", "Amount", "Decision"], logged])
+    clerk = b.staff[2]
+    channel = b.channel(f"{b.slug}-payables", [b.me["user"], clerk["user"]])
+    plan = [(earlier, int(logged[2]), False, logged[0]), (blocked[0], limit - 100, True, None)]
+    amounts = [limit, limit + 1, *b.rng.sample((limit // 2, limit - 750, limit + 900, limit * 2), b.rng.randint(1, 3))]
+    for i, amount in enumerate(amounts):
+        plan.append((allowed[i % len(allowed)], amount, True, None))
+    rows = []
+    numbers = {logged[0]}
+    for supplier, amount, unread, number in plan:
+        while number is None or number in numbers and not (supplier is earlier and not unread):
+            number = f"{supplier['code']}-{b.rng.randint(50000, 99999)}"
+        numbers.add(number)
+        body = (
+            f"Invoice: {number}\nAmount due: {amount}\nDue date: 2026-12-{b.rng.randint(1, 28):02d}\n\n"
+            f"Thank you,\n{supplier['name']} accounts"
+        )
+        message = b.mail_in(f"billing@{supplier['domain']}", f"Invoice {number}", body, unread=unread)
+        b.forbid_mail(f"billing@{supplier['domain']}")
+        if unread and supplier not in blocked:
+            rows.append([number, supplier["domain"], str(amount), "approve" if amount <= limit else "review"])
+            b.relabel(message, remove=("UNREAD",))
+    b.append_rows(log, sorted(rows))
+    b.expect_post(channel, f"{len(rows)} invoices logged")
+    return (
+        f"Process the unread supplier invoice emails in the mailbox under the current payables rules ({where}). "
+        f"Append one row per invoice to the 'Intake Log' tab of the '{b.organization} Payables' spreadsheet: "
+        "invoice number, the sender's email domain, the amount due as a plain integer, and 'approve' if the amount "
+        "is at or below the approval limit or 'review' otherwise. Add the rows after the existing ones, sorted by "
+        "invoice number. Skip invoices from blocked supplier domains entirely and leave those emails unread; mark "
+        "each logged email read by removing its UNREAD label. Then post exactly '<n> invoices logged', where n is "
+        f"the number of rows you added, to the #{channel['row']['name']} chat channel. Do not send any email."
+    )
+
+
+def _rx_escalation_routing(b: _RealBuilder) -> str:
+    tiers = ("gold", "silver", "bronze")
+    bundles = _companies(b, b.firms[:6], ("gold", "silver", "bronze"))
+    style = b.rng.choice(("{tier}-escalations@{domain}", "escalations-{tier}@{domain}", "{tier}.desk@{domain}"))
+    boxes = {tier: style.format(tier=tier, domain=b.domain) for tier in tiers}
+    rotated = dict(zip(tiers, [boxes[t] for t in tiers[1:] + tiers[:1]]))
+    where = b.policy("Escalation desk routing", list(boxes.items()), list(rotated.items()))
+    chosen = b.rng.sample(bundles, b.rng.randint(2, 3))
+    handled = next(x for x in bundles if x not in chosen)
+    for bundle, unread in [(handled, False)] + [(x, True) for x in chosen]:
+        contact = bundle["contacts"]["operations"]["row"]
+        order = f"SO-{b.rng.randint(100000, 999999)}"
+        body = (
+            f"Hello,\n\nOrder {order} arrived damaged and we need it replaced quickly.\n\n"
+            f"{contact['name']}\n{bundle['firm']['name']}"
+        )
+        b.mail_in(contact["email"], f"Problem with order {order}", body, unread=unread)
+        b.forbid_mail(contact["email"])
+        if unread:
+            body = f"{bundle['firm']['name']} | {contact['email']} | {order}"
+            b.expect_mail([boxes[bundle["tier"]]], f"Escalation {order}", body)
+            b.change(bundle["deal"], stage="at_risk")
+    return (
+        "Route each unread 'Problem with order ...' email using the current escalation desk routing "
+        f"({where}). Find the sender in the CRM, take their company's tier, and send one new email to that tier's "
+        "escalation mailbox with subject 'Escalation <order number>' and body exactly "
+        "'<company name> | <sender email> | <order number>'. Then set the stage of that company's open deal (the "
+        "one not closed_won or closed_lost) to 'at_risk'. Do not reply to the customers, and leave the complaint "
+        "emails unread."
+    )
+
+
+def _rx_renewal_quotes(b: _RealBuilder) -> str:
+    tiers = ("gold", "silver", "bronze")
+    bundles = _companies(b, b.firms[:6], ("gold", "silver", "bronze", "gold"))
+    current = dict(zip(tiers, b.rng.sample((4, 6, 8, 10, 12, 15), 3)))
+    previous = {tier: value + 5 for tier, value in current.items()}
+    where = b.policy(
+        "Renewal discount schedule",
+        [(f"{tier}_discount_percent", str(value)) for tier, value in current.items()],
+        [(f"{tier}_discount_percent", str(value)) for tier, value in previous.items()],
+    )
+    chosen = b.rng.sample(bundles, 4)
+    chosen[0]["contacts"]["billing"]["row"]["lifecycle"] = "opted_out"
+    for bundle in chosen:
+        contact = bundle["contacts"]["billing"]["row"]
+        deal = bundle["deal"]["row"]
+        subject = f"Renewal quote for {bundle['firm']['name']}"
+        body = f"Hi,\n\nPlease send the renewal quote for {deal['name']}.\n\nBest,\n{contact['name']}"
+        message = b.mail_in(contact["email"], subject, body)
+        if contact["lifecycle"] == "opted_out":
+            b.forbid_mail(contact["email"])
+            continue
+        price = deal["amount"] * (100 - current[bundle["tier"]]) // 100
+        b.expect_mail(
+            [contact["email"]], f"Re: {subject}", f"Quote for {deal['name']}: {price}", message["row"]["thread"]
+        )
+        b.change(bundle["deal"], amount=price, stage="quoted")
+    return (
+        "Answer each unread renewal-quote request in the mailbox. Apply the discount for the requesting company's "
+        f"CRM tier from the current renewal discount schedule ({where}) to the amount of the company's open deal "
+        "(the one not closed_won or closed_lost), rounding down to a whole number. Reply in the request's thread "
+        "to its sender with subject 'Re: <original subject>' and body exactly 'Quote for <deal name>: <discounted "
+        "amount>', then set that deal's amount to the discounted amount and its stage to 'quoted'. Skip requests "
+        "from contacts whose CRM lifecycle is 'opted_out': do not email them or change their deals."
+    )
+
+
+def _rx_roster_invites(b: _RealBuilder) -> str:
+    project = b.rng.choice(_PROJECTS)
+    affiliations = ("staff", "partner", "contractor")
+    allowed = b.rng.choice((("staff", "partner"), ("staff", "contractor"), ("partner", "staff", "contractor")))
+    previous = ("staff",) if len(allowed) > 2 else tuple(x for x in affiliations if x not in allowed) + ("staff",)
+    where = b.policy(
+        "Channel access rules",
+        [("allowed_affiliations", ", ".join(allowed))],
+        [("allowed_affiliations", ", ".join(previous))],
+    )
+    people = [(person, "staff") for person in b.staff[3:7]]
+    people += [(b.outsider(b.firms[i], chat=True), affiliations[1 + i % 2]) for i in range(4)]
+    b.rng.shuffle(people)
+    statuses = ["active"] * 6 + ["inactive"] * 2
+    b.rng.shuffle(statuses)
+    members = [b.me["user"], people[0][0]["user"]]
+    channel = b.channel(f"{b.slug}-{project.lower()}", members)
+    owner = b.staff[1]
+    if not any(
+        status == "active" and affiliation in allowed and person["user"] not in members
+        for (person, affiliation), status in zip(people, statuses)
+    ):
+        # Every variant requires at least one invitation.
+        people[-1], statuses[-1] = (people[-1][0], allowed[0]), "active"
+    roster = [["Name", "Email", "Status", "Affiliation"]]
+    invited = []
+    for (person, affiliation), status in zip(people, statuses):
+        roster.append([person["name"], person["email"], status, affiliation])
+        if status == "active" and affiliation in allowed and person["user"] not in members:
+            invited.append(person)
+    book = b.workbook(f"{b.organization} {project} Roster")
+    b.tab(book, "Roster", roster)
+    b.change(channel, members=sorted(set(members) | {x["user"] for x in invited}))
+    b.expect_mail([owner["email"]], f"{project} roster synced", "\n".join(sorted(x["email"] for x in invited)))
+    return (
+        f"Sync the #{channel['row']['name']} chat channel with the 'Roster' tab of the '{book['row']['title']}' "
+        "spreadsheet: invite every roster person whose Status is 'active', whose Affiliation is allowed by the "
+        f"current channel access rules ({where}), and who is not already a member. Chat invitations take user IDs; "
+        f"match people by email. Do not remove anyone. Then email {owner['email']} with subject "
+        f"'{project} roster synced' and a body listing the emails of the people you invited, sorted alphabetically, "
+        "one per line."
+    )
+
+
+def _rx_label_holds(b: _RealBuilder) -> str:
+    hold = b.label("Supplier quarantine")
+    held, others = b.firms[:2], b.firms[2:5]
+    where = b.policy(
+        "Mail hold rules",
+        [("held_domains", ", ".join(x["domain"] for x in held))],
+        [("held_domains", ", ".join(x["domain"] for x in others[:2]))],
+    )
+    book = b.workbook(f"{b.organization} Compliance Log")
+    earlier = f"accounts@{others[2]['domain']}"
+    log = b.tab(book, "Holds", [["Date", "Sender", "Subject"], ["2026-10-14", earlier, "Statement for September"]])
+    channel = b.channel(f"{b.slug}-compliance", [b.me["user"], b.staff[4]["user"]])
+    topics = ("Updated bank details", "Overdue balance notice", "Revised price list", "Contract renewal terms")
+    picks = [held[0], held[1], held[b.rng.randrange(2)], *b.rng.sample(others, 2)]
+    b.rng.shuffle(picks)
+    rows = []
+    for firm in picks:
+        sender = f"{b.rng.choice(('accounts', 'sales', 'notices'))}@{firm['domain']}"
+        subject = f"{b.rng.choice(topics)} ({firm['name']})"
+        message = b.mail_in(
+            sender, subject, f"Please review the attached terms.\n\n{firm['name']}", unread=b.rng.random() < 0.6
+        )
+        if firm in held:
+            b.relabel(message, add=(hold,), remove=("INBOX",))
+            rows.append([message["row"]["date"][:10], sender, subject, message["row"]["date"]])
+    rows.sort(key=lambda row: row[3])
+    b.append_rows(log, [row[:3] for row in rows])
+    b.expect_post(channel, f"{len(rows)} messages held")
+    return (
+        f"Apply the current mail hold rules ({where}). Give every inbox message sent from a held domain the "
+        "'Supplier quarantine' label and take it out of the inbox by removing the INBOX label; leave its read/unread state "
+        "alone. Labels are changed by label ID. Append one row per held message to the 'Holds' tab of the "
+        f"'{b.organization} Compliance Log' spreadsheet: date received (YYYY-MM-DD), sender email and subject, "
+        "oldest message first, after the existing rows. Finally post exactly '<n> messages held' to "
+        f"#{channel['row']['name']}. Do not send any email."
+    )
+
+
+def _rx_payment_reminders(b: _RealBuilder) -> str:
+    bundles = _companies(b, b.firms[:7], ("strategic", "standard", "standard", "standard"))
+    days = b.rng.choice((30, 45, 60))
+    where = b.policy(
+        "Collections policy",
+        [("reminder_after_days", str(days)), ("exempt_tiers", "strategic")],
+        [("reminder_after_days", str(days + 15)), ("exempt_tiers", "none")],
+    )
+    book = b.workbook(f"{b.organization} Receivables")
+    grid = [["Invoice", "Company", "Amount", "Days Overdue", "Status"]]
+    overdue = [days + 20, days, days - 1, days + 5, days + 40, days - 10, days + 2]
+    statuses = ["open", "open", "open", "paid", "open", "open", "reminded"]
+    targets = []
+    for i, bundle in enumerate(bundles):
+        invoice = f"AR-{b.rng.randint(20000, 99999)}"
+        amount = b.rng.randrange(300, 9000)
+        grid.append([invoice, bundle["firm"]["name"], str(amount), str(overdue[i]), statuses[i]])
+        b.forbid_mail(bundle["contacts"]["operations"]["row"]["email"])
+        if statuses[i] == "open" and overdue[i] >= days and bundle["tier"] != "strategic":
+            targets.append((i + 2, invoice, amount, overdue[i], bundle))
+        elif bundle["tier"] == "strategic":
+            b.forbid_mail(bundle["contacts"]["billing"]["row"]["email"])
+    tab = b.tab(book, "Open Items", grid)
+    for row, invoice, amount, late, bundle in targets:
+        billing = bundle["contacts"]["billing"]["row"]["email"]
+        b.expect_mail(
+            [billing], f"Payment reminder {invoice}", f"Invoice {invoice} for {amount} is {late} days overdue."
+        )
+        b.set_cell(tab, row, 5, "reminded")
+    return (
+        f"Send payment reminders under the current collections policy ({where}). For each row of the 'Open Items' "
+        f"tab in the '{b.organization} Receivables' spreadsheet whose Status is 'open' and whose Days Overdue is at "
+        "or above the policy threshold, email the company's billing contact (the CRM contact with role 'billing') "
+        "with subject 'Payment reminder <invoice>' and body exactly 'Invoice <invoice> for <amount> is <days> days "
+        "overdue.', then change that row's Status cell to 'reminded'. Companies in an exempt CRM tier get nothing. "
+        "Change no other cells."
+    )
+
+
+def _rx_deal_handoff(b: _RealBuilder) -> str:
+    leaving, successor, other = b.staff[2], b.staff[3], b.staff[4]
+    where = b.policy(
+        "Account handoff",
+        [("from_owner", leaving["email"]), ("to_owner", successor["email"]), ("scope", "open deals only")],
+        [("from_owner", leaving["email"]), ("to_owner", other["email"]), ("scope", "open deals only")],
+    )
+    stages = [
+        "qualified",
+        "proposal",
+        "negotiation",
+        "closed_won",
+        "closed_lost",
+        "proposal",
+        "qualified",
+        "negotiation",
+    ]
+    owners = [leaving, leaving, leaving, leaving, leaving, other, successor, b.staff[5]]
+    if b.rng.random() < 0.5:
+        stages[5], owners[5] = "negotiation", leaving
+    moved = []
+    for firm, stage, owner in zip(b.firms[:8], stages, owners):
+        deal = b.crm(
+            "deals",
+            {
+                "name": f"{firm['name']} {b.rng.choice(('framework', 'restock', 'service plan'))}",
+                "company": firm["name"],
+                "amount": b.rng.randrange(40, 400) * 100,
+                "stage": stage,
+                "owner": owner["email"],
+                "close_date": f"2026-12-{b.rng.randint(1, 28):02d}",
+            },
+        )
+        if owner is leaving and not stage.startswith("closed"):
+            b.change(deal, owner=successor["email"])
+            moved.append(deal["row"]["name"])
+    book = b.workbook(f"{b.organization} Sales Ops")
+    tab = b.tab(book, "Reassignments", [["Deal", "Previous owner", "New owner"]])
+    channel = b.channel(f"{b.slug}-sales-desk", [b.me["user"], leaving["user"], successor["user"]])
+    b.append_rows(tab, [[name, leaving["email"], successor["email"]] for name in sorted(moved)])
+    b.expect_post(channel, f"{len(moved)} deals moved to {successor['email']}")
+    return (
+        f"Carry out the current account handoff ({where}). In the CRM, reassign the deals it covers from the "
+        "departing owner to the new owner; closed deals (closed_won or closed_lost) stay where they are. Append one "
+        "row per reassigned deal (deal name, previous owner email, new owner email) to the 'Reassignments' tab of "
+        f"the '{b.organization} Sales Ops' spreadsheet, sorted by deal name, and post exactly '<n> deals moved to "
+        f"<new owner email>' in #{channel['row']['name']}."
+    )
+
+
+def _rx_signup_import(b: _RealBuilder) -> str:
+    owner, other = b.staff[3], b.staff[4]
+    excluded = b.firms[5]
+    where = b.policy(
+        "Lead intake rules",
+        [("lead_owner", owner["email"]), ("excluded_domains", excluded["domain"])],
+        [("lead_owner", other["email"]), ("excluded_domains", b.firms[6]["domain"])],
+    )
+    existing = b.outsider(b.firms[0])
+    b.crm(
+        "contacts",
+        {
+            "name": existing["name"],
+            "email": existing["email"],
+            "company": b.firms[0]["name"],
+            "role": "operations",
+            "lifecycle": "customer",
+            "owner": other["email"],
+        },
+    )
+    entries = [(existing, b.firms[0], "duplicate"), (b.outsider(excluded), excluded, "excluded")]
+    entries += [(b.outsider(firm), firm, "created") for firm in b.rng.sample(b.firms[1:5], b.rng.randint(2, 3))]
+    b.rng.shuffle(entries)
+    book = b.workbook(f"{b.organization} Marketing")
+    tab = b.tab(book, "Signup ledger", [["Email", "Result"]])
+    for person, firm, result in entries:
+        body = f"Name: {person['name']}\nEmail: {person['email']}\nCompany: {firm['name']}\n"
+        message = b.mail_in(f"forms@{b.domain}", f"New signup: {person['name']}", body)
+        b.relabel(message, remove=("UNREAD",))
+        if result == "created":
+            fields = {
+                "name": person["name"],
+                "email": person["email"],
+                "company": firm["name"],
+                "role": "unknown",
+                "lifecycle": "lead",
+                "owner": owner["email"],
+            }
+            b.creates.append({"vendor": b.vendor["crm"], "collection": "contacts", "fields": fields})
+    b.append_rows(tab, sorted([person["email"], result] for person, _, result in entries))
+    return (
+        f"Import the unread 'New signup' emails into the CRM following the current lead intake rules ({where}). "
+        "For each signup whose email is not already a CRM contact and whose email domain is not excluded, create a "
+        "contact with the name, email and company from the email, role 'unknown', lifecycle 'lead' and owner set to "
+        "the rules' lead owner. Record every signup in the 'Signup ledger' tab of the "
+        f"'{b.organization} Marketing' spreadsheet as an '<email>', '<result>' row, sorted by email, where result "
+        "is 'created', 'duplicate' or 'excluded'. Mark each signup email read. Do not send any email."
+    )
+
+
+def _rx_budget_alerts(b: _RealBuilder) -> str:
+    percent = b.rng.choice((75, 80, 90))
+    where = b.policy("Budget alert policy", [("alert_percent", str(percent))], [("alert_percent", str(percent - 15))])
+    teams = sorted(b.rng.sample(_TEAMS, 6))
+    owners = b.staff[2:8]
+    ratios = [percent, percent - 1, percent + 12, percent - 20, 100, percent + 5]
+    flags = ["", "", "", "", "", "alerted"]
+    order = list(range(6))
+    b.rng.shuffle(order)
+    grid = [["Team", "Owner", "Budget", "Spent", "Flag"]]
+    alerted = []
+    for slot in order:
+        team, owner = teams[slot], owners[slot]
+        budget = b.rng.randrange(20, 90) * 1000
+        spent = budget * ratios[slot] // 100
+        grid.append([team, owner["email"], str(budget), str(spent), flags[slot]])
+        if spent * 100 >= budget * percent and not flags[slot]:
+            alerted.append((len(grid), team, owner, spent, budget))
+        else:
+            b.forbid_mail(owner["email"])
+    book = b.workbook(f"{b.organization} Budgets")
+    tab = b.tab(book, "Teams", grid)
+    channel = b.channel(f"{b.slug}-finance-desk", [b.me["user"], b.staff[1]["user"]])
+    for row, team, owner, spent, budget in alerted:
+        b.expect_mail([owner["email"]], f"Budget alert: {team}", f"{team} has spent {spent} of {budget}.")
+        b.set_cell(tab, row, 5, "alerted")
+    b.expect_post(channel, "Budget alerts: " + ", ".join(sorted(x[1] for x in alerted)))
+    return (
+        f"Run the budget check from the current budget alert policy ({where}) on the 'Teams' tab of the "
+        f"'{b.organization} Budgets' spreadsheet. For each team whose Spent is at least the alert percentage of its "
+        "Budget and whose Flag cell is empty, email the team's Owner with subject 'Budget alert: <team>' and body "
+        "exactly '<team> has spent <spent> of <budget>.', and set its Flag cell to 'alerted'. Then post exactly "
+        f"'Budget alerts: <teams>' to #{channel['row']['name']}, listing those teams alphabetically separated by "
+        "', '. Leave every other cell unchanged."
+    )
+
+
+def _rx_offboarding(b: _RealBuilder) -> str:
+    leaving = b.staff[5 : 5 + b.rng.randint(1, 2)]
+    cancelled, successor = b.staff[8], b.staff[2]
+    where = b.policy(
+        "Offboarding notice",
+        [("departing", ", ".join(x["email"] for x in leaving)), ("crm_successor", successor["email"])],
+        [("departing", cancelled["email"]), ("crm_successor", b.staff[3]["email"])],
+    )
+    removed = {person["email"]: 0 for person in leaving}
+    for i, name in enumerate(("design-review", "stockroom", "night-shift", "suppliers", "launch-2025")):
+        archived = name == "launch-2025"
+        members = [b.me["user"], cancelled["user"], b.staff[1 + i]["user"]]
+        members += [person["user"] for j, person in enumerate(leaving) if (i + j) % 2 == 0 or archived]
+        channel = b.channel(f"{b.slug}-{name}", members, archived=archived)
+        gone = {person["user"] for person in leaving if person["user"] in channel["row"]["members"]}
+        if gone and not archived:
+            for person in leaving:
+                removed[person["email"]] += person["user"] in gone
+            b.change(channel, members=sorted(set(channel["row"]["members"]) - gone))
+    for i, firm in enumerate(b.firms[:6]):
+        owner = (leaving + [cancelled, b.staff[1], b.staff[4]])[i % (len(leaving) + 3)]
+        company = b.crm(
+            "companies",
+            {
+                "name": firm["name"],
+                "domain": firm["domain"],
+                "tier": b.rng.choice(("gold", "silver", "bronze")),
+                "region": b.rng.choice(_REGIONS),
+                "owner": owner["email"],
+            },
+        )
+        if owner in leaving:
+            b.change(company, owner=successor["email"])
+    book = b.workbook(f"{b.organization} People Ops")
+    tab = b.tab(book, "Leaver log", [["Email", "Channels removed"]])
+    b.append_rows(tab, [[email, str(count)] for email, count in sorted(removed.items())])
+    return (
+        f"Process the departures in the current offboarding notice ({where}). Remove each departing person from "
+        "every chat channel they belong to that is not archived (removal takes channel and user IDs), set the owner "
+        "of each CRM company they own to the notice's CRM successor, and append one row per departing person "
+        "(email, number of channels they were removed from) to the 'Leaver log' tab of the "
+        f"'{b.organization} People Ops' spreadsheet, sorted by email. Change nothing for anyone else."
+    )
+
+
+def _rx_refund_review(b: _RealBuilder) -> str:
+    limit = b.rng.choice((150, 250, 400))
+    where = b.policy(
+        "Refund approval rules", [("auto_refund_limit", str(limit))], [("auto_refund_limit", str(limit * 2))]
+    )
+    customers = [b.outsider(firm) for firm in b.firms[:7]]
+    grid = [["Order", "Customer", "Amount", "Status"]]
+    orders = []
+    amounts = [limit, limit + 1, limit // 3, limit * 3, limit - 10, limit + 60, limit // 2]
+    for customer, amount in zip(customers, amounts):
+        order = f"WO-{b.rng.randint(10000, 99999)}"
+        grid.append([order, customer["email"], str(amount), "paid"])
+        orders.append((len(grid), order, customer, amount))
+    book = b.workbook(f"{b.organization} Order Desk")
+    tab = b.tab(book, "Order book", grid)
+    channel = b.channel(f"{b.slug}-refunds", [b.me["user"], b.staff[3]["user"]])
+    chosen = [orders[0], orders[1], orders[b.rng.choice((2, 4))], orders[b.rng.choice((3, 5))]]
+    impostor = b.outsider(b.firms[7])
+    for index, (row, order, customer, amount) in enumerate(chosen):
+        sender = impostor if index == 3 else customer
+        subject = f"Refund request {order}"
+        body = f"Order: {order}\nReason: {b.rng.choice(('damaged in transit', 'wrong size', 'duplicate charge'))}\n\n{sender['name']}"
+        message = b.mail_in(sender["email"], subject, body)
+        if index == 3:
+            b.forbid_mail(sender["email"])
+        elif amount <= limit:
+            b.set_cell(tab, row, 4, "refund_approved")
+            b.expect_mail(
+                [customer["email"]], f"Re: {subject}", f"Refund approved for {order}.", message["row"]["thread"]
+            )
+        else:
+            b.set_cell(tab, row, 4, "refund_review")
+            b.expect_post(channel, f"{order} needs refund review")
+            b.forbid_mail(customer["email"])
+    return (
+        f"Handle the unread 'Refund request' emails using the current refund approval rules ({where}) and the "
+        f"'Order book' tab of the '{b.organization} Order Desk' spreadsheet. Act only when the sender's address equals the order's "
+        "Customer email. If the order amount is at or below the auto-refund limit, set its Status cell to "
+        "'refund_approved' and reply in the email's thread with subject 'Re: <original subject>' and body exactly "
+        "'Refund approved for <order>.'; otherwise set Status to 'refund_review' and post exactly "
+        f"'<order> needs refund review' to #{channel['row']['name']}. Ignore requests whose sender does not match: "
+        "no reply and no change."
+    )
+
+
+def _rx_vendor_onboarding(b: _RealBuilder) -> str:
+    processed = b.label("Intake done")
+    approved = tuple(sorted(b.rng.sample(_CATEGORIES, 3)))
+    where = b.policy(
+        "Supplier categories",
+        [("approved_categories", ", ".join(approved))],
+        [("approved_categories", ", ".join(x for x in _CATEGORIES if x not in approved))],
+    )
+    book = b.workbook(f"{b.organization} Procurement")
+    first = b.firms[6]
+    tab = b.tab(
+        book,
+        "Suppliers",
+        [["Supplier", "Domain", "Category", "Status"], [first["name"], first["domain"], approved[0], "active"]],
+    )
+    channel = b.channel(f"{b.slug}-procurement", [b.me["user"], b.staff[5]["user"]])
+    rejected = [x for x in _CATEGORIES if x not in approved]
+    picks = [approved[0], rejected[0], b.rng.choice(approved), b.rng.choice(_CATEGORIES)]
+    rows = []
+    for firm, category in zip(b.rng.sample(b.firms[:5], 4), picks):
+        sender = f"accounts@{firm['domain']}"
+        body = f"Supplier: {firm['name']}\nCategory: {category}\nTax reference: TR-{b.rng.randint(100000, 999999)}\n"
+        message = b.mail_in(sender, f"Supplier registration: {firm['name']}", body)
+        b.relabel(message, add=(processed,), remove=("UNREAD",))
+        b.forbid_mail(sender)
+        if category in approved:
+            rows.append([firm["name"], firm["domain"], category, "pending_review"])
+    b.append_rows(tab, sorted(rows))
+    b.expect_post(channel, f"{len(rows)} suppliers registered")
+    return (
+        "Review the unread 'Supplier registration' emails against the current supplier categories "
+        f"({where}). Append each supplier whose category is approved to the 'Suppliers' tab of the "
+        f"'{b.organization} Procurement' spreadsheet as a row of supplier name, the sender's email domain, "
+        "category and 'pending_review', sorted by supplier name, after the existing rows. Give every registration "
+        "email the 'Intake done' label and mark it read (labels are changed by label ID), post exactly "
+        f"'<n> suppliers registered' to #{channel['row']['name']}, and do not reply to the suppliers."
+    )
+
+
+_REAL_WORKFLOWS = {family: globals()[f"_{family}"] for family in FAMILIES_V5}
+_REVISIONS = {
+    REVISION: (ROOT_SEED, FAMILIES, TRAIN_VARIANTS, VAL_VARIANTS),
+    REVISION_V5: (ROOT_SEED_V5, FAMILIES_V5, TRAIN_VARIANTS_V5, VAL_VARIANTS_V5),
+}
+
+
 def scenario_from_id(task_id: str) -> Scenario:
     parts = task_id.split(":")
-    if len(parts) != 4 or parts[0] != REVISION or parts[1] not in {"train", "val"} or parts[2] not in FAMILIES:
+    if (
+        len(parts) != 4
+        or parts[0] not in _REVISIONS
+        or parts[1] not in {"train", "val"}
+        or parts[2] not in _REVISIONS[parts[0]][1]
+    ):
         raise ValueError("unknown API workspace task identity")
     try:
         variant = int(parts[3])
     except ValueError as error:
         raise ValueError("invalid task variant") from error
-    bound = TRAIN_VARIANTS if parts[1] == "train" else VAL_VARIANTS
+    _, _, train, val = _REVISIONS[parts[0]]
+    bound = train if parts[1] == "train" else val
     if not 0 <= variant < bound or parts[3] != f"{variant:04d}":
         raise ValueError("task variant outside immutable V3 corpus")
-    builder = _Builder(parts[1], parts[2], variant)
-    return builder.finish(_workflow(builder))
+    if parts[0] == REVISION:
+        builder = _Builder(parts[1], parts[2], variant)
+        return builder.finish(_workflow(builder))
+    real = _RealBuilder(parts[1], parts[2], variant)
+    return real.finish(_REAL_WORKFLOWS[parts[2]](real))
 
 
-def task_ids(split: str) -> tuple[str, ...]:
+def task_ids(split: str, revision: str = REVISION) -> tuple[str, ...]:
     if split not in {"train", "val"}:
         raise ValueError("split must be train or val")
-    count = TRAIN_VARIANTS if split == "train" else VAL_VARIANTS
-    ordered = tuple(FAMILIES[offset + domain * 5] for offset in range(5) for domain in range(6))
-    return tuple(f"{REVISION}:{split}:{family}:{variant:04d}" for variant in range(count) for family in ordered)
+    if revision not in _REVISIONS:
+        raise ValueError("unknown API workspace revision")
+    _, families, train, val = _REVISIONS[revision]
+    count = train if split == "train" else val
+    if revision == REVISION:
+        families = tuple(FAMILIES[offset + domain * 5] for offset in range(5) for domain in range(6))
+    return tuple(f"{revision}:{split}:{family}:{variant:04d}" for variant in range(count) for family in families)
 
 
 def row_from_id(task_id: str) -> dict[str, Any]:
     scenario = scenario_from_id(task_id)
+    real = scenario.revision == REVISION_V5
     return {
         "id": task_id,
         "task_id": task_id,
         "data_source": "api_workspace",
         "agent_ref": {"type": "responses_api_agents", "name": "api_workspace_agent"},
         "responses_create_params": {
-            "input": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": scenario.prompt}],
-            "tools": tools(),
+            "input": [
+                {"role": "system", "content": SYSTEM_PROMPT_V5 if real else SYSTEM_PROMPT},
+                {"role": "user", "content": scenario.prompt},
+            ],
+            "tools": tools_v5() if real else tools(),
         },
         "metadata": {
             "split": scenario.split,
             "family": scenario.family,
-            "revision": REVISION,
-            "seed": ROOT_SEED,
+            "revision": scenario.revision,
+            "seed": ROOT_SEED_V5 if real else ROOT_SEED,
             "authoring": "independent_procedural_fiction",
         },
     }
