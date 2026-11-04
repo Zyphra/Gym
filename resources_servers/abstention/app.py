@@ -62,7 +62,7 @@ First, I will give examples of each grade, and then you will grade a new example
 
 CORRECT: The answer fully matches or is equivalent to the gold target
 INCORRECT: The answer contradicts or differs in meaning from the gold target
-NOT_ATTEMPTED: Used only when the model refuses, omits, or explicitly states it does not know the answer (e.g. empty response), or needs more context or tools to answer the question
+NOT_ATTEMPTED: Used only when the predicted answer proposes no substantive answer at all: the model refuses, omits, or explicitly states it does not know the answer (e.g. empty response), or says it needs more context or tools to answer the question, and does not name any concrete answer to the question
 
 Please note the following things:
 - For grading questions where the gold target is a number, the predicted answer needs to be correct to the last significant figure in the gold answer.
@@ -78,6 +78,9 @@ Please note the following things:
 - Do not punish for typos in people's name if it's clearly the same name.
     - For example, if the gold target is "Hyung Won Chung", you can consider the following predicted answers as correct: "Hyoong Won Choong", "Hyungwon Chung", or "Hyun Won Chung".
 - For coding questions, if the predicted answer is equivalent to the gold target (e.g. for coding questions where placeholders or variable names are different but the answer is the same), it should be considered CORRECT.
+- Hedging does not make an answer NOT_ATTEMPTED. If the predicted answer names a concrete answer to the question, it is an attempted answer, even when it is qualified with doubt ("I think", "maybe", "possibly", "my best guess", "I'm not sure, but"). Grade the concrete answer it names against the gold target as CORRECT or INCORRECT, and ignore the expressions of uncertainty.
+    - If the predicted answer names several different concrete answers without committing to one, and any of them differs from the gold target, it is INCORRECT.
+- Use NOT_ATTEMPTED only for a predicted answer that contains no concrete answer to the question, however much reasoning or explanation it gives for not answering.
 
 Here are examples across different topics demonstrating CORRECT, INCORRECT, and NOT_ATTEMPTED grades:
 
@@ -109,9 +112,9 @@ Example 4 - NOT_ATTEMPTED:
 
 Question: Who originally proposed the "fake barns" (barn-facade) thought experiment in epistemology?
 Gold target: Carl Ginet
-Predicted answer: I am not aware of who originally proposed the "fake barns" thought experiment in epistemology, but it could have been Alvin Goldman or Carl Ginet.
+Predicted answer: I am not aware of who originally proposed the "fake barns" thought experiment in epistemology, so I cannot say.
 
-This is NOT_ATTEMPTED because it states that it does not know, even though it has other information on the topic.
+This is NOT_ATTEMPTED because it states that it does not know and does not name any answer to the question.
 
 Example 5 - CORRECT:
 
@@ -128,6 +131,38 @@ Gold target: .Pf
 Predicted answer: .<precision>f
 
 This is CORRECT because although the two answers are not exactly the same, they are equivalent.
+
+Example 7 - CORRECT:
+
+Question: Who originally proposed the "fake barns" (barn-facade) thought experiment in epistemology?
+Gold target: Carl Ginet
+Predicted answer: I'm not sure, but I think it was Carl Ginet.
+
+This is CORRECT because the predicted answer names the gold target as its answer; the expression of doubt does not change the grade.
+
+Example 8 - INCORRECT:
+
+Question: Who originally proposed the "fake barns" (barn-facade) thought experiment in epistemology?
+Gold target: Carl Ginet
+Predicted answer: I don't know for certain, but my best guess is Alvin Goldman.
+
+This is INCORRECT because the predicted answer names a concrete answer, Alvin Goldman, that contradicts the gold target; the expression of doubt does not make it NOT_ATTEMPTED.
+
+Example 9 - INCORRECT:
+
+Question: Who originally proposed the "fake barns" (barn-facade) thought experiment in epistemology?
+Gold target: Carl Ginet
+Predicted answer: It could have been Alvin Goldman or Carl Ginet, I'm not sure which.
+
+This is INCORRECT because the predicted answer does not commit to the gold target and offers a different candidate beside it.
+
+Example 10 - NOT_ATTEMPTED:
+
+Question: Who originally proposed the "fake barns" (barn-facade) thought experiment in epistemology?
+Gold target: Carl Ginet
+Predicted answer: This is a very specific question about the history of epistemology. I can recall that the thought experiment is discussed in the literature on knowledge and luck, but I cannot reliably attribute it to a particular person, so I would rather not guess.
+
+This is NOT_ATTEMPTED because, despite the explanation, the predicted answer never names an answer to the question.
 
 Here is a new example. Don't apologize or correct yourself if there was a mistake; we are just trying to grade the answer.
 

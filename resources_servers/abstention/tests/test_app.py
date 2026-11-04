@@ -26,6 +26,7 @@ from nemo_gym.openai_utils import (
 )
 from nemo_gym.server_utils import ServerClient
 from resources_servers.abstention.app import (
+    _DEFAULT_JUDGE_PROMPT_TEMPLATE,
     AbstentionConfig,
     AbstentionServer,
     AbstentionVerifyRequest,
@@ -392,3 +393,36 @@ class TestAbstentionServer:
         result = await server.verify(request)
         assert result.extracted_answer == "The capital of France is Paris"
         assert result.reward == approx(1.0)
+
+
+class TestStockJudgePrompt:
+    def test_formats_with_the_three_fields_and_ends_at_the_grading_instruction(self) -> None:
+        prompt = _DEFAULT_JUDGE_PROMPT_TEMPLATE.format(
+            question="Who wrote Dune?", target="Frank Herbert", predicted_answer="I think Herbert, not sure."
+        )
+        tail = prompt.split("Here is a new example.", 1)[1]
+        assert (
+            "Question: Who wrote Dune?\nGold target: Frank Herbert\nPredicted answer: I think Herbert, not sure.\n\n"
+            in tail
+        )
+        assert tail.rstrip().endswith('Just return the letters "A", "B", or "C", with no text around it.')
+
+    def test_hedged_attempts_are_not_abstentions_in_the_examples(self) -> None:
+        # Each worked example is "Example N - GRADE:" followed by its question; hedged answers must sit under
+        # CORRECT/INCORRECT and pure abstentions under NOT_ATTEMPTED.
+        examples = {}
+        for block in _DEFAULT_JUDGE_PROMPT_TEMPLATE.split("Example ")[1:]:
+            header, body = block.split("\n", 1)
+            predicted = body.split("Predicted answer: ", 1)[1].split("\n", 1)[0]
+            examples[predicted] = header.split(" - ")[1].rstrip(":")
+        assert examples["I'm not sure, but I think it was Carl Ginet."] == "CORRECT"
+        assert examples["I don't know for certain, but my best guess is Alvin Goldman."] == "INCORRECT"
+        assert examples["It could have been Alvin Goldman or Carl Ginet, I'm not sure which."] == "INCORRECT"
+        not_attempted = [k for k, v in examples.items() if v == "NOT_ATTEMPTED"]
+        assert len(not_attempted) == 2
+        assert all("Goldman" not in k and "Ginet" not in k for k in not_attempted)
+
+    def test_consumer_example_text_is_unchanged(self) -> None:
+        # Downstream prompt revisions replace this exact sentence once; moving it would break their config validation.
+        old = 'The predicted answer "1.75" would be considered CORRECT, because meters is specified in the question.'
+        assert _DEFAULT_JUDGE_PROMPT_TEMPLATE.count(old) == 1
