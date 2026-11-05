@@ -64,6 +64,15 @@ server:
 Use these for request latency. They are dimensioned, so you can compare `/verify` against
 `/v1/responses`, or isolate 500s, which is what latency questions usually require.
 
+Existing metadata-only model-call capture also records `server_queue_ms` and
+`server_service_ms` for SimpleModelServer requests. Queue time covers that
+process's semaphore wait; service time covers the admitted upstream call,
+including transport and upstream queue/prefill/decode. It does not isolate GPU
+compute. Cancellation before admission leaves service time unknown. Token
+usage comes from the returned upstream response and stays unknown when absent.
+These observations use the existing capture contract and do not enable capture
+or change concurrency, sampling, or reasoning settings.
+
 ### A Note on `gym.server.request_duration_ms`
 
 `nemo-lens` declares a `gym.server.request_duration_ms` histogram. NeMo Gym does not use
