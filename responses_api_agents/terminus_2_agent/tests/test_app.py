@@ -25,6 +25,7 @@ from nemo_gym.openai_utils import NeMoGymEasyInputMessage, NeMoGymResponseCreate
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.terminus_2_agent.app import (
     COMMAND_NAMESPACE,
+    HARNESS_MOUNTS,
     SETUP_FAILED_TMUX_UNAVAILABLE,
     LocalEnvironment,
     LocalTmuxSession,
@@ -222,7 +223,8 @@ class TestLocalTmuxSession:
         with patch("responses_api_agents.terminus_2_agent.app.sys.platform", "linux"):
             command = session._tmux_start_session
         upstream = Terminus2SessionBase._tmux_start_session.fget(session)
-        assert shlex.split(command) == [sys.executable, "-I", str(COMMAND_NAMESPACE), "bash", "-c", upstream]
+        hidden = [arg for path in HARNESS_MOUNTS for arg in ("--hide", path)]
+        assert shlex.split(command) == [sys.executable, "-I", str(COMMAND_NAMESPACE), *hidden, "bash", "-c", upstream]
         assert "script -qc" in upstream
 
 
@@ -329,6 +331,39 @@ class TestCommandNamespace:
         while not marker.exists():
             assert time.monotonic() < deadline, "the namespace ended its command's daemon"
             time.sleep(0.05)
+
+    def test_hidden_paths_are_empty_for_the_agent_and_intact_for_the_harness(self, tmp_path: Path) -> None:
+        hidden = tmp_path / "agent_deps_mount"
+        hidden.mkdir()
+        (hidden / "runner.py").write_text("harness")
+        listing = tmp_path / "listing.txt"
+        # The daemon outlives ARGV, as the tmux server and the agent's shell do.
+        partial = shlex.quote(str(listing) + ".partial")
+        script = f"(sleep 1; ls -A {shlex.quote(str(hidden))} > {partial}; mv {partial} {shlex.quote(str(listing))}) >/dev/null 2>&1 &"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                str(COMMAND_NAMESPACE),
+                "--hide",
+                str(hidden),
+                "--hide",
+                str(tmp_path / "absent"),
+                "bash",
+                "-c",
+                script,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        deadline = time.monotonic() + 20
+        while not listing.exists():
+            assert time.monotonic() < deadline, "the agent-side listing never ran"
+            time.sleep(0.05)
+        assert listing.read_text() == ""
+        assert (hidden / "runner.py").read_text() == "harness"
 
 
 class TestStandaloneTerminus2:
@@ -507,6 +542,23 @@ class TestResponses:
         assert "agent_error" not in response.metadata
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "flags, stop_reason",
+        [
+            ({"turn_cap": True}, "max_turns"),
+            ({"turn_cap": True, "stop_reason": "turn_limit"}, "turn_limit"),  # the endpoint stop is the cause
+            ({"turn_cap": False}, None),
+        ],
+    )
+    async def test_harness_turn_cap_is_a_named_stop(self, flags, stop_reason) -> None:
+        agent = _make_agent()
+        agent._run_terminus = AsyncMock(return_value=({"steps": []}, AgentContext(), flags, False, False))
+        body = NeMoGymResponseCreateParamsNonStreaming(model="model", input="task")
+        with patch.object(Terminus2Agent, "resolve_model_base_url", return_value="http://model/v1"):
+            response = await agent.responses(request=None, body=body)
+        assert response.metadata.get("stop_reason") == stop_reason
+        assert response.metadata["finished_naturally"] == "false"
+
     @pytest.mark.parametrize(
         ("flags", "timed_out", "confirmed", "expected"),
         [

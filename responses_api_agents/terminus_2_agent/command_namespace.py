@@ -15,7 +15,7 @@
 
 """Start the agent's terminal in its own PID and mount namespace.
 
-Usage: ``python -I command_namespace.py ARGV...``
+Usage: ``python -I command_namespace.py [--hide PATH]... ARGV...``
 
 The harness runs inside the task sandbox, beside the commands it types. Harbor's
 own environments keep the harness outside the task container; this keeps that
@@ -27,6 +27,11 @@ boundary inside one sandbox:
   never the harness, and the namespace init ignores signals sent from inside it.
 - Everything ARGV starts carries ``oom_score_adj`` 1000, so a sandbox memory
   limit kills the task's command that exhausted it, not the harness.
+- Each ``--hide`` PATH that exists is covered by an empty read-only tmpfs once
+  ARGV has returned, before its status is reported. The harness, its runtime
+  and the runner's directories stay mounted for the harness, but the agent's
+  commands see what a task container without them would show. ARGV itself (the
+  tmux server, which runs from the harness runtime) has started by then.
 
 The caller's exit status is ARGV's. The namespace init then stays as the reaper
 of the agent's processes until the last one exits; tmux daemonizes, so the
@@ -43,6 +48,7 @@ import signal
 import sys
 
 
+_MS_RDONLY = 0x1
 _MS_NOSUID = 0x2
 _MS_NODEV = 0x4
 _MS_NOEXEC = 0x8
@@ -52,8 +58,10 @@ _COMMAND_OOM_SCORE_ADJ = "1000"
 SETUP_FAILURE_EXIT = 125
 
 
-def _mount(libc: ctypes.CDLL, source: bytes, target: bytes, fstype: bytes | None, flags: int) -> None:
-    if libc.mount(source, target, fstype, flags, None) != 0:
+def _mount(
+    libc: ctypes.CDLL, source: bytes, target: bytes, fstype: bytes | None, flags: int, data: bytes | None = None
+) -> None:
+    if libc.mount(source, target, fstype, flags, data) != 0:
         code = ctypes.get_errno()
         raise OSError(code, f"mount {target.decode()}: {os.strerror(code)}")
 
@@ -88,8 +96,21 @@ def _report(fd: int, message: str) -> None:
         os.close(fd)
 
 
-def _run_init(argv: list[str], status: int) -> None:
-    """PID 1 of the new namespace: start ARGV, report its status, reap the rest."""
+def _hide(libc: ctypes.CDLL, paths: list[str]) -> None:
+    for path in paths:
+        if os.path.isdir(path):
+            _mount(
+                libc,
+                b"none",
+                os.fsencode(path),
+                b"tmpfs",
+                _MS_RDONLY | _MS_NOSUID | _MS_NODEV | _MS_NOEXEC,
+                b"size=4k,mode=0555",
+            )
+
+
+def _run_init(argv: list[str], hide: list[str], status: int) -> None:
+    """PID 1 of the new namespace: start ARGV, hide paths, report its status, reap the rest."""
     libc = ctypes.CDLL(None, use_errno=True)
     try:
         # Keep the private /proc out of the sandbox's other mount namespaces.
@@ -119,6 +140,11 @@ def _run_init(argv: list[str], status: int) -> None:
     os.close(null)
     _, wait_status = os.waitpid(command, 0)
     code = os.waitstatus_to_exitcode(wait_status)
+    try:
+        _hide(libc, hide)
+    except OSError as error:
+        _report(status, f"E {error}\n")
+        os._exit(SETUP_FAILURE_EXIT)
     _report(status, f"{code if code >= 0 else 128 - code}\n")
     while True:
         try:
@@ -130,8 +156,12 @@ def _run_init(argv: list[str], status: int) -> None:
 
 
 def main(argv: list[str]) -> int:
+    hide = []
+    while len(argv) >= 2 and argv[0] == "--hide":
+        hide.append(argv[1])
+        argv = argv[2:]
     if not argv:
-        print("usage: command_namespace.py ARGV...", file=sys.stderr)
+        print("usage: command_namespace.py [--hide PATH]... ARGV...", file=sys.stderr)
         return 2
     read_end, write_end = os.pipe()
     sys.stdout.flush()
@@ -146,7 +176,7 @@ def main(argv: list[str]) -> int:
             _report(write_end, f"E namespace setup: {error}\n")
             os._exit(SETUP_FAILURE_EXIT)
         if init == 0:
-            _run_init(argv, write_end)
+            _run_init(argv, hide, write_end)
         os._exit(0)
     os.close(write_end)
     os.waitpid(intermediate, 0)

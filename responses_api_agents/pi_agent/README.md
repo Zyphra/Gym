@@ -76,8 +76,24 @@ model call. Model rollout and multi-segment training qualification are separate.
 - `thinking`: passed to `--thinking` (off, minimal, low, medium, high, xhigh)
 - `system_prompt`: appended via `--append-system-prompt`
 - `timeout`: seconds for the `pi` run
+- `hide_harness_mounts`: run Pi's shell commands without the runner, Gym and harness-runtime mounts
+  (`nemo_gym/hidden_mounts.py`, as Hermes does). Pi's bash tool takes the hiding shell as its `shellPath`;
+  an extension that spawns its own shell reads `PI_HIDE_HARNESS_MOUNTS=1`.
+- `max_turns`: assistant requests per run (Pi has none of its own). When set, the agent loads
+  `turn_limit.ts`, which aborts the request after the last allowed turn, once that turn's tools have run.
 - `extra_args`: extra flags appended to the `pi` command
 - `models_config`: written to `~/.pi/agent/models.json`
 - `pi_version`: npm version to pin on install (null means latest)
 
 See `configs/pi_agent.yaml`.
+
+## Budget stops
+
+A run that ends on a budget reports it the way the OpenHands adapter does, with no response error and
+`metadata.stop_reason`, so AnySWE grades and keeps the partial patch:
+
+- `max_iterations`: `max_turns` was reached;
+- `context_exhausted`: the last request failed with the endpoint's context-overflow error after Pi's
+  own overflow recovery, or the last reply was cut where the context window ends.
+
+Any other non-zero exit stays a `failed` response with error `Pi process_exit_<code>`.

@@ -30,8 +30,9 @@ def _events(*, end=True, usage=True):
     return "".join(json.dumps(event) + "\n" for event in events)
 
 
-def _agent(root, stdout, exit_code=0, *, timeout=False):
+def _agent(root, stdout, exit_code=0, *, timeout=False, stderr="", **config):
     script = "import sys,time; sys.stdout.write(" + repr(stdout) + "); sys.stdout.flush(); "
+    script += "sys.stderr.write(" + repr(stderr) + "); "
     script += "time.sleep(5)" if timeout else "sys.exit(" + str(exit_code) + ")"
     client = ServerClient(
         head_server_config=BaseServerConfig(host="127.0.0.1", port=1),
@@ -50,6 +51,7 @@ def _agent(root, stdout, exit_code=0, *, timeout=False):
         model="fixture",
         workspace_root=str(root),
         timeout=1 if timeout else 5,
+        **config,
     )
     with patch("responses_api_agents.pi_agent.app.ensure_pi", return_value=None):
         return PiAgent(config=config, server_client=client)
@@ -180,3 +182,91 @@ def test_existing_policy_stop_and_endpoint_failure_classification(tmp_path):
         }
     )
     assert harness_response_error(endpoint_failure, observations) is endpoint_failure.error
+
+
+def _last_reply(**message):
+    reply = (
+        dict(
+            role="assistant",
+            content=[dict(type="text", text="partial answer")],
+            responseId="response-fixture",
+            usage=dict(input=2, output=3),
+        )
+        | message
+    )
+    return json.dumps(dict(type="message_end", message=reply)) + "\n"
+
+
+def _agent_error_kind(saved):
+    """AnySWE's classification of a saved response (responses_api_agents/anyswe_agent/app.py)."""
+    from responses_api_agents.anyswe_agent.app import _classify_agent_error
+
+    stop = (saved.metadata or {}).get("stop_reason")
+    error = saved.error.message if saved.error is not None else ""
+    if stop == "max_iterations" and not error:
+        error = "max iterations"
+    return stop, "context_window" if stop == "context_exhausted" else _classify_agent_error(error)
+
+
+AT_WINDOW = dict(stopReason="length", usage=dict(input=131000, cacheRead=0, output=72))
+
+
+@pytest.mark.parametrize("observe", [False, True])
+@pytest.mark.parametrize(
+    "reply,stderr,exit_code,expected",
+    [
+        # turn_limit.ts aborted the request after the last allowed turn.
+        (
+            dict(stopReason="aborted", errorMessage="Request was aborted"),
+            "pi_gym_turn_limit: 3 turns\n",
+            1,
+            ("max_iterations", "max_iteration"),
+        ),
+        # An overflow that Pi's recovery could not compact away.
+        (
+            dict(stopReason="error", errorMessage="400 This model's maximum context length is 131072 tokens."),
+            "",
+            1,
+            ("context_exhausted", "context_window"),
+        ),
+        # A reply the endpoint cut where the window ends.
+        (AT_WINDOW, "", 0, ("context_exhausted", "context_window")),
+    ],
+)
+def test_budget_stops_are_labelled_like_openhands(tmp_path, observe, reply, stderr, exit_code, expected):
+    agent = _agent(
+        tmp_path / "work", _last_reply(**reply), exit_code, stderr=stderr, max_turns=3, context_window=131072
+    )
+    saved, observations, error = _stock_roundtrip(tmp_path, asyncio.run(_response(agent, observe)))
+    assert saved.error is None and saved.status not in ("failed", "incomplete")
+    assert _agent_error_kind(saved) == expected
+    assert error is None
+    stop, kind = expected
+    # AnySWE grades and keeps the partial patch of an expected budget stop, solved or not.
+    assert not _should_mask_sample(True, kind, False, None, stop)
+    assert not _should_mask_sample(False, kind, False, None, stop)
+    assert saved.output[0].content[0].text == "partial answer"
+
+
+@pytest.mark.parametrize(
+    "reply,stderr,config",
+    [
+        # Without the extension's marker an abort is not the turn limit.
+        (dict(stopReason="aborted", errorMessage="Request was aborted"), "", dict(max_turns=3)),
+        (dict(stopReason="aborted", errorMessage="Request was aborted"), "pi_gym_turn_limit: 3 turns\n", {}),
+        # A model-transport failure stays a failure.
+        (dict(stopReason="error", errorMessage="Error code: 503 unavailable"), "", dict(max_turns=3)),
+    ],
+)
+def test_other_ends_stay_failures(tmp_path, reply, stderr, config):
+    agent = _agent(tmp_path / "work", _last_reply(**reply), 1, stderr=stderr, **config)
+    saved, _, _ = _stock_roundtrip(tmp_path, asyncio.run(_response(agent, True)))
+    assert saved.status == "failed" and saved.error.message == "Pi process_exit_1"
+    assert "stop_reason" not in (saved.metadata or {})
+
+
+def test_a_reply_cut_below_the_window_is_not_a_context_stop(tmp_path):
+    reply = dict(stopReason="length", usage=dict(input=1000, output=32768))
+    agent = _agent(tmp_path / "work", _last_reply(**reply), 0, context_window=131072)
+    saved, _, _ = _stock_roundtrip(tmp_path, asyncio.run(_response(agent, True)))
+    assert saved.metadata is None and saved.error is None

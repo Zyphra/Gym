@@ -76,6 +76,10 @@ _OBSERVATION_SOURCE = "terminus_2"
 _ROOT_INVOCATION_ID = "root"
 # Runs under the harness interpreter; see its docstring for the boundary it keeps.
 COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
+# The AnyTerminal sandbox binds the runner directory, Gym and the harness runtime at
+# these paths. The agent's terminal does not see them: a task container run by
+# Harbor has none of them. Paths absent from a sandbox are left alone.
+HARNESS_MOUNTS = ("/trajectories_mount", "/nemo_gym_mount", "/agent_deps_mount")
 NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
 NATIVE_POLICY_BRIDGE = Path("/native_policy_bridge.py")
 NATIVE_CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -418,7 +422,8 @@ class LocalTmuxSession(TmuxSession):
             # kill commands and the task's memory use cannot end this harness.
             return (
                 f"{shlex.quote(sys.executable)} -I {shlex.quote(str(COMMAND_NAMESPACE))} "
-                f"bash -c {shlex.quote(super()._tmux_start_session)}"
+                + "".join(f"--hide {shlex.quote(path)} " for path in HARNESS_MOUNTS)
+                + f"bash -c {shlex.quote(super()._tmux_start_session)}"
             )
 
         session_name = shlex.quote(self._session_name)
@@ -556,6 +561,7 @@ class StandaloneTerminus2(ServedContextTerminus2):
         self.context_length_exceeded = False
         self.agent_error = None
         self.model_transport_error = None
+        self.turn_cap_reached = False
         try:
             session = getattr(self, "_session", None)
             if session is not None and not await session.is_session_alive():
@@ -565,6 +571,11 @@ class StandaloneTerminus2(ServedContextTerminus2):
                 causes = getattr(self, "_setup_errors", None) or ["tmux session is not alive after setup"]
                 self.logger.warning("Agent setup failed: %s: %s", self.agent_error, causes[0])
             await super().run(instruction, environment, context)
+            # Harbor's loop returns silently after max_turns episodes; name that end. A confirmed
+            # task_complete on the last episode is a natural finish, not a cap.
+            self.turn_cap_reached = not self.finished_naturally and getattr(self, "_n_episodes", 0) >= getattr(
+                self, "_max_episodes", math.inf
+            )
         except EpisodeTerminatedError:
             pass  # A policy stop keeps the completed trajectory for grading.
         except Exception as exc:
@@ -816,6 +827,7 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 "agent_error": getattr(agent, "agent_error", None),
                 "model_transport_error": getattr(agent, "model_transport_error", None),
                 "stop_reason": agent._llm.terminal_stop_reason,
+                "turn_cap": getattr(agent, "turn_cap_reached", False),
             }
             return trajectory, context, flags, timed_out, agent.finished_naturally
         finally:
@@ -926,7 +938,11 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                     }
                 ),
                 **({"model_transport_error": "true"} if flags.get("model_transport_error") else {}),
-                **({"stop_reason": flags["stop_reason"]} if flags.get("stop_reason") else {}),
+                **(
+                    {"stop_reason": flags["stop_reason"]}
+                    if flags.get("stop_reason")
+                    else ({"stop_reason": "max_turns"} if flags.get("turn_cap") else {})
+                ),
                 # Harness-neutral labels a wrapping agent (anyterminal) carries.
                 **({"agent_error": flags["agent_error"]} if flags.get("agent_error") else {}),
                 "finished_naturally": "true" if finished_naturally else "false",
