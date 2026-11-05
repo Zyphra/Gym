@@ -14,6 +14,7 @@ pi_agent:
       system_prompt: null
       timeout: 900
       max_turns: null
+      hide_harness_mounts: false
       extra_args: []
       # written to ~/.pi/agent/models.json
       models_config:

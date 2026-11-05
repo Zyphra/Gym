@@ -76,6 +76,9 @@ model call. Model rollout and multi-segment training qualification are separate.
 - `thinking`: passed to `--thinking` (off, minimal, low, medium, high, xhigh)
 - `system_prompt`: appended via `--append-system-prompt`
 - `timeout`: seconds for the `pi` run
+- `hide_harness_mounts`: run Pi's shell commands without the runner, Gym and harness-runtime mounts
+  (`nemo_gym/hidden_mounts.py`, as Hermes does). Pi's bash tool takes the hiding shell as its `shellPath`;
+  an extension that spawns its own shell reads `PI_HIDE_HARNESS_MOUNTS=1`.
 - `max_turns`: assistant requests per run (Pi has none of its own). When set, the agent loads
   `turn_limit.ts`, which aborts the request after the last allowed turn, once that turn's tools have run.
 - `extra_args`: extra flags appended to the `pi` command

@@ -5,6 +5,9 @@
 import asyncio
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -26,7 +29,7 @@ pytestmark = pytest.mark.skipif(not os.environ.get("TASK_STOCK_PI_RUNTIME"), rea
 class _Endpoint:
     """Every request is answered with one bash call that appends to a marker file."""
 
-    def __init__(self, marker: Path) -> None:
+    def __init__(self, marker: Path, extra: str = "") -> None:
         self.requests: list[dict] = []
         endpoint = self
 
@@ -42,7 +45,7 @@ class _Endpoint:
                     "index": 0,
                     "id": f"call_{n}",
                     "type": "function",
-                    "function": {"name": "bash", "arguments": json.dumps({"command": f"echo {n} >> {marker}"})},
+                    "function": {"name": "bash", "arguments": json.dumps({"command": f"echo {n} >> {marker}{extra}"})},
                 }
                 chunks = [
                     {
@@ -76,10 +79,10 @@ class _Endpoint:
         Thread(target=self.httpd.serve_forever, daemon=True).start()
 
 
-def _episode(monkeypatch, tmp_path, max_turns):
+def _episode(monkeypatch, tmp_path, max_turns, extra="", **config):
     runtime = Path(os.environ["TASK_STOCK_PI_RUNTIME"])
     marker = tmp_path / "turns.txt"
-    endpoint = _Endpoint(marker)
+    endpoint = _Endpoint(marker, extra)
     monkeypatch.setenv("PATH", f"{runtime / 'bin'}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(base_agent, "get_first_server_config_dict", lambda _gc, _name: {})
     client = MagicMock(spec=ServerClient)
@@ -94,6 +97,7 @@ def _episode(monkeypatch, tmp_path, max_turns):
             model="model",
             timeout=60,
             max_turns=max_turns,
+            **config,
             command=f"{runtime / 'bin/node'} {runtime / 'bin/pi'}",
             workspace_root=str(tmp_path / "pi"),
             resources_server=ResourcesServerRef(type="resources_servers", name=""),
@@ -118,3 +122,24 @@ def test_max_turns_ends_after_the_last_turns_tools(monkeypatch, tmp_path):
     assert response.metadata == {"stop_reason": "max_iterations", "pi_stop_detail": "Pi reached max_turns=3"}
     assert [item.type for item in response.output].count("function_call") == 3
     assert not _should_mask_sample(True, "max_iteration", False, None, "max_iterations")
+
+
+@pytest.mark.skipif(
+    subprocess.run(["unshare", "--user", "--mount", "true"]).returncode != 0,
+    reason="this host allows no unprivileged mount namespace",
+)
+def test_hidden_harness_mounts_are_empty_for_pi_bash(monkeypatch, tmp_path):
+    """Pi's own bash tool runs through the hiding shell: a harness mount reads empty, the harness keeps it."""
+    mount = Path(tempfile.mkdtemp(prefix="nemo-gym-", dir="/tmp"))
+    try:
+        (mount / "params.json").write_text("{}")
+        listing = f"; ls -A {mount} | wc -l"
+        response, _, ran = _episode(monkeypatch, tmp_path, 1, listing, hide_harness_mounts=True)
+        output = [item.output for item in response.output if item.type == "function_call_output"]
+        assert ran == ["1"] and output[0].strip() == "0"
+        (tmp_path / "plain").mkdir()
+        response, _, _ = _episode(monkeypatch, tmp_path / "plain", 1, listing)
+        output = [item.output for item in response.output if item.type == "function_call_output"]
+        assert output[0].strip() == "1" and (mount / "params.json").read_text() == "{}"
+    finally:
+        shutil.rmtree(mount)

@@ -541,6 +541,10 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     context_window: int = 262144
     max_output_tokens: int = 131072
     max_turns: Optional[int] = Field(default=None, ge=1)
+    # Run Pi's shell commands without the runner, Gym and harness-runtime mounts, as a benchmark's task
+    # container shows them (nemo_gym/hidden_mounts.py). Pi's bash tool takes the hiding shell through its
+    # shellPath setting; an extension that spawns its own shell reads PI_HIDE_HARNESS_MOUNTS=1.
+    hide_harness_mounts: bool = False
     pi_version: Optional[str] = None
 
     @property
@@ -622,13 +626,18 @@ class PiAgent(SimpleResponsesAPIAgent):
         }
         return config
 
-    def _build_settings_config(self) -> dict[str, Any]:
-        return build_pi_settings(
+    def _build_settings_config(self, home: Optional[Path] = None) -> dict[str, Any]:
+        settings = build_pi_settings(
             self.config.settings_config,
             timeout=self.config.timeout,
             compaction_enabled=self.config.compaction_enabled,
             episode_bound=self.config.model_server is not None,
         )
+        if self.config.hide_harness_mounts and home is not None:
+            from nemo_gym import hidden_mounts
+
+            settings["shellPath"] = hidden_mounts.shell_wrapper(str(home), "/bin/bash")
+        return settings
 
     def _write_pi_config(self, home: Path, rollout_id: Optional[str] = None) -> None:
         agent_dir = home / ".pi" / "agent"
@@ -636,7 +645,7 @@ class PiAgent(SimpleResponsesAPIAgent):
         models_config = self._build_models_config(rollout_id)
         if models_config:
             (agent_dir / "models.json").write_text(json.dumps(models_config, indent=2))
-        (agent_dir / "settings.json").write_text(json.dumps(self._build_settings_config(), indent=2))
+        (agent_dir / "settings.json").write_text(json.dumps(self._build_settings_config(home), indent=2))
 
     async def _run_pi(
         self,
@@ -662,6 +671,8 @@ class PiAgent(SimpleResponsesAPIAgent):
             cmd += ["--thinking", self.config.thinking]
         if system_prompt:
             cmd += ["--append-system-prompt", system_prompt]
+        if self.config.hide_harness_mounts:
+            env["PI_HIDE_HARNESS_MOUNTS"] = "1"
         if self.config.max_turns is not None:
             cmd += ["--extension", str(TURN_LIMIT_EXTENSION)]
             env["PI_GYM_MAX_TURNS"] = str(self.config.max_turns)
