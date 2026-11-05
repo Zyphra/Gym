@@ -112,6 +112,14 @@ summary tokens. Thinking and the visible-summary target remain unchanged;
 budget that fits the policy model's context window together with the summary input.
 Requires the Hermes runtime's summary-output-budget configuration support.
 
+`compression_summary_keep_first_copy` (default `false`) cuts a visible summary that
+restarts at its own first heading (the template written twice) to its first copy
+before Hermes reads it. Hermes' summary guard rejects a summary with a repeated
+heading and keeps the old context, so the run re-compacts on its next turn; with
+this option such a summary is accepted once. The served completion, including both
+copies, is unchanged. Other repeated headings, empty and length-cut summaries still
+reach the guard.
+
 ## Local command output budget
 
 The pinned Hermes source bounds command output while it drains the process.

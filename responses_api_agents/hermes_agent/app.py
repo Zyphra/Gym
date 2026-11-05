@@ -17,6 +17,7 @@ import atexit
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -372,6 +373,10 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     compression_target_ratio: float | None = Field(default=None, ge=0.10, le=0.80, allow_inf_nan=False)
     # Total summary completion allowance, including reasoning; independent of tail retention.
     compression_summary_max_output_tokens: int = Field(default=32768, gt=0)
+    # Keep only the first copy when the visible summary restarts at its own first heading
+    # (the model wrote the template twice). Hermes' summary guard otherwise rejects the summary
+    # and the run re-compacts on the next turn.
+    compression_summary_keep_first_copy: bool = False
     chat_template_kwargs_enabled: bool = True
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
@@ -457,7 +462,66 @@ def _hide_harness_mounts_from_shell() -> None:
     local._find_bash = find_bash
 
 
-def _policy_compression_route(agent, summary_temperature: float | None) -> Callable[..., Any]:
+# Markdown ATX headings and code fences, read as Hermes' summary guard reads them.
+_SUMMARY_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$")
+_SUMMARY_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+
+
+def _first_summary_copy(text: str) -> str:
+    """The text before the summary restarts at its own first heading; otherwise the text unchanged.
+
+    A summary that writes its whole template twice (``## Goal ... ## Goal ...``) repeats its first
+    heading at the same level outside code fences. Only that restart is cut: any other repeated
+    heading is left for Hermes' guard to reject.
+    """
+    first = None
+    fence = None
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        start = offset
+        offset += len(line)
+        fence_match = _SUMMARY_FENCE_RE.match(line)
+        if fence_match:
+            marker = fence_match.group(1)
+            if fence is None:
+                fence = marker
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        heading = _SUMMARY_HEADING_RE.match(line.rstrip("\r\n"))
+        if not heading:
+            continue
+        title = " ".join(heading.group(2).split()).casefold()
+        if not title:
+            continue
+        key = (len(heading.group(1)), title)
+        if first is None:
+            first = key
+        elif key == first:
+            kept = text[:start].rstrip()
+            return kept if kept else text
+    return text
+
+
+def _keep_first_summary_copy(response) -> None:
+    """Cut the response's visible summary to its first copy, in place."""
+    choices = getattr(response, "choices", None) or []
+    message = getattr(choices[0], "message", None) if choices else None
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        kept = _first_summary_copy(content)
+        if kept != content:
+            message.content = kept
+            LOG.info(
+                "Hermes summary repeated its template; kept the first copy (%d of %d chars)", len(kept), len(content)
+            )
+
+
+def _policy_compression_route(
+    agent, summary_temperature: float | None, keep_first_copy: bool = False
+) -> Callable[..., Any]:
     """Send a compression request through the run's own policy request builder.
 
     ``agent._build_api_kwargs`` (the run's patched builder) supplies the model,
@@ -481,7 +545,10 @@ def _policy_compression_route(agent, summary_temperature: float | None) -> Calla
             request["tools"] = tools
         if extra_body:
             request["extra_body"] = {**request.get("extra_body", {}), **extra_body}
-        return agent.client.chat.completions.create(**request)
+        response = agent.client.chat.completions.create(**request)
+        if keep_first_copy:
+            _keep_first_summary_copy(response)
+        return response
 
     return complete
 
@@ -640,7 +707,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
             _hide_harness_mounts_from_shell()
         if self.config.compression_enabled:
             _route_compression_calls()
-            compression_route = _policy_compression_route(agent, self.config.compression_summary_temperature)
+            compression_route = _policy_compression_route(
+                agent,
+                self.config.compression_summary_temperature,
+                self.config.compression_summary_keep_first_copy,
+            )
         _execute_every_tool_call(agent)
         _limit_tool_results(agent)
         ended_by_endpoint = _observe_endpoint_stop(agent)
