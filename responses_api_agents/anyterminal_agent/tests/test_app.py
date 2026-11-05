@@ -749,6 +749,45 @@ class TestSetupParams:
 
         assert params.tb_sandbox_ttl == 7200
 
+    @staticmethod
+    def _terminus(tmp_path: Path, timer: float, **config) -> AnyTerminalAgent:
+        return _make_setup_agent(
+            tmp_path,
+            agent_server_module="responses_api_agents.terminus_2_agent.app",
+            agent_server_class="Terminus2Agent",
+            agent_config_class="Terminus2AgentConfig",
+            agent_kwargs={"timeout": timer, "max_turns": 250},
+            **config,
+        )
+
+    def test_terminus_timer_outlives_a_longer_row_clock(self, tmp_path: Path) -> None:
+        # Attached TB2.1 eval: row clocks apply and the wrapper set the timer to run_timeout_s + 600.
+        agent = self._terminus(tmp_path, 11400)
+        body = _make_body(
+            metadata={"task_name": "build-pov-ray", "task_dir": str(tmp_path), "agent_timeout_sec": "12000"}
+        )
+
+        params = agent._setup_params(body)
+
+        assert params.tb_agent_timeout == 12000
+        assert params.agent_kwargs == {"timeout": 12600, "max_turns": 250}
+        assert agent.config.agent_kwargs["timeout"] == 11400
+
+    @pytest.mark.parametrize("row_clock, global_clock, timer", [("7200", None, 11400), ("900", 21600, 22200)])
+    def test_terminus_timer_kept_when_it_already_outlives_the_clock(
+        self, tmp_path: Path, row_clock: str, global_clock, timer: int
+    ) -> None:
+        agent = self._terminus(tmp_path, timer, global_agent_timeout=global_clock)
+        body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": row_clock})
+
+        assert agent._setup_params(body).agent_kwargs["timeout"] == timer
+
+    def test_other_harness_timeout_kwarg_is_not_a_terminus_timer(self, tmp_path: Path) -> None:
+        agent = _make_setup_agent(tmp_path, agent_kwargs={"timeout": 60})
+        body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": "12000"})
+
+        assert agent._setup_params(body).agent_kwargs == {"timeout": 60}
+
     def test_global_agent_timeout_rejects_zero(self) -> None:
         with pytest.raises(ValidationError, match="global_agent_timeout"):
             _config(global_agent_timeout=0)
