@@ -30,9 +30,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from subprocess import Popen
 from traceback import format_exc
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Literal, Mapping, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from nemo_gym import PARENT_DIR
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -101,6 +101,12 @@ def _read_task_meta(task_dir: Path) -> dict:
             cfg = tomllib.load(f)
         result["agent_timeout_sec"] = (cfg.get("agent") or {}).get("timeout_sec")
         result["verifier_timeout_sec"] = (cfg.get("verifier") or {}).get("timeout_sec")
+        declared = ((cfg.get("verifier") or {}).get("isolation") or {}).get("prepared_artifacts") or []
+        extensions = [item for item in declared if item.get("kind") == "python_extension"]
+        if len(extensions) > 1:
+            raise ValueError("only one declared Python extension is supported")
+        if extensions:
+            result["verifier_extension"] = extensions[0]
         if "storage_mb" in (cfg.get("environment") or {}):
             result["storage_mb"] = cfg["environment"]["storage_mb"]
     dockerfile = task_dir / "environment" / "Dockerfile"
@@ -572,24 +578,132 @@ class AnyTerminalServerConfig(BaseModel):
     agent_deps_url: Optional[str] = None
 
 
+class ImageVerifierPython(BaseModel):
+    """Exact image Python and package environment for trusted verifier preparation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    executable: str
+    executable_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    version: str
+    soabi: str
+    extension_suffix: str
+    uv_version: Literal["0.9.5"]
+    requirements: tuple[str, ...]
+
+    @field_validator("requirements", mode="before")
+    @classmethod
+    def freeze_requirements(cls, value):
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_image_python(self):
+        if (
+            not self.executable.startswith("/usr/local/bin/python")
+            or any(c in self.executable for c in ("\n", "\r", ":"))
+            or not self.version.startswith("3.13.")
+            or not self.soabi.startswith("cpython-313-")
+            or self.extension_suffix != f".{self.soabi}.so"
+            or not self.requirements
+            or len(self.requirements) != len(set(self.requirements))
+            or any(not re.fullmatch(r"[a-zA-Z0-9_.-]+==[a-zA-Z0-9_.-]+", item) for item in self.requirements)
+        ):
+            raise ValueError("image verifier Python identity or package pins are invalid")
+        return self
+
+    def prepare_command(self, module: str) -> str:
+        """Resolve one pinned uv environment and compile in the isolated build tree."""
+        expected = self.model_dump(mode="json")
+        program = (
+            "import hashlib,importlib.metadata as md,importlib.machinery as machinery,"
+            "json,os,platform,subprocess,sys,sysconfig,pathlib,shutil;"
+            "root=pathlib.Path(os.environ['NEMO_PREP_ROOT']);"
+            "build=root/'build';"
+            "sha=lambda p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest();"
+            f"expected={expected!r};"
+            "base=os.path.realpath(getattr(sys,'_base_executable',sys.executable));"
+            "assert os.path.realpath(expected['executable'])==base;"
+            "assert sha(base)==expected['executable_sha256'];"
+            "assert platform.python_version()==expected['version'];"
+            "assert sysconfig.get_config_var('SOABI')==expected['soabi'];"
+            "assert expected['extension_suffix'] in machinery.EXTENSION_SUFFIXES;"
+            "pins={x.split('==')[0].replace('_','-').lower():x.split('==')[1] "
+            "for x in expected['requirements']};"
+            "assert all(md.version(name)==version for name,version in pins.items());"
+            "uv_observed=subprocess.check_output([os.environ['NEMO_UVX'],'--version'],text=True).strip();"
+            "assert uv_observed.split()[-1]==expected['uv_version'];"
+            "subprocess.run([sys.executable,'-I','setup.py','build_ext','--inplace'],"
+            "cwd=build,check=True);"
+            f"output=build/({module!r}+expected['extension_suffix']);"
+            "assert output.is_file() and not output.is_symlink();"
+            "site=pathlib.Path(sysconfig.get_paths()['purelib']);"
+            "assert site.is_relative_to(root) and site.is_dir();"
+            "site_files=sorted(p for p in site.rglob('*') if '__pycache__' not in p.parts);"
+            "assert all(not p.is_symlink() for p in site_files);"
+            "site_hash=hashlib.sha256();"
+            "[(site_hash.update(p.relative_to(site).as_posix().encode()+b'\\0'),"
+            "site_hash.update(hashlib.sha256(p.read_bytes()).digest())) "
+            "for p in site_files if p.is_file()];"
+            "receipt={'python':sys.executable,'base_executable':base,"
+            "'executable_sha256':sha(base),'version':platform.python_version(),"
+            "'soabi':sysconfig.get_config_var('SOABI'),"
+            "'extension_suffix':expected['extension_suffix'],"
+            "'packages':{name:md.version(name) for name in pins},"
+            "'output_sha256':sha(output),"
+            "'site_packages':str(site),'site_tree_sha256':site_hash.hexdigest(),"
+            "'uv_version':uv_observed.split()[-1],'uv_version_output':uv_observed,"
+            "'uv_sha256':sha(os.environ['NEMO_UVX']),"
+            "'compiler_path':shutil.which('gcc'),"
+            "'compiler_sha256':sha(shutil.which('gcc')),"
+            "'compiler_version':subprocess.check_output(['gcc','--version'],"
+            "text=True).splitlines()[0],"
+            "'libc':platform.libc_ver(),"
+            "'machine':platform.machine()};"
+            "(root/'runtime.json').write_text(json.dumps(receipt,sort_keys=True))"
+        )
+        uv_args = " ".join("-w " + shlex.quote(item) for item in self.requirements)
+        return (
+            'set -eo pipefail; export HOME="$NEMO_PREP_ROOT/home"; mkdir -p "$HOME"; '
+            'export UV_CACHE_DIR="$NEMO_PREP_ROOT/uv-cache" '
+            'UV_TOOL_DIR="$NEMO_PREP_ROOT/uv-tools" '
+            "UV_PYTHON_DOWNLOADS=never UV_PYTHON_PREFERENCE=only-system; "
+            f"curl -fsSL https://astral.sh/uv/{self.uv_version}/install.sh | sh; "
+            'export NEMO_UVX="$HOME/.local/bin/uvx"; '
+            f'"$NEMO_UVX" -p {shlex.quote(self.executable)} {uv_args} '
+            "python -I -c " + shlex.quote(program)
+        )
+
+
 class VerifierRuntime(BaseModel):
-    """Immutable admitted Python verifier payloads; absent preserves stock execution."""
+    """An admitted managed helper or the task-declared image Python runtime."""
 
     model_config = ConfigDict(extra="forbid")
-    helper_dir: Path
-    cache_dir: Path
-    helper_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    cache_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mode: Literal["managed_helper", "image_python"] = "managed_helper"
+    helper_dir: Path | None = None
+    cache_dir: Path | None = None
+    helper_manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    cache_manifest_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    image_python: ImageVerifierPython | None = None
     isolate_network: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def validate_payload_manifests(self):
+        if self.mode == "image_python":
+            if self.image_python is None or any(
+                value is not None
+                for value in (self.helper_dir, self.cache_dir, self.helper_manifest_sha256, self.cache_manifest_sha256)
+            ):
+                raise ValueError("image Python runtime must name only its exact image interpreter")
+            return self
+        if self.image_python is not None:
+            raise ValueError("managed verifier runtime cannot select image Python")
         for directory, filename, digest in (
             (self.helper_dir, "helper-manifest.json", self.helper_manifest_sha256),
             (self.cache_dir, "verifier-cache.json", self.cache_manifest_sha256),
         ):
             if (
-                not directory.is_absolute()
+                directory is None
+                or digest is None
+                or not directory.is_absolute()
                 or directory.resolve() != directory
                 or directory.is_symlink()
                 or not directory.is_dir()
@@ -604,6 +718,8 @@ class VerifierRuntime(BaseModel):
         return self
 
     def binds(self) -> list[str]:
+        if self.mode == "image_python":
+            return [f"{Path(__file__).parent}:/gym_verifier_helper:ro"]
         return [f"{self.helper_dir}:/staging/env_files:ro", f"{self.cache_dir}:/verifier_cache_mount:ro"]
 
 
@@ -819,6 +935,8 @@ class RunTerminalAgent(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
     config: AnyTerminalInstanceConfig
+    _prepared_extension: Optional[dict] = PrivateAttr(default=None)
+    _prepared_extension_bytes: Optional[bytes] = PrivateAttr(default=None)
 
     @staticmethod
     def _uses_bind_mounts(cfg: AnyTerminalInstanceConfig) -> bool:
@@ -1067,6 +1185,85 @@ class RunTerminalAgent(BaseModel):
         if staging_tests.exists():
             shutil.rmtree(staging_tests)
         shutil.copytree(src, staging_tests)
+        self._restore_stock_extension(cfg)
+
+    async def _prepare_stock_extension(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
+        """Prepare declared sources before agent execution, in this stock instance."""
+        item = cfg.problem_info.get("verifier_extension")
+        if item is None:
+            return
+        runtime = cfg.verifier_runtime
+        if runtime is None or runtime.mode != "image_python" or runtime.image_python is None:
+            raise RuntimeError("declared extension requires a selected image Python runtime")
+        if not Path(cfg.container).is_file():
+            raise RuntimeError("declared extension requires its admitted local task image")
+        from . import extension_runtime
+
+        declaration = json.dumps(item, sort_keys=True, separators=(",", ":")).encode()
+        output = "tests/" + item["module"] + runtime.image_python.extension_suffix
+        spec = {
+            "workspace": cfg.problem_info["workdir"],
+            "command": (
+                "set -e; "
+                + _apt_root_sandbox(cfg)
+                + "apt-get update && apt-get install -y curl gcc && "
+                + runtime.image_python.prepare_command(item["module"])
+            ),
+            "sources": item["sources"],
+            "module": item["module"],
+            "output": output,
+            "max_bytes": item["max_bytes"],
+            "runtime": runtime.model_dump(mode="json", exclude_none=True),
+            "declaration_sha256": hashlib.sha256(declaration).hexdigest(),
+            "task_manifest_sha256": extension_runtime.sha256(Path(cfg.problem_info["task_dir"]) / "task.toml"),
+            "sif_sha256": extension_runtime.sha256(cfg.container),
+        }
+        prepare_dir = cfg.persistent_dir / "prepared-extension"
+        prepare_dir.mkdir(mode=0o700)
+        link = await sandbox.exec(
+            "rm -rf /tests && ln -s /trajectories_mount/staging/tests /tests",
+            timeout_s=cfg.tb_eval_timeout,
+            user="root",
+        )
+        if link.return_code != 0 or link.error_type:
+            raise RuntimeError("stock extension source staging failed")
+        result = await sandbox.exec(
+            "python3 -I -S /gym_verifier_helper/extension_runtime.py --prepare-stock "
+            + shlex.quote(json.dumps(spec, sort_keys=True)),
+            timeout_s=cfg.tb_eval_timeout,
+            user="root",
+        )
+        if result.return_code != 0 or result.error_type:
+            raise RuntimeError(
+                f"trusted stock extension preparation failed: {result.error_type} {(result.stderr or '')[-1000:]}"
+            )
+        receipt = json.loads((prepare_dir / extension_runtime.RECEIPT).read_text())
+        if receipt["declaration_sha256"] != spec["declaration_sha256"]:
+            raise RuntimeError("stock extension declaration differs")
+        output_bytes = (prepare_dir / Path(receipt["output"]).name).read_bytes()
+        if hashlib.sha256(output_bytes).hexdigest() != receipt["output_sha256"]:
+            raise RuntimeError("stock prepared output differs")
+        self._prepared_extension = receipt
+        self._prepared_extension_bytes = output_bytes
+
+    def _restore_stock_extension(self, cfg: AnyTerminalInstanceConfig) -> None:
+        receipt = getattr(self, "_prepared_extension", None)
+        if receipt is None:
+            return
+        from . import extension_runtime
+
+        prepared_dir = cfg.persistent_dir / "prepared-extension"
+        if json.loads((prepared_dir / extension_runtime.RECEIPT).read_text()) != receipt:
+            raise RuntimeError("prepared stock receipt changed after the agent")
+        source = prepared_dir / Path(receipt["output"]).name
+        if extension_runtime.sha256(source) != receipt["output_sha256"]:
+            raise RuntimeError("prepared stock extension changed after the agent")
+        target = cfg.persistent_dir / "staging" / receipt["output"]
+        with target.open("xb") as dst:
+            dst.write(self._prepared_extension_bytes)
+        target.chmod(0o444)
+        if extension_runtime.sha256(target) != receipt["output_sha256"]:
+            raise RuntimeError("restaged stock extension differs")
 
     async def _exec_verifier(
         self, sandbox: AsyncSandbox, command: str, *, env: dict[str, str] | None, timeout_s: int | float
@@ -1105,6 +1302,8 @@ class RunTerminalAgent(BaseModel):
         """Create only verifier-local state; never run task helper setup or alter /app."""
         if cfg.verifier_runtime is None:
             return None
+        if cfg.verifier_runtime.mode == "image_python":
+            raise RuntimeError("image Python runtime requires declared pre-agent preparation")
         root = f"/tmp/gym-verifier-{uuid.uuid4().hex}"
         helper = "/staging/env_files/python"
         # Inspect before adding tools: task commands must keep their interpreter
@@ -1182,7 +1381,8 @@ class RunTerminalAgent(BaseModel):
     ) -> tuple[float, bool, Optional[int], Optional[str]]:
         """Run test.sh: elapsed, timed out or sandbox error, and the verifier's return code and error type."""
         t0 = time.time()
-        verifier_env = await self._prepare_verifier_runtime(sandbox, cfg)
+        receipt = self._prepared_extension
+        verifier_env = None if receipt is not None else await self._prepare_verifier_runtime(sandbox, cfg)
         task_env = task_verifier_environment(Path(cfg.problem_info["task_dir"]), cfg.verifier_environment)
         if task_env or cfg.verifier_forwarded_environment:
             verifier_env = {**cfg.verifier_forwarded_environment, **task_env, **(verifier_env or {})}
@@ -1198,9 +1398,37 @@ class RunTerminalAgent(BaseModel):
             "printf '[pytest]\\naddopts =\\n' > /pytest.ini && "
             "mkdir -p /logs/verifier && bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
         )
+        if receipt is not None:
+            setup = await self._exec_verifier(
+                sandbox,
+                "rm -rf /tests && ln -s /trajectories_mount/staging/tests /tests && "
+                "printf '[pytest]\\naddopts =\\n' > /pytest.ini && "
+                "mkdir -p /logs/verifier",
+                timeout_s=cfg.tb_eval_timeout,
+                env=None,
+            )
+            if setup.return_code != 0 or setup.error_type:
+                raise RuntimeError("prepared stock tests could not be staged")
+            attested = await sandbox.exec(
+                "python3 -I -S /gym_verifier_helper/extension_runtime.py --attest-stock "
+                + shlex.quote(receipt["declaration_sha256"]),
+                timeout_s=cfg.tb_eval_timeout,
+                user="root",
+            )
+            if attested.return_code != 0 or attested.error_type:
+                raise RuntimeError("prepared stock interpreter or extension differs")
+            attestation = json.loads(attested.stdout)
+            verifier_env = {
+                **(verifier_env or {}),
+                "NEMO_VERIFIER_PYTHON": attestation["python"],
+                "NEMO_VERIFIER_ATTESTATION": json.dumps(attestation, sort_keys=True),
+            }
+            test_cmd = "bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
         result = await self._exec_verifier(
             sandbox, _apt_root_sandbox(cfg) + test_cmd, timeout_s=cfg.tb_eval_timeout, env=verifier_env
         )
+        if receipt is not None and result.return_code == 125:
+            raise RuntimeError("prepared stock interpreter attestation failed")
         if result.return_code != 0:
             print(f"[{cfg.task_name}] eval exit {result.return_code}: {(result.stderr or '')[-2000:]}", flush=True)
         return (
@@ -1251,6 +1479,11 @@ class RunTerminalAgent(BaseModel):
             update_metrics(cfg.metrics_fpath, {"sandbox_ready_at": time.time()}, cfg.task_name)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_runtime(sandbox, cfg)
+            if cfg.problem_info.get("verifier_extension") is not None:
+                if not self._uses_bind_mounts(cfg):
+                    raise ValueError("declared extension requires a local bind-mount provider")
+                await self._stage_tests(cfg)
+                await self._prepare_stock_extension(sandbox, cfg)
             if continues:
                 (
                     agent_run_time,
@@ -1585,11 +1818,18 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
 
         # Fill in workdir and timeouts from task.toml/Dockerfile if not in JSONL metadata.
         task_dir = Path(problem_info["task_dir"])
+        task_meta = _read_task_meta(task_dir)
         required_meta = ["workdir", "agent_timeout_sec", "verifier_timeout_sec"]
         if self.config.sandbox_provider.get("apptainer", {}).get("create", {}).get("disk_backed_overlay"):
             required_meta.append("storage_mb")
         if not all(k in problem_info for k in required_meta):
-            problem_info.update({k: v for k, v in _read_task_meta(task_dir).items() if k not in problem_info})
+            problem_info.update(
+                {k: v for k, v in task_meta.items() if k not in problem_info and k != "verifier_extension"}
+            )
+        # Runtime preparation authority comes from the pristine task, never row metadata.
+        problem_info.pop("verifier_extension", None)
+        if "verifier_extension" in task_meta:
+            problem_info["verifier_extension"] = task_meta["verifier_extension"]
         task_verifier_environment(task_dir, self.config.verifier_environment)
 
         instance_dir = f"{task_name}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
@@ -1650,9 +1890,13 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
                 else TaskNetwork.model_validate_json(problem_info["task_network"])
             ),
             verifier_runtime=(
-                None
-                if "verifier_runtime" not in problem_info
-                else VerifierRuntime.model_validate_json(problem_info["verifier_runtime"])
+                VerifierRuntime.model_validate(task_meta["verifier_extension"]["runtime"])
+                if "verifier_extension" in task_meta
+                else (
+                    None
+                    if "verifier_runtime" not in problem_info
+                    else VerifierRuntime.model_validate_json(problem_info["verifier_runtime"])
+                )
             ),
             body=body,
             persistent_dir=persistent_dir,
