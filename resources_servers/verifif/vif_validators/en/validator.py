@@ -214,7 +214,10 @@ def keyword_frequency(response: str, keyword: str) -> int:
     escaped_tokens = [re.escape(part) for part in keyword.split()]
     phrase_pattern = r"\s+".join(escaped_tokens)
 
-    pattern = rf"(?<![\w\'\-]){phrase_pattern}(?![\w\'\-])"
+    # Apostrophes and hyphens extend a word only when followed/preceded by
+    # another word character. A quote opening 'clearly' is a boundary; the
+    # apostrophe in clearly's and the hyphen in clearly-written are not.
+    pattern = rf"(?<!\w)(?<!\w['-]){phrase_pattern}(?!\w)(?!['-]\w)"
 
     return len(re.findall(pattern, response, flags=re.IGNORECASE))
 
