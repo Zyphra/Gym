@@ -753,6 +753,18 @@ class HermesAgent(SimpleResponsesAPIAgent):
             metadata["hermes_error"] = str(harness_error)[:2000]
         if context_exhausted:
             metadata["stop_reason"] = "context_exhausted"
+        elif (
+            not agent_completed
+            and not finished_naturally
+            and not was_interrupted
+            and not agent_failed
+            and not ended_by_endpoint()
+            and isinstance(result.get("api_calls"), int)
+            and result["api_calls"] >= self.config.max_turns
+        ):
+            # Hermes' iteration cap (its run returns completed=False after the budget summary turn):
+            # OpenHands' label for the same stop, so AnySWE classifies it as an expected budget stop.
+            metadata["stop_reason"] = "max_iterations"
 
         # Populate the structured error field too. `code` must be one of OpenAI's Literals, so we
         # use the generic "server_error"; the real text lives in `message`.
