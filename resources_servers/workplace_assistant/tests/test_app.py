@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -63,7 +64,7 @@ class TestApp:
         mock_df = pd.DataFrame(mock_data)
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.company_directory.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.company_directory.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -99,9 +100,7 @@ class TestApp:
         mock_df = pd.DataFrame(mock_data)
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_read_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
@@ -158,9 +157,7 @@ class TestApp:
         }
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_read_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
@@ -200,9 +197,7 @@ class TestApp:
         mock_df = pd.DataFrame(mock_data)
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_read_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
@@ -256,9 +251,7 @@ class TestApp:
         mock_df = pd.DataFrame(mock_data)
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_read_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
@@ -298,9 +291,7 @@ class TestApp:
         mock_df = pd.DataFrame(mock_data)
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_read_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
@@ -340,7 +331,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -411,7 +402,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -467,7 +458,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -503,7 +494,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -544,7 +535,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.calendar.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -586,7 +577,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.read_csv"
             ) as mock_read_csv,
         ):
             mock_read_csv.return_value = mock_df
@@ -634,7 +625,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.read_csv"
             ) as mock_read_csv,
         ):
             mock_read_csv.return_value = mock_df
@@ -677,7 +668,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.read_csv"
             ) as mock_read_csv,
         ):
             mock_read_csv.return_value = mock_df
@@ -734,7 +725,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.read_csv"
             ) as mock_read_csv,
         ):
             mock_read_csv.return_value = mock_df
@@ -770,7 +761,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.read_csv"
             ) as mock_read_csv,
         ):
             mock_read_csv.return_value = mock_df
@@ -821,7 +812,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.read_csv"
             ) as mock_read_csv,
         ):
             mock_read_csv.return_value = mock_df
@@ -849,7 +840,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -909,7 +900,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -956,7 +947,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -997,7 +988,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -1036,7 +1027,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.project_management.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -1083,7 +1074,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -1135,7 +1126,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -1173,7 +1164,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -1215,7 +1206,7 @@ class TestApp:
 
         with (
             patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.pd.read_csv"
+                "resources_servers.workplace_assistant.workplace_assistant_tools.customer_relationship_manager.read_csv"
             ) as mock_read_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
@@ -1259,9 +1250,7 @@ class TestApp:
         mock_request_with_session = Request(scope=mock_scope)
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_email_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_email_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
@@ -1380,6 +1369,10 @@ class TestApp:
                 id="0",
             )
 
+            for action in verify_request.ground_truth:
+                await resources_server.route_to_python_function(
+                    action["name"], WorkbenchRequest(**json.loads(action["arguments"])), mock_request_with_session
+                )
             verification_response = await resources_server.verify(mock_request_with_session, verify_request)
 
             assert verification_response.reward == 1.0
@@ -1397,7 +1390,10 @@ class TestApp:
         verify_request.response.output = []
 
         with (
-            patch("resources_servers.workplace_assistant.app.is_correct", side_effect=RuntimeError("scoring failed")),
+            patch(
+                "resources_servers.workplace_assistant.app.state_matches_reference",
+                side_effect=RuntimeError("scoring failed"),
+            ),
             raises(RuntimeError, match="scoring failed"),
         ):
             await resources_server.verify(mock_request_with_session, verify_request)
@@ -1422,9 +1418,7 @@ class TestApp:
         mock_email_df = pd.DataFrame(mock_email_data)
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_email_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_email_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
@@ -1603,10 +1597,13 @@ class TestApp:
             await resources_server.seed_session(mock_request_with_session, BaseSeedSessionRequest())
             assert session_id in resources_server.session_id_to_tool_env
 
+            for action in verify_request.ground_truth:
+                await resources_server.route_to_python_function(
+                    action["name"], WorkbenchRequest(**json.loads(action["arguments"])), mock_request_with_session
+                )
             verification_response = await resources_server.verify(mock_request_with_session, verify_request)
 
-            # The reward should be 1.0 because the predicted function calls in our
-            # crafted `response` object exactly match the `ground_truth`.
+            # The reward uses the actual deletion and subsequent readback.
             assert verification_response.reward == 1.0, (
                 f"Verification failed with reward {verification_response.reward}"
             )
@@ -1628,9 +1625,7 @@ class TestApp:
         mock_email_df = pd.DataFrame(mock_email_data)
 
         with (
-            patch(
-                "resources_servers.workplace_assistant.workplace_assistant_tools.email.pd.read_csv"
-            ) as mock_email_csv,
+            patch("resources_servers.workplace_assistant.workplace_assistant_tools.email.read_csv") as mock_email_csv,
             patch(
                 "resources_servers.workplace_assistant.workplace_assistant_tools.analytics.AnalyticsTool.reset_state",
                 side_effect=self.mock_analytics_reset_state,
