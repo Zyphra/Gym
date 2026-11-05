@@ -305,6 +305,8 @@ def _file_lock(file_path: Path, label: str, max_wait: float = 7200.0, poll_inter
         shutil.rmtree(lock_path, ignore_errors=True)
 
 
+TERMINUS_2_AGENT_MODULE = "responses_api_agents.terminus_2_agent.app"
+TERMINUS_TIMER_GRACE_S = 600
 # Harness stop labels carried to done_reason. A harness turn cap is "max_turns" whatever the harness
 # calls it (Terminus "max_turns", Hermes/OpenHands "max_iterations"), the wrapper's turn-cap label.
 _NAMED_AGENT_STOPS = {
@@ -1619,6 +1621,20 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         required_ttl = effective_agent_timeout + effective_eval_timeout * verifications + 600
         if required_ttl > self.config.tb_sandbox_ttl:
             config_overrides["tb_sandbox_ttl"] = required_ttl
+
+        # Terminus-2's own fallback timer must outlive this row's host work clock, or a row whose
+        # clock exceeds the configured timer (TB2.1 build-pov-ray: 12,000 s) is cut by the harness
+        # before the clock it is graded under. Only ever raised, with the native 600 s grace.
+        timer = self.config.agent_kwargs.get("timeout")
+        if (
+            self.config.agent_server_module == TERMINUS_2_AGENT_MODULE
+            and isinstance(timer, (int, float))
+            and timer < effective_agent_timeout + TERMINUS_TIMER_GRACE_S
+        ):
+            config_overrides["agent_kwargs"] = {
+                **self.config.agent_kwargs,
+                "timeout": effective_agent_timeout + TERMINUS_TIMER_GRACE_S,
+            }
 
         server_config = self._server.model_dump()
         if not self.config.sandbox_model_base_url and rollout_id and server_config["model_server_url"]:
