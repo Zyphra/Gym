@@ -76,6 +76,10 @@ _OBSERVATION_SOURCE = "terminus_2"
 _ROOT_INVOCATION_ID = "root"
 # Runs under the harness interpreter; see its docstring for the boundary it keeps.
 COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
+# The AnyTerminal sandbox binds the runner directory, Gym and the harness runtime at
+# these paths. The agent's terminal does not see them: a task container run by
+# Harbor has none of them. Paths absent from a sandbox are left alone.
+HARNESS_MOUNTS = ("/trajectories_mount", "/nemo_gym_mount", "/agent_deps_mount")
 NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
 NATIVE_POLICY_BRIDGE = Path("/native_policy_bridge.py")
 NATIVE_CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -418,7 +422,8 @@ class LocalTmuxSession(TmuxSession):
             # kill commands and the task's memory use cannot end this harness.
             return (
                 f"{shlex.quote(sys.executable)} -I {shlex.quote(str(COMMAND_NAMESPACE))} "
-                f"bash -c {shlex.quote(super()._tmux_start_session)}"
+                + "".join(f"--hide {shlex.quote(path)} " for path in HARNESS_MOUNTS)
+                + f"bash -c {shlex.quote(super()._tmux_start_session)}"
             )
 
         session_name = shlex.quote(self._session_name)
