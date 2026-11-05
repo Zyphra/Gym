@@ -58,6 +58,7 @@ def get_tool_calls(action: ExpectedAction) -> list[FunctionCallAction]:
 
 
 class StepRewardCategory(StrEnum):
+    AGENT_STEP_VERIFIED = "A complete agent step was evaluated against its policy and context"
     NO_ACTION_FOUND = "No tool call or chat message was found in the response"
     NO_EXPECTED_TOOL_CALL = "No tool call was found when one was expected"
     EXPECTED_CHAT_MESSAGE_FOUND = "A chat message was found as expected"
