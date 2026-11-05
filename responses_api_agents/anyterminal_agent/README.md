@@ -152,3 +152,31 @@ Each task row carries the task's Docker image (from `task.toml`); `container_for
 | `fractional_reward` | `false` | Report `reward.txt`'s value (0 to 1; anything else is unreadable) as the reward instead of 1.0 for any positive grade, for verifiers that award partial credit. |
 | `solved_reward_threshold` | unset | Call a row `resolved` only at or above this verifier reward (LHTB's "solved" is `0.95`) instead of at any positive reward. The reward itself is unchanged. |
 | `concurrency` | `256` | Max concurrent tasks dispatched to Ray; the shipped configs set `6` (`1` for `nemo_fabric`). |
+
+## Declared Python extension verifiers
+
+A task can declare one `python_extension` under
+`[verifier.isolation.prepared_artifacts]`, naming its source SHA-256 values,
+output size bound and exact `runtime.mode = "image_python"` interpreter and
+package pins. AnyTerminal prepares those sources before agent execution in the
+same task instance. It retains the preparation receipt and compiled bytes,
+restages the extension with pristine tests after the agent, and attests the
+interpreter, packages and extension before invoking the unchanged `test.sh`.
+The attestation supplies `NEMO_VERIFIER_PYTHON` and
+`NEMO_VERIFIER_ATTESTATION`; the helper is mounted read-only at
+`/gym_verifier_helper`. Preparation or attestation failure is infrastructure,
+not a test verdict. Tasks without a declaration retain their current verifier
+path. A row cannot supply or replace this task-source declaration.
+
+The native controls in `tests/test_prepared_extension.py` use caller-supplied
+`GYM_ANYTERMINAL_NATIVE_ROWS`, `GYM_ANYTERMINAL_NATIVE_PROVIDER` and a fresh
+`GYM_ANYTERMINAL_NATIVE_OUTPUT` directory on allocated compute. They run the
+FEAL reference solution and no-op through the actual sandbox and pytest, plus
+an unchanged regex-log reference solution. Source tests and live adoption are
+separate; this source change does not repair historical scores automatically.
+
+The allocated native Enroot controls pass: FEAL reference reward 1, FEAL no-op
+reward 0, and regex-log reference reward 1, all through pytest with no mask.
+The source suite passes 213 tests; the three opt-in native cases run separately.
+This proves the selected verifier path, not historical model scores or live
+adoption. The PR retains the source hashes and original runtime receipts.
