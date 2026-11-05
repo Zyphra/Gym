@@ -371,3 +371,56 @@ async def test_user_inference_flattens_extra_body(monkeypatch):
     assert body["model"] == "qwen3.5"
     assert body["chat_template_kwargs"] == {"enable_thinking": True}
     assert "extra_body" not in body
+
+
+@pytest.mark.parametrize("visible_to", [None, ["AGENT"], ["USER", "AGENT"]])
+def test_seed_observations_preserve_agent_visible_messages(visible_to):
+    from tool_sandbox.common.execution_context import DatabaseNamespace, ExecutionContext, RoleType
+
+    ctx = ExecutionContext()
+    ctx.add_to_database(
+        DatabaseNamespace.SANDBOX,
+        [
+            {"sender": RoleType.SYSTEM, "recipient": RoleType.AGENT, "content": "policy", "visible_to": visible_to},
+            {
+                "sender": RoleType.USER,
+                "recipient": RoleType.AGENT,
+                "content": "same text",
+                "visible_to": [RoleType.USER],
+            },
+            {"sender": RoleType.USER, "recipient": RoleType.AGENT, "content": "same text", "visible_to": visible_to},
+        ],
+    )
+    observations = ToolSandboxResourcesServer._seed_obs(ctx)
+    assert [(item.role, item.content) for item in observations] == [("system", "policy"), ("user", "same text")]
+    # Hidden examples are retained in the simulator's original state.
+    assert ctx.get_database(DatabaseNamespace.SANDBOX, get_all_history_snapshots=True).height == 3
+
+
+def test_new_policy_observations_respect_explicit_visibility():
+    from tool_sandbox.common.execution_context import DatabaseNamespace, ExecutionContext, RoleType
+
+    ctx = ExecutionContext()
+    ctx.add_to_database(
+        DatabaseNamespace.SANDBOX,
+        [
+            {
+                "sender": RoleType.USER,
+                "recipient": RoleType.AGENT,
+                "content": "private",
+                "visible_to": [RoleType.USER],
+            },
+            {"sender": RoleType.USER, "recipient": RoleType.AGENT, "content": "goal"},
+            {
+                "sender": RoleType.EXECUTION_ENVIRONMENT,
+                "recipient": RoleType.AGENT,
+                "content": "result",
+                "openai_tool_call_id": "call_visible",
+            },
+        ],
+    )
+    observations = ToolSandboxResourcesServer._collect_agent_obs(ctx, -1)
+    assert observations[0].content == "goal"
+    assert observations[1].output == "result"
+    assert observations[1].call_id == "call_visible"
+    assert len(observations) == 2
