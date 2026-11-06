@@ -114,10 +114,9 @@ def open_capture(path: str | Path) -> Iterator[Iterator[bytes]]:
     """Stream the JSONL lines of the capture ``<id>.capture.jsonl``, sealed or not.
 
     A capture is its sealed ``.zst`` records followed by any records appended to the
-    plain file since. Raises ``FileNotFoundError`` when neither file exists.
+    plain file since. Raises ``FileNotFoundError`` when neither file exists. Plain
+    captures read without ``zstandard``.
     """
-    import zstandard
-
     path = Path(path)
     # Shared lock: no append is half-written and no seal moves records mid-read.
     plain = _open_locked(path, fcntl.LOCK_SH)
@@ -130,6 +129,8 @@ def open_capture(path: str | Path) -> Iterator[Iterator[bytes]]:
                 raise
         parts = []
         if sealed is not None:
+            import zstandard
+
             reader = zstandard.ZstdDecompressor().stream_reader(sealed, read_across_frames=True, closefd=False)
             parts.append(io.BufferedReader(reader, 1 << 20))
         if plain is not None and not (sealed is not None and _already_sealed(path, plain)):
