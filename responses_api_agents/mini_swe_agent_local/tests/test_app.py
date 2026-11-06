@@ -180,6 +180,11 @@ def test_a_config_file_supplies_the_whole_agent_config(tmp_path):
     absolute.write_text(yaml.safe_dump({**shipped, "agent": {**shipped["agent"], "system_template": "custom"}}))
     built = _agent(config_file=str(absolute))._agent("http://127.0.0.1:9/v1", None, str(tmp_path))
     assert built.config.system_template == "custom"
+    inline = {**shipped, "agent": {**shipped["agent"], "system_template": "inline"}}
+    built = _agent(config=inline)._agent("http://127.0.0.1:9/v1", None, str(tmp_path))
+    assert built.config.system_template == "inline"
+    with pytest.raises(ValueError, match="exclusive"):
+        _agent(config=inline, config_file="mini.yaml")._agent("http://127.0.0.1:9/v1", None, str(tmp_path))
 
 
 def test_the_wall_time_limit_ends_the_run_with_its_reason(tmp_path):
