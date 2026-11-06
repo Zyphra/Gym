@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import orjson
 import pytest
@@ -209,6 +212,23 @@ def test_open_capture_streams_sealed_then_plain_lines(tmp_path):
     with pytest.raises(FileNotFoundError):
         with open_capture(tmp_path / "missing.capture.jsonl"):
             pass
+
+
+def test_plain_captures_read_without_zstandard(tmp_path):
+    store = CaptureStore(tmp_path)
+    store.record("episode", turn(1))
+    # -S leaves out site-packages: only the standard library and this checkout import.
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]);"
+        "from nemo_gym.model_call_capture_files import read_capture_bytes;"
+        "sys.stdout.buffer.write(read_capture_bytes(sys.argv[2]))"
+    )
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", code, str(root), str(store.path_for("episode"))], capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == store.path_for("episode").read_bytes()
 
 
 def test_agentic_capture_compresses_by_more_than_twenty_times(tmp_path):
