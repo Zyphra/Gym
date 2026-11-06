@@ -71,6 +71,9 @@ class MiniSweAgentConfig(BaseResponsesAPIAgentConfig):
     # A whole mini-swe-agent config instead: a path inside minisweagent/config (for example
     # ``mini.yaml``, the CLI default) or an absolute path to a benchmark's own config file.
     config_file: Optional[str] = None
+    # The same config as a mapping, for a file that exists only where the config is written: the agent
+    # runs inside the task sandbox, where the writer's paths are absent. Exclusive with config_file.
+    config: Optional[dict[str, Any]] = None
     # 0 means no step limit, as in mini-swe-agent's own configs.
     step_limit: int = Field(default=250, ge=0)
     # Upstream's wall-clock limit: the agent stops before its next model call once it is reached,
@@ -239,11 +242,14 @@ class MiniSweAgent(SimpleResponsesAPIAgent):
         from minisweagent.agents.default import DefaultAgent
         from minisweagent.environments.local import LocalEnvironment
 
-        settings = (
-            config_settings(self.config.config_file)
-            if self.config.config_file
-            else benchmark_settings(self.config.benchmark_config)
-        )
+        if self.config.config is not None and self.config.config_file:
+            raise ValueError("config and config_file are exclusive")
+        if self.config.config is not None:
+            settings = self.config.config
+        elif self.config.config_file:
+            settings = config_settings(self.config.config_file)
+        else:
+            settings = benchmark_settings(self.config.benchmark_config)
         agent_settings = {
             # ``mode`` selects the interactive agent's confirmation behaviour; DefaultAgent has none.
             **{key: value for key, value in settings["agent"].items() if key != "mode"},
