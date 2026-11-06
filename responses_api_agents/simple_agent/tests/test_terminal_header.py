@@ -22,7 +22,7 @@ from pytest import MonkeyPatch
 from nemo_gym import server_utils
 from nemo_gym.base_resources_server import EPISODE_TERMINAL_HEADER
 from nemo_gym.config_types import BaseServerConfig
-from nemo_gym.openai_utils import NeMoGymEasyInputMessage, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.simple_agent.app import ModelServerRef, ResourcesServerRef, SimpleAgent, SimpleAgentConfig
 
