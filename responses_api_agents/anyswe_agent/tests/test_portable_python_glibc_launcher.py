@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+
 SCRIPT = Path(__file__).parents[1] / "setup_scripts" / "_portable_python.sh"
 APPTAINER = os.environ.get("APPTAINER") or shutil.which("apptainer") or shutil.which("singularity")
 IMAGES = {"alpine": "docker://alpine:3.19", "debian": "docker://debian:12-slim"}
@@ -46,9 +47,20 @@ def test_interpreter_and_child_run_in_image(runtime: Path, image: str, tmp_path:
     sif = tmp_path / f"{image}.sif"
     subprocess.run([APPTAINER, "pull", "--force", str(sif), IMAGES[image]], check=True, capture_output=True)
     result = subprocess.run(
-        [APPTAINER, "exec", "--cleanenv", "--no-home", "--bind", f"{runtime}:/agent_deps_mount:ro",
-         str(sif), "/agent_deps_mount/bin/python", "-c", PROBE],
-        capture_output=True, text=True,
+        [
+            APPTAINER,
+            "exec",
+            "--cleanenv",
+            "--no-home",
+            "--bind",
+            f"{runtime}:/agent_deps_mount:ro",
+            str(sif),
+            "/agent_deps_mount/bin/python",
+            "-c",
+            PROBE,
+        ],
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
     executable, child = result.stdout.split()[0], result.stdout.strip()

@@ -18,7 +18,7 @@ install_portable_python() {
     echo "Downloading portable python: $url"
     # Tarball extracts to python/{bin,lib}.
     curl -fsSL "$url" | tar xz -C "$DEPS_DIR" --strip-components=1
-    case "$ARCH" in *-linux-gnu) install_glibc_launcher ;; esac
+    case "$ARCH" in *-linux-gnu) install_glibc_launcher || return 1 ;; esac
     if portable_python_can_run; then
         install_python_packages --upgrade pip
     fi
@@ -27,8 +27,10 @@ install_portable_python() {
 # Task images without glibc (Alpine/musl) cannot exec the glibc CPython. Bundle the
 # build host's glibc loader and core libraries under $DEPS_DIR/glibc and replace the
 # interpreter entry points with a launcher that uses them only when the image has no
-# glibc loader. --argv0 keeps sys.executable on the launcher, so child interpreters
-# come back through it. glibc images run the interpreter directly.
+# glibc loader. On musl images --argv0 keeps sys.executable on the launcher, so child
+# interpreters come back through it; glibc images exec the interpreter directly. A
+# build host without these libraries fails the install instead of shipping a
+# glibc-only runtime.
 GLIBC_LOADER="${GLIBC_LOADER:-/lib64/ld-linux-x86-64.so.2}"
 GLIBC_LIBS="libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libutil.so.1 libresolv.so.2 libnss_dns.so.2 libnss_files.so.2 libcrypt.so.1 libgcc_s.so.1 libstdc++.so.6 libz.so.1"
 
