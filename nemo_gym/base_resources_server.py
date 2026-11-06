@@ -38,6 +38,9 @@ from nemo_gym.telemetry.endpoints import traced_verify_endpoint
 
 
 NEMO_GYM_MCP_SESSION_TOKEN_HEADER = "X-NeMo-Gym-Session-Token"
+# A resources server sets this response header to "1" on a tool response that
+# ends the episode; the agent stops calling the model and proceeds to verify.
+EPISODE_TERMINAL_HEADER = "X-NeMo-Gym-Episode-Terminal"
 NEMO_GYM_MCP_METADATA_KEY = "mcp"
 # Salt namespacing the signed MCP session token, so it can't be confused with another signer
 # that happens to share the same session-middleware secret.

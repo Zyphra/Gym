@@ -23,6 +23,7 @@ from openai.types.responses.response import IncompleteDetails
 from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from nemo_gym.base_resources_server import (
+    EPISODE_TERMINAL_HEADER,
     AggregateMetrics,
     AggregateMetricsRequest,
     BaseRunRequest,
@@ -251,6 +252,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
             if not all_fn_calls and all_output_messages:
                 break
 
+            episode_terminal = False
             for output_function_call in all_fn_calls:
                 if collect_trajectory:
                     started_at = time()
@@ -291,6 +293,7 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                     )
                     tool_output = (await api_response.content.read()).decode()
                     resources_server_cookies = api_response.cookies
+                    episode_terminal = episode_terminal or api_response.headers.get(EPISODE_TERMINAL_HEADER) == "1"
                     if collect_trajectory:
                         completed = 200 <= api_response.status < 400
                         tool_status = "completed" if completed else "failed"
@@ -322,6 +325,9 @@ class SimpleAgent(SimpleResponsesAPIAgent):
 
             if collect_trajectory and all_fn_calls:
                 turns[-1].step_count = len(tool_records)
+
+            if episode_terminal:
+                break
 
             # Check if max steps is not None and if we have exhausted it.
             if self.config.max_steps and step >= self.config.max_steps:
