@@ -1159,9 +1159,11 @@ class NeMoGymChatCompletionAssistantMessageForTrainingParam(
     pass
 
 
-class NeMoGymChatCompletionToolMessageParam(ChatCompletionToolMessageParam):
+class NeMoGymChatCompletionToolMessageParam(ChatCompletionToolMessageParam, total=False):
     # Override the iterable which is annoying to work with.
     content: Required[Union[str, List[NeMoGymChatCompletionContentPartTextParam]]]
+    # LiteLLM sends the called function's name on tool results (OpenAI legacy field).
+    name: Optional[str]
 
 
 class NeMoGymFunctionToolParam(FunctionToolParam):

@@ -1722,3 +1722,23 @@ def test_chat_request_accepts_litellm_replayed_assistant_provider_fields():
     }
     parsed = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(body)
     assert parsed.messages[2]["provider_specific_fields"] == {"refusal": None}
+
+
+def test_chat_request_accepts_litellm_tool_result_name():
+    # LiteLLM-based harnesses send tool results with the called function's name.
+    body = {
+        "messages": [
+            {"role": "user", "content": "u"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "name": "list_files", "content": "[]"},
+        ]
+    }
+    parsed = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(body)
+    assert parsed.messages[2]["name"] == "list_files"
+    assert parsed.messages[2]["tool_call_id"] == "call_1"
