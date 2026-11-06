@@ -105,7 +105,7 @@ class _Server:
         self.thread.join()
 
 
-def _agent() -> MiniSweAgent:
+def _agent(**overrides) -> MiniSweAgent:
     config = MiniSweAgentConfig(
         host="0.0.0.0",
         port=0,
@@ -114,7 +114,7 @@ def _agent() -> MiniSweAgent:
         model_server=ModelServerRef(name="policy_model", type="responses_api_models"),
         resources_server=ResourcesServerRef(name="anyswe", type="resources_servers"),
         model="policy",
-        step_limit=10,
+        **{"step_limit": 10, **overrides},
     )
     return MiniSweAgent(config=config, server_client=ServerClient.model_construct(global_config_dict={}))
 
@@ -158,6 +158,38 @@ def test_an_ended_episode_stops_the_agent_with_its_reason(tmp_path, code, reason
         info = agent.run("Fix add() in calc.py.")
     assert info == {"exit_status": "EpisodeEnded", "stop_reason": reason, "submission": ""}
     assert len(server.requests) == 2
+
+
+def test_a_config_file_supplies_the_whole_agent_config(tmp_path):
+    """mini.yaml is the CLI default a benchmark harness runs (``-c mini.yaml``); 0 means no step limit."""
+    import minisweagent
+    import yaml
+
+    shipped = yaml.safe_load((Path(minisweagent.__file__).parent / "config" / "mini.yaml").read_text())
+    with _Server() as server:
+        agent = _agent(config_file="mini.yaml", step_limit=0, wall_time_limit_seconds=600)._agent(
+            f"http://127.0.0.1:{server.port}/v1", None, str(_repo(tmp_path))
+        )
+        info = agent.run("Fix add() in calc.py.")
+    assert info["exit_status"] == "Submitted"
+    assert agent.config.instance_template == shipped["agent"]["instance_template"]
+    assert (agent.config.step_limit, agent.config.cost_limit, agent.config.wall_time_limit_seconds) == (0, 0, 600)
+    # Upstream renders it with jinja2, which drops one trailing newline.
+    assert server.requests[0]["messages"][0]["content"] == shipped["agent"]["system_template"].removesuffix("\n")
+    absolute = tmp_path / "custom.yaml"
+    absolute.write_text(yaml.safe_dump({**shipped, "agent": {**shipped["agent"], "system_template": "custom"}}))
+    built = _agent(config_file=str(absolute))._agent("http://127.0.0.1:9/v1", None, str(tmp_path))
+    assert built.config.system_template == "custom"
+
+
+def test_the_wall_time_limit_ends_the_run_with_its_reason(tmp_path):
+    with _Server() as server:
+        mini = _agent(wall_time_limit_seconds=1)
+        agent = mini._agent(f"http://127.0.0.1:{server.port}/v1", None, str(_repo(tmp_path)))
+        agent._start_time = time.time() - 2
+        info = agent.run("Fix add() in calc.py.")
+    assert info["exit_status"] == "TimeExceeded"
+    assert server.requests == []
 
 
 def test_the_agent_model_loads_litellm_without_a_cost_map_fetch():

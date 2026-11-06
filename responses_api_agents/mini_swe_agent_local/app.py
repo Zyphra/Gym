@@ -68,7 +68,14 @@ class MiniSweAgentConfig(BaseResponsesAPIAgentConfig):
     concurrency: int = 32
     # A config file shipped with mini-swe-agent (minisweagent/config/benchmarks/...).
     benchmark_config: str = "swebench.yaml"
-    step_limit: int = Field(default=250, ge=1)
+    # A whole mini-swe-agent config instead: a path inside minisweagent/config (for example
+    # ``mini.yaml``, the CLI default) or an absolute path to a benchmark's own config file.
+    config_file: Optional[str] = None
+    # 0 means no step limit, as in mini-swe-agent's own configs.
+    step_limit: int = Field(default=250, ge=0)
+    # Upstream's wall-clock limit: the agent stops before its next model call once it is reached,
+    # so the work present then is graded. 0 means no limit.
+    wall_time_limit_seconds: int = Field(default=0, ge=0)
     command_timeout: int = Field(default=180, gt=0)
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
@@ -90,9 +97,14 @@ class MiniSweAgentVerifyResponse(BaseVerifyResponse):
 
 def benchmark_settings(name: str) -> dict:
     """The agent, environment and model sections of a mini-swe-agent benchmark config."""
+    return config_settings(f"benchmarks/{name}")
+
+
+def config_settings(name: str) -> dict:
+    """The sections of a mini-swe-agent config: a path inside minisweagent/config, or an absolute path."""
     import minisweagent
 
-    path = Path(minisweagent.__file__).parent / "config" / "benchmarks" / name
+    path = Path(name) if Path(name).is_absolute() else Path(minisweagent.__file__).parent / "config" / name
     return yaml.safe_load(path.read_text())
 
 
@@ -227,11 +239,17 @@ class MiniSweAgent(SimpleResponsesAPIAgent):
         from minisweagent.agents.default import DefaultAgent
         from minisweagent.environments.local import LocalEnvironment
 
-        settings = benchmark_settings(self.config.benchmark_config)
+        settings = (
+            config_settings(self.config.config_file)
+            if self.config.config_file
+            else benchmark_settings(self.config.benchmark_config)
+        )
         agent_settings = {
-            **settings["agent"],
+            # ``mode`` selects the interactive agent's confirmation behaviour; DefaultAgent has none.
+            **{key: value for key, value in settings["agent"].items() if key != "mode"},
             "step_limit": self.config.step_limit,
-            # The policy endpoint has no price: steps and the episode end it.
+            "wall_time_limit_seconds": self.config.wall_time_limit_seconds,
+            # The policy endpoint has no price: steps, time and the episode end it.
             "cost_limit": 0,
         }
         if self.config.system_prompt or system:
@@ -286,6 +304,8 @@ class MiniSweAgent(SimpleResponsesAPIAgent):
             metadata["stop_reason"] = stop_reason
         elif exit_status == "LimitsExceeded":
             metadata["stop_reason"] = "max_iterations"
+        elif exit_status == "TimeExceeded":
+            metadata["stop_reason"] = "wall_time_limit"
         response_error = None
         if error is not None:
             from openai.types.responses import ResponseError
