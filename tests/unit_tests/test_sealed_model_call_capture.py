@@ -21,9 +21,12 @@ import pytest
 from nemo_gym.base_responses_api_model import (
     CaptureStore,
     ModelCallCaptureSelection,
+    clear_model_call_captures_for_rollouts,
+)
+from nemo_gym.model_call_capture_files import (
     _append_locked,
     capture_paths,
-    clear_model_call_captures_for_rollouts,
+    open_capture,
     read_capture_bytes,
     seal_capture,
     seal_idle_captures,
@@ -193,6 +196,19 @@ def test_selected_capture_seal_keeps_owner_private_mode(tmp_path):
 
     assert sealed_capture_path(store.path_for("episode")).stat().st_mode & 0o777 == 0o600
     assert len(store.read("episode")) == 2
+
+
+def test_open_capture_streams_sealed_then_plain_lines(tmp_path):
+    store = CaptureStore(tmp_path)
+    store.record("episode", turn(1))
+    seal_capture(store.path_for("episode"))
+    store.record("episode", turn(2))
+
+    with open_capture(store.path_for("episode")) as lines:
+        assert [orjson.loads(line) for line in lines] == [turn(1), turn(2)]
+    with pytest.raises(FileNotFoundError):
+        with open_capture(tmp_path / "missing.capture.jsonl"):
+            pass
 
 
 def test_agentic_capture_compresses_by_more_than_twenty_times(tmp_path):

@@ -35,7 +35,6 @@ import logging
 import os
 import re
 import stat
-import struct
 import threading
 import time
 from abc import abstractmethod
@@ -62,6 +61,12 @@ from nemo_gym.anthropic_tool_echo import (
 )
 from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_chat_completion_sse
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT, ModelServerRef
+from nemo_gym.model_call_capture_files import (
+    CAPTURE_SUFFIX,
+    _append_locked,
+    read_capture_bytes,
+    sealed_capture_path,
+)
 from nemo_gym.openai_utils import (
     NeMoGymChatCompletion,
     NeMoGymChatCompletionCreateParamsNonStreaming,
@@ -559,188 +564,6 @@ def _validate_rollout_id(rollout_id: str) -> str:
     if not rollout_id or any(not (char.isascii() and (char.isalnum() or char in "._-")) for char in rollout_id):
         raise ValueError(f"Invalid rollout id: {rollout_id!r}")
     return rollout_id
-
-
-CAPTURE_SUFFIX = ".capture.jsonl"
-SEALED_CAPTURE_SUFFIX = CAPTURE_SUFFIX + ".zst"
-
-
-def sealed_capture_path(path: str | Path) -> Path:
-    """The zstd file holding the sealed records of the capture ``<id>.capture.jsonl``."""
-    path = Path(path)
-    return path.with_name(path.name + ".zst")
-
-
-def _is_current(fd: int, path: Path) -> bool:
-    """Whether ``fd`` is still the file at ``path`` (a seal unlinks the file it moved)."""
-    try:
-        current = os.stat(path, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    opened = os.fstat(fd)
-    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
-
-
-def _append_locked(path: Path, line: bytes, open_fd) -> None:
-    """Append one record under the capture's exclusive lock, to the file no seal has moved."""
-    while True:
-        with os.fdopen(open_fd(path), "ab") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                if not _is_current(handle.fileno(), path):
-                    continue
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
-                return
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-# Each sealed segment ends with a zstd skippable frame (zstd readers skip it) naming the
-# plain file it came from. A seal publishes the sealed file before removing that plain
-# file, so a plain file the mark names, unchanged since before the sealed file was
-# written, is one whose removal was interrupted: its records are already sealed. (Appends
-# to such a file before the next seal finishes it would read twice; the window is the
-# instant between the two calls, and the idle sweep seals only files nobody is writing.)
-_SEAL_MARK_MAGIC = 0x184D2A5C
-_SEAL_MARK = struct.Struct("<IIQQQ")
-
-
-def _seal_mark(info: os.stat_result) -> bytes:
-    return _SEAL_MARK.pack(_SEAL_MARK_MAGIC, _SEAL_MARK.size - 8, info.st_dev, info.st_ino, info.st_size)
-
-
-def _already_sealed(path: Path, plain) -> bool:
-    info = os.fstat(plain.fileno())
-    try:
-        with sealed_capture_path(path).open("rb") as sealed:
-            sealed_mtime_ns = os.fstat(sealed.fileno()).st_mtime_ns
-            sealed.seek(-_SEAL_MARK.size, os.SEEK_END)
-            mark = sealed.read(_SEAL_MARK.size)
-    except OSError:
-        return False
-    # A later plain file can reuse the inode, but it is written after the sealed file.
-    return mark == _seal_mark(info) and info.st_mtime_ns < sealed_mtime_ns
-
-
-def _read_sealed(path: Path) -> Optional[bytes]:
-    import zstandard
-
-    try:
-        with sealed_capture_path(path).open("rb") as sealed:
-            return zstandard.ZstdDecompressor().stream_reader(sealed, read_across_frames=True).readall()
-    except FileNotFoundError:
-        return None
-
-
-def _open_locked(path: Path, operation: int):
-    """Open and lock ``path``, retrying while a seal moves it; ``None`` when absent."""
-    while True:
-        try:
-            handle = open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC))
-        except FileNotFoundError:
-            return None
-        fcntl.flock(handle.fileno(), operation)
-        if _is_current(handle.fileno(), path):
-            return handle
-        handle.close()
-
-
-def read_capture_bytes(path: str | Path) -> bytes:
-    """Return the JSONL bytes of the capture ``<id>.capture.jsonl``, sealed or not.
-
-    A capture is its sealed ``.zst`` records followed by any records appended to the
-    plain file since. Raises ``FileNotFoundError`` when neither file exists.
-    """
-    path = Path(path)
-    # Shared lock: no append is half-written and no seal moves records mid-read.
-    plain = _open_locked(path, fcntl.LOCK_SH)
-    try:
-        data = _read_sealed(path)
-        if plain is None:
-            if data is None:
-                raise FileNotFoundError(path)
-            return data
-        if data is None:
-            return plain.read()
-        return data if _already_sealed(path, plain) else data + plain.read()
-    finally:
-        if plain is not None:
-            plain.close()
-
-
-def seal_capture(path: str | Path) -> bool:
-    """Move a capture's plain records into its zstd file and remove the plain file.
-
-    Appends that arrive later start a new plain file, read after the sealed records
-    and sealed again by the next call. Returns whether any records were moved.
-    """
-    import zstandard
-
-    path = Path(path)
-    plain = _open_locked(path, fcntl.LOCK_EX)
-    if plain is None:
-        return False
-    with plain:
-        info = os.fstat(plain.fileno())
-        moved = bool(info.st_size) and not _already_sealed(path, plain)
-        if moved:
-            sealed = sealed_capture_path(path)
-            temporary = sealed.with_name(f".{sealed.name}.{os.getpid()}.tmp")
-            mode = stat.S_IMODE(info.st_mode)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-            try:
-                with os.fdopen(os.open(temporary, flags, mode), "wb") as out:
-                    os.fchmod(out.fileno(), mode)
-                    try:
-                        with sealed.open("rb") as previous:
-                            while chunk := previous.read(1 << 20):
-                                out.write(chunk)
-                    except FileNotFoundError:
-                        pass
-                    # One frame per seal keeps an episode's repeated context inside zstd's window.
-                    zstandard.ZstdCompressor(level=3).copy_stream(plain, out)
-                    out.write(_seal_mark(info))
-                    out.flush()
-                    os.fsync(out.fileno())
-                os.replace(temporary, sealed)
-            except BaseException:
-                temporary.unlink(missing_ok=True)
-                raise
-        # Writers waiting on this lock find the path gone and start a new plain file.
-        os.unlink(path)
-        return moved
-
-
-def capture_paths(directory: str | Path) -> list[Path]:
-    """The ``<id>.capture.jsonl`` path of every capture in ``directory``, sealed or not."""
-    names = set()
-    for entry in os.scandir(directory):
-        for suffix in ("", ".zst"):
-            if entry.name.endswith(CAPTURE_SUFFIX + suffix) and not entry.name.startswith("."):
-                names.add(entry.name.removesuffix(suffix) if suffix else entry.name)
-    return [Path(directory) / name for name in sorted(names)]
-
-
-def seal_idle_captures(directory: str | Path, idle_s: float) -> int:
-    """Seal every capture in ``directory`` with no append for ``idle_s`` seconds; returns the count."""
-    sealed = 0
-    now = time.time()
-    try:
-        entries = list(os.scandir(directory))
-    except FileNotFoundError:
-        return 0
-    for entry in entries:
-        if not entry.name.endswith(CAPTURE_SUFFIX) or not entry.is_file(follow_symlinks=False):
-            continue
-        try:
-            idle = now - entry.stat(follow_symlinks=False).st_mtime
-        except FileNotFoundError:
-            continue
-        if idle >= idle_s and seal_capture(entry.path):
-            sealed += 1
-    return sealed
 
 
 class CaptureStore:
