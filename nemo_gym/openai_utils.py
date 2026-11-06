@@ -1148,6 +1148,9 @@ class NeMoGymChatCompletionAssistantMessageParam(ChatCompletionAssistantMessageP
     # vLLM has used both names for parsed reasoning in assistant history.
     reasoning_content: Optional[str]
     reasoning: Optional[str]
+    # LiteLLM-based harnesses replay their parsed assistant messages with this
+    # provider metadata attached; it carries no prompt content.
+    provider_specific_fields: Optional[Dict[str, Any]]
 
 
 class NeMoGymChatCompletionAssistantMessageForTrainingParam(
