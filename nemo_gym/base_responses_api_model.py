@@ -61,6 +61,12 @@ from nemo_gym.anthropic_tool_echo import (
 )
 from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_chat_completion_sse
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT, ModelServerRef
+from nemo_gym.model_call_capture_files import (
+    CAPTURE_SUFFIX,
+    _append_locked,
+    read_capture_bytes,
+    sealed_capture_path,
+)
 from nemo_gym.openai_utils import (
     NeMoGymChatCompletion,
     NeMoGymChatCompletionCreateParamsNonStreaming,
@@ -561,7 +567,11 @@ def _validate_rollout_id(rollout_id: str) -> str:
 
 
 class CaptureStore:
-    """Append-only, rollout-keyed JSONL sink for model exchanges."""
+    """Append-only, rollout-keyed JSONL sink for model exchanges.
+
+    Records append to ``<id>.capture.jsonl``; ``seal_capture`` later compresses them
+    into ``<id>.capture.jsonl.zst``. Reads return both, sealed records first.
+    """
 
     def __init__(self, root: str | Path, selection: ModelCallCaptureSelection | None = None) -> None:
         self._root = Path(root)
@@ -690,19 +700,22 @@ class CaptureStore:
             quota.truncate()
             quota.flush()
             os.fsync(quota.fileno())
-            with os.fdopen(
-                self._private_fd(self.path_for(rollout_id), os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab"
-            ) as handle:
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
+            _append_locked(
+                self.path_for(rollout_id),
+                line,
+                lambda path: self._private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT),
+            )
 
     @property
     def root(self) -> Path:
         return self._root
 
     def path_for(self, rollout_id: str) -> Path:
-        return self._root / f"{_validate_rollout_id(rollout_id)}.capture.jsonl"
+        return self._root / f"{_validate_rollout_id(rollout_id)}{CAPTURE_SUFFIX}"
+
+    def exists(self, rollout_id: str) -> bool:
+        path = self.path_for(rollout_id)
+        return path.exists() or sealed_capture_path(path).exists()
 
     def incomplete_path_for(self, rollout_id: str) -> Path:
         return self._root / f"{_validate_rollout_id(rollout_id)}.capture.incomplete"
@@ -729,61 +742,36 @@ class CaptureStore:
             self._bounded_record(rollout_id, exchange)
             return
         line = orjson.dumps(exchange, default=str, option=orjson.OPT_APPEND_NEWLINE)
-        path = self.path_for(rollout_id)
-        with path.open("ab") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        _append_locked(
+            self.path_for(rollout_id),
+            line,
+            lambda path: os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o666),
+        )
+
+    def _lines(self, rollout_id: str) -> list[bytes]:
+        try:
+            raw = read_capture_bytes(self.path_for(rollout_id))
+        except FileNotFoundError:
+            return []
+        return [stripped for line in raw.split(b"\n") if (stripped := line.strip())]
 
     def read(self, rollout_id: str) -> list[dict[str, Any]]:
-        path = self.path_for(rollout_id)
-        if not path.exists():
-            return []
-        exchanges: list[dict[str, Any]] = []
-        # Stream line-by-line; a capture can be large (token-ids / logprobs).
-        with path.open("rb") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            try:
-                for line in handle:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    exchanges.append(orjson.loads(stripped))
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return exchanges
+        return [orjson.loads(line) for line in self._lines(rollout_id)]
 
     def read_available(self, rollout_id: str) -> tuple[list[tuple[int, dict[str, Any]]], int]:
         """Read valid exchanges without letting one damaged line hide the rest."""
-        path = self.path_for(rollout_id)
-        if not path.exists():
-            return [], 0
         exchanges: list[tuple[int, dict[str, Any]]] = []
         invalid_count = 0
-        capture_index = 0
-        with path.open("rb") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        for capture_index, line in enumerate(self._lines(rollout_id)):
             try:
-                for line in handle:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        exchange = orjson.loads(stripped)
-                    except orjson.JSONDecodeError:
-                        invalid_count += 1
-                    else:
-                        if isinstance(exchange, dict):
-                            exchanges.append((capture_index, exchange))
-                        else:
-                            invalid_count += 1
-                    capture_index += 1
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                exchange = orjson.loads(line)
+            except orjson.JSONDecodeError:
+                invalid_count += 1
+            else:
+                if isinstance(exchange, dict):
+                    exchanges.append((capture_index, exchange))
+                else:
+                    invalid_count += 1
         return exchanges, invalid_count
 
 
@@ -2024,7 +2012,7 @@ def observability_enabled_from_config(global_config_dict: Any) -> bool:
 def _store_for_rollout(rollout_id: str, capture_dirs: list[Path]) -> Optional[CaptureStore]:
     for directory in capture_dirs:
         store = CaptureStore(directory)
-        if store.path_for(rollout_id).exists() or store.is_incomplete(rollout_id):
+        if store.exists(rollout_id) or store.is_incomplete(rollout_id):
             return store
     return None
 
@@ -2044,6 +2032,7 @@ def clear_model_call_captures_for_rollouts(records: list[Any], capture_dirs: lis
             rollout_id = maybe_rollout_id_from_run_body(record)
             if rollout_id:
                 store.path_for(rollout_id).unlink(missing_ok=True)
+                sealed_capture_path(store.path_for(rollout_id)).unlink(missing_ok=True)
                 store.incomplete_path_for(rollout_id).unlink(missing_ok=True)
 
 
