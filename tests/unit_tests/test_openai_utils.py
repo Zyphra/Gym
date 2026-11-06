@@ -1700,3 +1700,25 @@ def test_response_field_set_is_pinned() -> None:
         f"openai {openai.__version__} changed Response's field set: added={added} removed={removed}.\n"
         f"Decide what Gym does with each, then update this list."
     )
+
+
+def test_chat_request_accepts_litellm_replayed_assistant_provider_fields():
+    # LiteLLM replays assistant tool-call turns with reasoning_content, no content and
+    # provider_specific_fields; the request must validate rather than return 422.
+    body = {
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "list_files", "arguments": "{}"}}
+                ],
+                "reasoning_content": "look first",
+                "provider_specific_fields": {"refusal": None},
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "[]"},
+        ]
+    }
+    parsed = NeMoGymChatCompletionCreateParamsNonStreaming.model_validate(body)
+    assert parsed.messages[2]["provider_specific_fields"] == {"refusal": None}
