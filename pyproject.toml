@@ -215,6 +215,11 @@ dependencies = [
     # License: Apache 2.0 https://github.com/ijl/orjson/blob/fb3eb1f729c7e7b019f780af5695722c99c7c695/LICENSE-APACHE
     "orjson",
 
+    # zstandard: zstd compression of sealed model-call captures
+    # Updated: Fri Nov 06, 2026 with zstandard==0.25.0
+    # License: BSD 3-Clause https://github.com/indygreg/python-zstandard/blob/main/LICENSE
+    "zstandard",
+
     # urllib3: HTTP client library (transitive dependency, pinned for security)
     # Updated: Mon May 19, 2026 with urllib3>=2.7.0
     # License: MIT https://github.com/urllib3/urllib3/blob/main/LICENSE.txt

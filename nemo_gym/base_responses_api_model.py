@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import stat
+import struct
 import threading
 import time
 from abc import abstractmethod
@@ -560,8 +561,194 @@ def _validate_rollout_id(rollout_id: str) -> str:
     return rollout_id
 
 
+CAPTURE_SUFFIX = ".capture.jsonl"
+SEALED_CAPTURE_SUFFIX = CAPTURE_SUFFIX + ".zst"
+
+
+def sealed_capture_path(path: str | Path) -> Path:
+    """The zstd file holding the sealed records of the capture ``<id>.capture.jsonl``."""
+    path = Path(path)
+    return path.with_name(path.name + ".zst")
+
+
+def _is_current(fd: int, path: Path) -> bool:
+    """Whether ``fd`` is still the file at ``path`` (a seal unlinks the file it moved)."""
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    opened = os.fstat(fd)
+    return (opened.st_dev, opened.st_ino) == (current.st_dev, current.st_ino)
+
+
+def _append_locked(path: Path, line: bytes, open_fd) -> None:
+    """Append one record under the capture's exclusive lock, to the file no seal has moved."""
+    while True:
+        with os.fdopen(open_fd(path), "ab") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                if not _is_current(handle.fileno(), path):
+                    continue
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+                return
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+# Each sealed segment ends with a zstd skippable frame (zstd readers skip it) naming the
+# plain file it came from. A seal publishes the sealed file before removing that plain
+# file, so a plain file the mark names, unchanged since before the sealed file was
+# written, is one whose removal was interrupted: its records are already sealed. (Appends
+# to such a file before the next seal finishes it would read twice; the window is the
+# instant between the two calls, and the idle sweep seals only files nobody is writing.)
+_SEAL_MARK_MAGIC = 0x184D2A5C
+_SEAL_MARK = struct.Struct("<IIQQQ")
+
+
+def _seal_mark(info: os.stat_result) -> bytes:
+    return _SEAL_MARK.pack(_SEAL_MARK_MAGIC, _SEAL_MARK.size - 8, info.st_dev, info.st_ino, info.st_size)
+
+
+def _already_sealed(path: Path, plain) -> bool:
+    info = os.fstat(plain.fileno())
+    try:
+        with sealed_capture_path(path).open("rb") as sealed:
+            sealed_mtime_ns = os.fstat(sealed.fileno()).st_mtime_ns
+            sealed.seek(-_SEAL_MARK.size, os.SEEK_END)
+            mark = sealed.read(_SEAL_MARK.size)
+    except OSError:
+        return False
+    # A later plain file can reuse the inode, but it is written after the sealed file.
+    return mark == _seal_mark(info) and info.st_mtime_ns < sealed_mtime_ns
+
+
+def _read_sealed(path: Path) -> Optional[bytes]:
+    import zstandard
+
+    try:
+        with sealed_capture_path(path).open("rb") as sealed:
+            return zstandard.ZstdDecompressor().stream_reader(sealed, read_across_frames=True).readall()
+    except FileNotFoundError:
+        return None
+
+
+def _open_locked(path: Path, operation: int):
+    """Open and lock ``path``, retrying while a seal moves it; ``None`` when absent."""
+    while True:
+        try:
+            handle = open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC))
+        except FileNotFoundError:
+            return None
+        fcntl.flock(handle.fileno(), operation)
+        if _is_current(handle.fileno(), path):
+            return handle
+        handle.close()
+
+
+def read_capture_bytes(path: str | Path) -> bytes:
+    """Return the JSONL bytes of the capture ``<id>.capture.jsonl``, sealed or not.
+
+    A capture is its sealed ``.zst`` records followed by any records appended to the
+    plain file since. Raises ``FileNotFoundError`` when neither file exists.
+    """
+    path = Path(path)
+    # Shared lock: no append is half-written and no seal moves records mid-read.
+    plain = _open_locked(path, fcntl.LOCK_SH)
+    try:
+        data = _read_sealed(path)
+        if plain is None:
+            if data is None:
+                raise FileNotFoundError(path)
+            return data
+        if data is None:
+            return plain.read()
+        return data if _already_sealed(path, plain) else data + plain.read()
+    finally:
+        if plain is not None:
+            plain.close()
+
+
+def seal_capture(path: str | Path) -> bool:
+    """Move a capture's plain records into its zstd file and remove the plain file.
+
+    Appends that arrive later start a new plain file, read after the sealed records
+    and sealed again by the next call. Returns whether any records were moved.
+    """
+    import zstandard
+
+    path = Path(path)
+    plain = _open_locked(path, fcntl.LOCK_EX)
+    if plain is None:
+        return False
+    with plain:
+        info = os.fstat(plain.fileno())
+        moved = bool(info.st_size) and not _already_sealed(path, plain)
+        if moved:
+            sealed = sealed_capture_path(path)
+            temporary = sealed.with_name(f".{sealed.name}.{os.getpid()}.tmp")
+            mode = stat.S_IMODE(info.st_mode)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                with os.fdopen(os.open(temporary, flags, mode), "wb") as out:
+                    os.fchmod(out.fileno(), mode)
+                    try:
+                        with sealed.open("rb") as previous:
+                            while chunk := previous.read(1 << 20):
+                                out.write(chunk)
+                    except FileNotFoundError:
+                        pass
+                    # One frame per seal keeps an episode's repeated context inside zstd's window.
+                    zstandard.ZstdCompressor(level=3).copy_stream(plain, out)
+                    out.write(_seal_mark(info))
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(temporary, sealed)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
+        # Writers waiting on this lock find the path gone and start a new plain file.
+        os.unlink(path)
+        return moved
+
+
+def capture_paths(directory: str | Path) -> list[Path]:
+    """The ``<id>.capture.jsonl`` path of every capture in ``directory``, sealed or not."""
+    names = set()
+    for entry in os.scandir(directory):
+        for suffix in ("", ".zst"):
+            if entry.name.endswith(CAPTURE_SUFFIX + suffix) and not entry.name.startswith("."):
+                names.add(entry.name.removesuffix(suffix) if suffix else entry.name)
+    return [Path(directory) / name for name in sorted(names)]
+
+
+def seal_idle_captures(directory: str | Path, idle_s: float) -> int:
+    """Seal every capture in ``directory`` with no append for ``idle_s`` seconds; returns the count."""
+    sealed = 0
+    now = time.time()
+    try:
+        entries = list(os.scandir(directory))
+    except FileNotFoundError:
+        return 0
+    for entry in entries:
+        if not entry.name.endswith(CAPTURE_SUFFIX) or not entry.is_file(follow_symlinks=False):
+            continue
+        try:
+            idle = now - entry.stat(follow_symlinks=False).st_mtime
+        except FileNotFoundError:
+            continue
+        if idle >= idle_s and seal_capture(entry.path):
+            sealed += 1
+    return sealed
+
+
 class CaptureStore:
-    """Append-only, rollout-keyed JSONL sink for model exchanges."""
+    """Append-only, rollout-keyed JSONL sink for model exchanges.
+
+    Records append to ``<id>.capture.jsonl``; ``seal_capture`` later compresses them
+    into ``<id>.capture.jsonl.zst``. Reads return both, sealed records first.
+    """
 
     def __init__(self, root: str | Path, selection: ModelCallCaptureSelection | None = None) -> None:
         self._root = Path(root)
@@ -690,19 +877,22 @@ class CaptureStore:
             quota.truncate()
             quota.flush()
             os.fsync(quota.fileno())
-            with os.fdopen(
-                self._private_fd(self.path_for(rollout_id), os.O_WRONLY | os.O_APPEND | os.O_CREAT), "ab"
-            ) as handle:
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
+            _append_locked(
+                self.path_for(rollout_id),
+                line,
+                lambda path: self._private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT),
+            )
 
     @property
     def root(self) -> Path:
         return self._root
 
     def path_for(self, rollout_id: str) -> Path:
-        return self._root / f"{_validate_rollout_id(rollout_id)}.capture.jsonl"
+        return self._root / f"{_validate_rollout_id(rollout_id)}{CAPTURE_SUFFIX}"
+
+    def exists(self, rollout_id: str) -> bool:
+        path = self.path_for(rollout_id)
+        return path.exists() or sealed_capture_path(path).exists()
 
     def incomplete_path_for(self, rollout_id: str) -> Path:
         return self._root / f"{_validate_rollout_id(rollout_id)}.capture.incomplete"
@@ -729,61 +919,36 @@ class CaptureStore:
             self._bounded_record(rollout_id, exchange)
             return
         line = orjson.dumps(exchange, default=str, option=orjson.OPT_APPEND_NEWLINE)
-        path = self.path_for(rollout_id)
-        with path.open("ab") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                handle.write(line)
-                handle.flush()
-                os.fsync(handle.fileno())
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        _append_locked(
+            self.path_for(rollout_id),
+            line,
+            lambda path: os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o666),
+        )
+
+    def _lines(self, rollout_id: str) -> list[bytes]:
+        try:
+            raw = read_capture_bytes(self.path_for(rollout_id))
+        except FileNotFoundError:
+            return []
+        return [stripped for line in raw.splitlines() if (stripped := line.strip())]
 
     def read(self, rollout_id: str) -> list[dict[str, Any]]:
-        path = self.path_for(rollout_id)
-        if not path.exists():
-            return []
-        exchanges: list[dict[str, Any]] = []
-        # Stream line-by-line; a capture can be large (token-ids / logprobs).
-        with path.open("rb") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-            try:
-                for line in handle:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    exchanges.append(orjson.loads(stripped))
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        return exchanges
+        return [orjson.loads(line) for line in self._lines(rollout_id)]
 
     def read_available(self, rollout_id: str) -> tuple[list[tuple[int, dict[str, Any]]], int]:
         """Read valid exchanges without letting one damaged line hide the rest."""
-        path = self.path_for(rollout_id)
-        if not path.exists():
-            return [], 0
         exchanges: list[tuple[int, dict[str, Any]]] = []
         invalid_count = 0
-        capture_index = 0
-        with path.open("rb") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+        for capture_index, line in enumerate(self._lines(rollout_id)):
             try:
-                for line in handle:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        exchange = orjson.loads(stripped)
-                    except orjson.JSONDecodeError:
-                        invalid_count += 1
-                    else:
-                        if isinstance(exchange, dict):
-                            exchanges.append((capture_index, exchange))
-                        else:
-                            invalid_count += 1
-                    capture_index += 1
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                exchange = orjson.loads(line)
+            except orjson.JSONDecodeError:
+                invalid_count += 1
+            else:
+                if isinstance(exchange, dict):
+                    exchanges.append((capture_index, exchange))
+                else:
+                    invalid_count += 1
         return exchanges, invalid_count
 
 
@@ -2024,7 +2189,7 @@ def observability_enabled_from_config(global_config_dict: Any) -> bool:
 def _store_for_rollout(rollout_id: str, capture_dirs: list[Path]) -> Optional[CaptureStore]:
     for directory in capture_dirs:
         store = CaptureStore(directory)
-        if store.path_for(rollout_id).exists() or store.is_incomplete(rollout_id):
+        if store.exists(rollout_id) or store.is_incomplete(rollout_id):
             return store
     return None
 
@@ -2044,6 +2209,7 @@ def clear_model_call_captures_for_rollouts(records: list[Any], capture_dirs: lis
             rollout_id = maybe_rollout_id_from_run_body(record)
             if rollout_id:
                 store.path_for(rollout_id).unlink(missing_ok=True)
+                sealed_capture_path(store.path_for(rollout_id)).unlink(missing_ok=True)
                 store.incomplete_path_for(rollout_id).unlink(missing_ok=True)
 
 
