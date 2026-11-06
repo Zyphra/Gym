@@ -17,7 +17,15 @@ from nemo_gym.config_types import BaseServerConfig
 from nemo_gym.server_utils import ServerClient
 from resources_servers.api_workspace.app import APIWorkspaceConfig, APIWorkspaceResourcesServer
 from resources_servers.api_workspace.engine import VENDORS, APIError, Workspace, canonical_json
-from resources_servers.api_workspace.scenarios import FAMILIES, row_from_id, scenario_from_id, task_ids
+from resources_servers.api_workspace.scenarios import (
+    FAMILIES,
+    FAMILIES_V5,
+    REVISION,
+    REVISION_V5,
+    row_from_id,
+    scenario_from_id,
+    task_ids,
+)
 
 
 def server():
@@ -81,6 +89,94 @@ def test_all_immutable_tasks_gold_noop_wrong_and_preservation(family):
         assert world.score()["reward"] == 0.0, identity
         assert canonical_json(scenario.records) == before
     assert len(fingerprints) == 80
+
+
+def _goal_world(scenario):
+    """The expected final state written directly into the world; creations get fresh IDs."""
+    world = Workspace(scenario)
+    for goal in scenario.updates:
+        world.records[goal["vendor"]][goal["collection"]][goal["id"]].update(deepcopy(goal["fields"]))
+    for goal in scenario.deletes:
+        del world.records[goal["vendor"]][goal["collection"]][goal["id"]]
+    for index, goal in enumerate(scenario.creates):
+        identity = f"created-{index}"
+        world.records[goal["vendor"]][goal["collection"]][identity] = {"id": identity, **deepcopy(goal["fields"])}
+    return world
+
+
+def _one_assertion_failed(score, total):
+    grading = score["assertions"]
+    assert score["reward"] == 0.0 and grading["guards_broken"] == 0, grading
+    assert grading["assertions_passed"] == total - 1 and grading["assertions_total"] == total, grading
+    assert grading["partial"] == (total - 1) / total
+
+
+def _guard_broken(score, total):
+    grading = score["assertions"]
+    assert score["reward"] == 0.0 and grading["guards_broken"] > 0, grading
+    assert grading["assertions_passed"] == total, grading
+
+
+@pytest.mark.parametrize(
+    "revision,family", [(REVISION, family) for family in FAMILIES] + [(REVISION_V5, family) for family in FAMILIES_V5]
+)
+def test_wrong_work_fails_its_assertion_and_collateral_damage_breaks_a_guard(revision, family):
+    for identity in task_ids("train", revision):
+        if f":{family}:" not in identity:
+            continue
+        scenario = scenario_from_id(identity)
+        total = len(scenario.updates) + len(scenario.deletes) + len(scenario.creates)
+        gold = _goal_world(scenario).score()
+        assert gold["reward"] == 1.0 and gold["assertions"]["partial"] == 1.0, identity
+        assert Workspace(scenario).score()["assertions"]["partial"] == 0.0, identity
+
+        if scenario.creates:
+            # The last creation is made with one wrong value: only its assertion fails.
+            world, goal = _goal_world(scenario), scenario.creates[-1]
+            created = world.records[goal["vendor"]][goal["collection"]][f"created-{len(scenario.creates) - 1}"]
+            field = next(key for key, value in created.items() if key != "id" and isinstance(value, str) and value)
+            created[field] += " (wrong)"
+            _one_assertion_failed(world.score(), total)
+            # The same record made on another vendor's collection is also a wrong creation.
+            world = _goal_world(scenario)
+            other = next(
+                (
+                    vendor
+                    for vendor in world.records
+                    if vendor != goal["vendor"] and goal["collection"] in world.records[vendor]
+                ),
+                None,
+            )
+            if other is not None:
+                moved = world.records[goal["vendor"]][goal["collection"]].pop(f"created-{len(scenario.creates) - 1}")
+                world.records[other][goal["collection"]]["created-moved"] = {**moved, "id": "created-moved"}
+                _one_assertion_failed(world.score(), total)
+            # A record beyond the wanted count is collateral damage.
+            world = _goal_world(scenario)
+            world.records[goal["vendor"]][goal["collection"]]["created-extra"] = {
+                "id": "created-extra",
+                **goal["fields"],
+            }
+            _guard_broken(world.score(), total)
+
+        if scenario.deletes:
+            world, goal = _goal_world(scenario), scenario.deletes[0]
+            original = scenario.records[goal["vendor"]][goal["collection"]][goal["id"]]
+            world.records[goal["vendor"]][goal["collection"]][goal["id"]] = deepcopy(original)
+            _one_assertion_failed(world.score(), total)
+
+        # Changing a record no goal targets breaks a guard even when every assertion passes.
+        targeted = {goal["id"] for goal in scenario.updates + scenario.deletes}
+        world = _goal_world(scenario)
+        record = next(
+            row
+            for vendor in scenario.connected
+            for rows in world.records[vendor].values()
+            for key, row in rows.items()
+            if key not in targeted and not key.startswith("created-")
+        )
+        record["injected_authority"] = "success"
+        _guard_broken(world.score(), total)
 
 
 @pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
