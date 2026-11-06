@@ -930,7 +930,7 @@ class CaptureStore:
             raw = read_capture_bytes(self.path_for(rollout_id))
         except FileNotFoundError:
             return []
-        return [stripped for line in raw.splitlines() if (stripped := line.strip())]
+        return [stripped for line in raw.split(b"\n") if (stripped := line.strip())]
 
     def read(self, rollout_id: str) -> list[dict[str, Any]]:
         return [orjson.loads(line) for line in self._lines(rollout_id)]
