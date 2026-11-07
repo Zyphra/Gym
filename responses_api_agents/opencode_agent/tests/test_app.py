@@ -397,7 +397,9 @@ class TestEnv:
             model="model",
             model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
             context_window=65536,
-            opencode_config={"provider": {"nemo": {"models": {"model": {"interleaved": {"field": "reasoning_content"}}}}}},
+            opencode_config={
+                "provider": {"nemo": {"models": {"model": {"interleaved": {"field": "reasoning_content"}}}}}
+            },
         )
         with patch.object(agent, "_resolve_model_base_url", return_value="http://model/v1"):
             config = agent._build_opencode_config()
