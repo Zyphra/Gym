@@ -1,2 +1,5 @@
 -e nemo-gym[dev] @ ../../
-hermes-agent @ git+https://github.com/Zyphra/hermes-agent@0877d91f005451b1a0d801ad7c5ab91a05131e9a
+# Hermes is not pip-installable (its setup.py refuses wheel builds). scripts/hermes_agent_deps.sh
+# installs this unmodified upstream commit with Hermes' own uv.lock; the agent runtimes key their
+# prepared dependencies on this file, so the pin stays here:
+# hermes-agent @ https://github.com/NousResearch/hermes-agent@6b21d0564de0492e2ebd0d8f63fca86c03b5c892

@@ -17,15 +17,13 @@ import atexit
 import json
 import logging
 import os
-import re
 import shutil
 import sys
 import tempfile
 from asyncio import Semaphore
 from collections.abc import Mapping
-from contextvars import ContextVar
 from time import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
 import model_tools  # noqa: F401  # fail-fast if hermes-agent isn't installed  # pyright: ignore[reportMissingImports]
@@ -62,14 +60,15 @@ from responses_api_agents.hermes_agent.observability import HermesAgentObserver
 def _trajectory_to_output_items(messages, n_input):
     output_items = []
     for item in messages[n_input:]:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or item.get("display_kind") == "hidden":
+            # Hermes' hidden rows (its interrupt placeholder) are not model output.
             continue
         role = item.get("role")
         content = item.get("content", "") or ""
         if isinstance(content, list):
             content = "".join(c.get("text", "") if isinstance(c, dict) else getattr(c, "text", "") for c in content)
         if role == "assistant":
-            reasoning_text = item.get("reasoning") or ""
+            reasoning_text = item.get("reasoning") or item.get("reasoning_content") or ""
             if reasoning_text:
                 content = ResponsesConverter._parse_think_tags(content)[1]
                 output_items.append(
@@ -170,54 +169,6 @@ def _split_input_to_user_and_history(input_items) -> tuple[str, list[dict], Opti
     return user_message, history, system_message
 
 
-def _execute_every_tool_call(agent: Any) -> None:
-    """Run every tool call the policy emits in a turn.
-
-    Hermes' post-call guardrails drop duplicate (name, arguments) pairs and
-    delegate_task calls past MAX_CONCURRENT_CHILDREN with only a log line; the
-    dropped calls get no tool result and leave the served turn. Every emitted
-    call executes instead, in Hermes' own sequential or parallel-safe order.
-    """
-    agent._deduplicate_tool_calls = _keep_tool_calls
-    agent._cap_delegate_task_calls = _keep_tool_calls
-
-
-def _keep_tool_calls(tool_calls: list) -> list:
-    return tool_calls
-
-
-MAX_TOOL_RESULT_CHARS = 20_000
-
-
-def _limit_tool_results(agent: Any) -> None:
-    """Bound each new tool observation before Hermes sends its next request.
-
-    The pinned Hermes executor has a larger, hardcoded result limit and no
-    setting for it. Wrap its common dispatcher so both execution branches keep
-    their ordering, errors and tool identities. Never rewrite earlier history.
-    """
-    execute_tool_calls = agent._execute_tool_calls
-
-    def execute_then_limit(assistant_message, messages, *args, **kwargs):
-        first_new_message = len(messages)
-        try:
-            return execute_tool_calls(assistant_message, messages, *args, **kwargs)
-        finally:
-            for message in messages[first_new_message:]:
-                content = message.get("content")
-                if message.get("role") != "tool" or not isinstance(content, str):
-                    continue
-                if len(content) > MAX_TOOL_RESULT_CHARS:
-                    note = (
-                        f"\n\n[Truncated: tool result was {len(content):,} characters; "
-                        f"limit {MAX_TOOL_RESULT_CHARS:,} characters including this note. "
-                        "Use a narrower search or read range.]"
-                    )
-                    message["content"] = content[: MAX_TOOL_RESULT_CHARS - len(note)] + note
-
-    agent._execute_tool_calls = execute_then_limit
-
-
 # OpenHands' built-in `finish` schema (openhands/sdk/tool/builtins/finish.py), so a
 # harness mix offers one completion contract.
 FINISH_TOOL_SCHEMA = {
@@ -298,7 +249,12 @@ def _endpoint_stop(response: Any) -> bool:
 
 
 def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
-    """Record whether the latest main-loop model response was the endpoint's episode stop."""
+    """Record whether the latest main-loop model response was the endpoint's episode stop.
+
+    The stop ends the episode: Hermes would otherwise answer the empty message with its
+    empty-response nudge or retry and send another request to a finished episode. The run
+    stops at Hermes' own between-turn interrupt check, as the `finish` tool does.
+    """
     api_call = getattr(agent, "_interruptible_api_call", None)
     if api_call is None:
         # An unobservable stop counts as the endpoint's, so completion is never claimed.
@@ -310,6 +266,8 @@ def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
         stopped = False
         response = api_call(*args, **kwargs)
         stopped = _endpoint_stop(response)
+        if stopped:
+            agent._interrupt_requested = True
         return response
 
     agent._interruptible_api_call = call_then_observe
@@ -356,28 +314,21 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     context_window: int | None = Field(default=None, gt=0)
     enabled_toolsets: Optional[list[str]] = None
     disabled_toolsets: Optional[list[str]] = None
-    temperature: float | None = None
     terminal_backend: str = "local"
     terminal_timeout: int = 180
     api_timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     system_prompt: Optional[str] = None
     compression_enabled: bool = True
     # Stock Hermes compresses at this fraction of the model context
-    # (hermes_cli/config.py DEFAULT_CONFIG compression.threshold).
+    # (hermes_cli/config_defaults.py DEFAULT_CONFIG compression.threshold).
     compression_threshold: float = Field(default=0.50, gt=0, le=1)
-    # Temperature of the compression summary request. None samples it like the
-    # run's policy turns, never at Hermes' own 0.3 (context_compressor.py).
-    compression_summary_temperature: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     # Hermes' compression.target_ratio: the kept recent tail as a fraction of the threshold.
-    # None keeps Hermes' default (0.20); Hermes clamps it to [0.10, 0.80].
+    # None keeps Hermes' default (0.20).
     compression_target_ratio: float | None = Field(default=None, ge=0.10, le=0.80, allow_inf_nan=False)
-    # Total summary completion allowance, including reasoning; independent of tail retention.
-    compression_summary_max_output_tokens: int = Field(default=32768, gt=0)
-    # Keep only the first copy when the visible summary restarts at its own first heading
-    # (the model wrote the template twice). Hermes' summary guard otherwise rejects the summary
-    # and the run re-compacts on the next turn.
-    compression_summary_keep_first_copy: bool = False
-    chat_template_kwargs_enabled: bool = True
+    # Hermes' compression.tail_mode (hermes_cli/config_defaults.py): "lean" (Hermes' default) adds a
+    # detailed session log to the summary request and a clamped tail; "legacy" keeps the structured
+    # summary and the target_ratio tail. None keeps Hermes' default.
+    compression_tail_mode: Literal["lean", "legacy"] | None = None
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
     checkpoints_enabled: bool = False
@@ -406,37 +357,6 @@ class HermesAgentVerifyResponse(BaseVerifyResponse):
     )
 
 
-_COMPRESSION_ROUTE: ContextVar[Optional[Callable[..., Any]]] = ContextVar("hermes_compression_route", default=None)
-
-
-def _route_compression_calls() -> None:
-    """Answer Hermes' own compression call from the calling run's policy client.
-
-    Stock Hermes summarizes through ``call_llm(task="compression")``
-    (``agent/context_compressor.py`` ``_generate_summary``); with no auxiliary
-    provider configured, a self-hosted deployment resolves it to the main
-    endpoint and model. A process-wide endpoint cannot carry concurrent rollout
-    URLs, so compression calls made inside a run go to the route bound for that
-    run. Everything else in the stock path is unchanged: the request, its
-    max_tokens, an empty summary leaving only the compaction marker, and a
-    failed call dropping the middle turns. Other calls keep Hermes' resolution.
-    """
-    import agent.context_compressor as context_compressor  # pyright: ignore[reportMissingImports]
-
-    native_call_llm = context_compressor.call_llm
-    if getattr(native_call_llm, "routes_compression", False):
-        return
-
-    def call_llm(task=None, **kwargs):
-        route = _COMPRESSION_ROUTE.get()
-        if task != "compression" or route is None:
-            return native_call_llm(task, **kwargs)
-        return route(**kwargs)
-
-    call_llm.routes_compression = True
-    context_compressor.call_llm = call_llm
-
-
 def _hide_harness_mounts_from_shell() -> None:
     """Point Hermes' shell lookup at a ``bash`` stand-in that hides the harness mounts.
 
@@ -460,97 +380,6 @@ def _hide_harness_mounts_from_shell() -> None:
 
     find_bash.hides_harness_mounts = True
     local._find_bash = find_bash
-
-
-# Markdown ATX headings and code fences, read as Hermes' summary guard reads them.
-_SUMMARY_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$")
-_SUMMARY_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-
-
-def _first_summary_copy(text: str) -> str:
-    """The text before the summary restarts at its own first heading; otherwise the text unchanged.
-
-    A summary that writes its whole template twice (``## Goal ... ## Goal ...``) repeats its first
-    heading at the same level outside code fences. Only that restart is cut: any other repeated
-    heading is left for Hermes' guard to reject.
-    """
-    first = None
-    fence = None
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        start = offset
-        offset += len(line)
-        fence_match = _SUMMARY_FENCE_RE.match(line)
-        if fence_match:
-            marker = fence_match.group(1)
-            if fence is None:
-                fence = marker
-            elif marker[0] == fence[0] and len(marker) >= len(fence):
-                fence = None
-            continue
-        if fence is not None:
-            continue
-        heading = _SUMMARY_HEADING_RE.match(line.rstrip("\r\n"))
-        if not heading:
-            continue
-        title = " ".join(heading.group(2).split()).casefold()
-        if not title:
-            continue
-        key = (len(heading.group(1)), title)
-        if first is None:
-            first = key
-        elif key == first:
-            kept = text[:start].rstrip()
-            return kept if kept else text
-    return text
-
-
-def _keep_first_summary_copy(response) -> None:
-    """Cut the response's visible summary to its first copy, in place."""
-    choices = getattr(response, "choices", None) or []
-    message = getattr(choices[0], "message", None) if choices else None
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        kept = _first_summary_copy(content)
-        if kept != content:
-            message.content = kept
-            LOG.info(
-                "Hermes summary repeated its template; kept the first copy (%d of %d chars)", len(kept), len(content)
-            )
-
-
-def _policy_compression_route(
-    agent, summary_temperature: float | None, keep_first_copy: bool = False
-) -> Callable[..., Any]:
-    """Send a compression request through the run's own policy request builder.
-
-    ``agent._build_api_kwargs`` (the run's patched builder) supplies the model,
-    timeout and ``extra_body`` (the thinking mode included) that the run's policy
-    turns carry; the request then takes the compression messages only, with no
-    tools and Hermes' summary ``max_tokens``. The summary is sampled at the policy
-    turns' temperature, or ``summary_temperature`` when set; Hermes' own 0.3 is
-    dropped because the summary is trained as a policy turn.
-    """
-
-    def complete(*, messages, temperature=None, max_tokens=None, tools=None, extra_body=None, **_):
-        request: dict[str, Any] = agent._build_api_kwargs(messages)
-        request["messages"] = messages
-        for key in ("tools", "tool_choice", "max_tokens", "max_completion_tokens"):
-            request.pop(key, None)
-        if summary_temperature is not None:
-            request["temperature"] = summary_temperature
-        if max_tokens is not None:
-            request["max_tokens"] = max_tokens
-        if tools:
-            request["tools"] = tools
-        if extra_body:
-            request["extra_body"] = {**request.get("extra_body", {}), **extra_body}
-        response = agent.client.chat.completions.create(**request)
-        if keep_first_copy:
-            _keep_first_summary_copy(response)
-        return response
-
-    return complete
 
 
 class HermesAgent(SimpleResponsesAPIAgent):
@@ -589,8 +418,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
         import yaml
 
         config: dict[str, Any] = {
+            # No provider: Hermes keeps model.context_length only for the configured route, and the
+            # run's route is the rollout URL it is given (a provider name here would not match it).
             "model": self._model_name(),
-            "provider": "auto",
             "toolsets": ["hermes-cli"],
             "agent": {"max_turns": self.config.max_turns},
             "memory": {
@@ -600,10 +430,14 @@ class HermesAgent(SimpleResponsesAPIAgent):
             "compression": {
                 "enabled": self.config.compression_enabled,
                 "threshold": self.config.compression_threshold,
-                "summary_max_output_tokens": self.config.compression_summary_max_output_tokens,
                 **(
                     {"target_ratio": self.config.compression_target_ratio}
                     if self.config.compression_target_ratio is not None
+                    else {}
+                ),
+                **(
+                    {"tail_mode": self.config.compression_tail_mode}
+                    if self.config.compression_tail_mode is not None
                     else {}
                 ),
             },
@@ -617,6 +451,14 @@ class HermesAgent(SimpleResponsesAPIAgent):
             "checkpoints": {
                 "enabled": self.config.checkpoints_enabled,
             },
+            # Every auxiliary request Hermes makes without a dedicated provider resolves to the run's
+            # own policy endpoint. Only the compression summary belongs to the rollout; Hermes' title
+            # generation is switched off with its own setting, and the compression call gets the
+            # run's request budget instead of Hermes' 120 s auxiliary default.
+            "auxiliary": {
+                "title_generation": {"enabled": False},
+                **({"compression": {"timeout": self.config.api_timeout}} if self.config.api_timeout else {}),
+            },
         }
         if self.config.mcp_servers:
             config["mcp_servers"] = self.config.mcp_servers
@@ -625,6 +467,10 @@ class HermesAgent(SimpleResponsesAPIAgent):
             reserve = self.config.max_tokens or 0
             if reserve >= self.config.context_window:
                 raise ValueError("Hermes output reserve must be smaller than its context window")
+        if not isinstance(config["model"], dict):
+            config["model"] = {"default": config["model"]}
+        # The rollout endpoint answers whole chat completions; Hermes' own switch turns streaming off.
+        config["model"]["streaming"] = False
         return yaml.dump(config, default_flow_style=False)
 
     def model_post_init(self, __context: Any) -> None:
@@ -645,9 +491,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             _f.write(self._build_config())
         os.environ["HERMES_HOME"] = hermes_home
         if self.config.mcp_servers:
-            # Hermes discovers MCP servers when `model_tools` is first imported, which is before this
-            # config exists; discovery is idempotent, so run it again against the config just written.
-            from tools.mcp_tool import discover_mcp_tools  # pyright: ignore[reportMissingImports]
+            # Hermes' entry points (CLI, gateway) run MCP discovery at startup, after their config
+            # exists; this server's startup is here, once the config is written.
+            from tools.mcp_tool_discovery import discover_mcp_tools  # pyright: ignore[reportMissingImports]
 
             discover_mcp_tools()
 
@@ -674,12 +520,12 @@ class HermesAgent(SimpleResponsesAPIAgent):
         model_name = self._model_name()
 
         agent = AIAgent(
+            # An anonymous custom OpenAI-compatible endpoint: Hermes then routes its auxiliary
+            # requests (the compression summary) to this same per-run URL and model.
+            provider="custom",
             base_url=base_url,
             api_key=self.config.api_key or os.environ.get("OPENAI_API_KEY", "gym"),  # pragma: allowlist secret
             model=model_name,
-            use_streaming=False,
-            temperature=self.config.temperature,
-            insert_reasoning=True,
             max_iterations=self.config.max_turns,
             max_tokens=self.config.max_tokens,
             enabled_toolsets=self.config.enabled_toolsets,
@@ -687,33 +533,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
-            persist_session=False,
+            skip_background_review=True,
             save_trajectories=False,
         )
-        _original_build_api_kwargs = agent._build_api_kwargs
-
-        def _patched_build_api_kwargs(api_messages):
-            kw = _original_build_api_kwargs(api_messages)
-            if not self.config.chat_template_kwargs_enabled:
-                return kw
-            ctk = kw.setdefault("extra_body", {}).setdefault("chat_template_kwargs", {})
-            ctk.setdefault("enable_thinking", True)
-            ctk["truncate_history_thinking"] = False
-            return kw
-
-        agent._build_api_kwargs = _patched_build_api_kwargs
-        compression_route = None
         if self.config.hide_harness_mounts:
             _hide_harness_mounts_from_shell()
-        if self.config.compression_enabled:
-            _route_compression_calls()
-            compression_route = _policy_compression_route(
-                agent,
-                self.config.compression_summary_temperature,
-                self.config.compression_summary_keep_first_copy,
-            )
-        _execute_every_tool_call(agent)
-        _limit_tool_results(agent)
         ended_by_endpoint = _observe_endpoint_stop(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         observer = None
@@ -733,9 +557,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
         result = None
         agent_error: Optional[BaseException] = None
         interrupted_by_dispatch = False
-        route_token = _COMPRESSION_ROUTE.set(compression_route)
         try:
-            # to_thread copies this context, so the run's compression calls reach its own route.
             result = await asyncio.to_thread(
                 agent.run_conversation,
                 user_message,
@@ -745,11 +567,13 @@ class HermesAgent(SimpleResponsesAPIAgent):
             if finished_by_tool is not None and finished_by_tool() and agent_id not in self.interrupted_agents:
                 # The policy ended the run itself; the loop's interrupt check was only the stop point.
                 result = {**result, "completed": True, "interrupted": False}
+            elif ended_by_endpoint() and agent_id not in self.interrupted_agents:
+                # The endpoint ended the episode; the interrupt only kept Hermes from asking again.
+                result = {**result, "completed": True, "interrupted": False}
         except BaseException as exc:
             agent_error = exc
             raise
         finally:
-            _COMPRESSION_ROUTE.reset(route_token)
             self.active_agents.discard(agent)
             interrupted_by_dispatch = agent_id in self.interrupted_agents
             self.interrupted_agents.discard(agent_id)
@@ -824,11 +648,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
         was_interrupted = bool(result.get("interrupted")) or interrupted_by_dispatch
 
         harness_error = result.get("error")
-        context_exhausted = (
-            isinstance(harness_error, str)
-            and harness_error.startswith("Context length exceeded")
-            and harness_error.endswith("Cannot compress further.")
-        )
+        # Hermes' own verdict that the conversation no longer fits and cannot be compressed
+        # (agent/turn_overflow.py fail_turn); its error text is display copy.
+        context_exhausted = result.get("failure_reason") == "context_overflow"
         agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not context_exhausted
         finished_naturally = _finished_naturally(
             result,

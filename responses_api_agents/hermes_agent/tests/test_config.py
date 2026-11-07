@@ -106,7 +106,7 @@ def test_mcp_server_tools_register_when_config_is_written_after_hermes_import(tm
         config=_config(mcp_servers={"gym_probe": {"command": sys.executable, "args": [str(script)]}}),
         server_client=ServerClient.model_construct(),
     )
-    assert "mcp_gym_probe_probe_echo" in registry.get_all_tool_names()
+    assert "mcp__gym_probe__probe_echo" in registry.get_all_tool_names()
 
 
 if __name__ == "__main__":

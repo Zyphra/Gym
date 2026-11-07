@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -197,45 +198,53 @@ def test_model_response_id_is_joined_to_the_owning_invocation():
     assert "model_call_ownership_unavailable" not in {gap.code for gap in bundle.gaps}
 
 
-def test_concurrent_tool_intervals_end_at_each_worker_not_completion_callback():
+def test_concurrent_tool_intervals_end_at_each_worker_not_completion_callback(tmp_path, monkeypatch):
+    """Hermes' own concurrent executor on a real ``AIAgent``; only the tool body is scripted."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("model:\n  default: model\n  context_length: 131072\n  streaming: false\n")
     from run_agent import AIAgent
 
-    agent = _FakeAgent()
-    release = {"fast": threading.Event(), "slow": threading.Event()}
-    entered = {"fast": threading.Event(), "slow": threading.Event()}
+    agent = AIAgent(
+        base_url="http://127.0.0.1:9/v1",
+        api_key="unused",
+        model="model",
+        quiet_mode=True,
+        enabled_toolsets=["file"],
+        skip_context_files=True,
+        skip_memory=True,
+        skip_background_review=True,
+    )
+    release = {"read_file": threading.Event(), "search_files": threading.Event()}
+    entered = {"read_file": threading.Event(), "search_files": threading.Event()}
 
-    def invoke(function_name, function_args, effective_task_id):
+    def invoke(function_name, function_args, effective_task_id, *args, **kwargs):
         entered[function_name].set()
-        assert release[function_name].wait(timeout=2)
+        assert release[function_name].wait(timeout=5)
         return function_name
 
     agent._invoke_tool = invoke
-    agent._interrupt_requested = False
-    agent.quiet_mode = False
-    agent.verbose_logging = False
-    agent.log_prefix_chars = 100
-    agent.tool_progress_callback = None
-    agent._checkpoint_mgr = SimpleNamespace(enabled=False)
-    agent._get_budget_warning = lambda _count: None
     observer = HermesAgentObserver().instrument(agent)
     calls = [
-        SimpleNamespace(id=f"{name}-call", function=SimpleNamespace(name=name, arguments="{}"))
-        for name in ("fast", "slow")
+        SimpleNamespace(
+            id=f"{name}-call", type="function", function=SimpleNamespace(name=name, arguments=json.dumps(args))
+        )
+        for name, args in (("read_file", {"path": "a.txt"}), ("search_files", {"pattern": "x"}))
     ]
-    execute = AIAgent._execute_tool_calls_concurrent.__get__(agent, _FakeAgent)
-    execution = threading.Thread(target=execute, args=(SimpleNamespace(tool_calls=calls), [], "task"))
+    execution = threading.Thread(
+        target=agent._execute_tool_calls_concurrent, args=(SimpleNamespace(tool_calls=calls, content=""), [], "task")
+    )
     execution.start()
-    assert entered["fast"].wait(timeout=2)
-    assert entered["slow"].wait(timeout=2)
-    release["fast"].set()
+    assert entered["read_file"].wait(timeout=5)
+    assert entered["search_files"].wait(timeout=5)
+    release["read_file"].set()
     assert not threading.Event().wait(timeout=0.02)
-    release["slow"].set()
-    execution.join(timeout=2)
+    release["search_files"].set()
+    execution.join(timeout=5)
     assert not execution.is_alive()
     bundle = observer.finish({"completed": True, "messages": []})
 
-    fast = _tool(bundle, "fast-call")
-    slow = _tool(bundle, "slow-call")
+    fast = _tool(bundle, "read_file-call")
+    slow = _tool(bundle, "search_files-call")
     assert fast.completed_at < slow.completed_at
     assert fast.duration_ms < slow.duration_ms
 
