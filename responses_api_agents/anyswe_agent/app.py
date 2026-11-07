@@ -105,6 +105,7 @@ class SWEBenchMetrics(SandboxMemoryEvents):
     resolved: Optional[bool] = None
     patch_exists: Optional[bool] = None
     model_patch: Optional[str] = None
+    model_patch_bytes: Optional[int] = None
 
     agent_timed_out: Optional[bool] = None
     agent_error_kind: Optional[str] = None
@@ -181,6 +182,19 @@ class PrivateGraderPlan(BaseModel):
 
 
 _MAX_ERROR_DETAIL_CHARS = 500
+# Grading and patch.diff keep the whole patch; the metrics and verify response
+# that travel to the trainer carry at most this many characters of it.
+MODEL_PATCH_RECORD_CHARS = 1 << 20
+
+
+def _recorded_patch(patch: str) -> Optional[str]:
+    """The patch as recorded in metrics: whole, or a prefix with a truncation marker."""
+    if len(patch) <= MODEL_PATCH_RECORD_CHARS:
+        return patch or None
+    return patch[:MODEL_PATCH_RECORD_CHARS] + (
+        f"\n[model_patch truncated: {len(patch)} characters, first {MODEL_PATCH_RECORD_CHARS} kept;"
+        " the whole patch is patch.diff]\n"
+    )
 
 
 def _error_detail(*parts: Any) -> Optional[str]:
@@ -1155,7 +1169,8 @@ class AnySweSandboxRunner:
             {
                 "resolved": resolved,
                 "patch_exists": bool(patch.strip()),
-                "model_patch": patch or None,
+                "model_patch": _recorded_patch(patch),
+                "model_patch_bytes": patch_path.stat().st_size if patch_path.exists() else 0,
                 "agent_timed_out": agent_timed_out,
                 "agent_error_kind": agent_error_kind,
                 "agent_stop_reason": agent_stop_reason,
