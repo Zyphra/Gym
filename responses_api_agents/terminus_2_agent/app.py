@@ -16,7 +16,6 @@
 """Run Harbor's Terminus-2 loop as a NeMo Gym agent server."""
 
 import asyncio
-import dataclasses
 import errno
 import importlib.util
 import inspect
@@ -102,20 +101,13 @@ def _message_text(item: Any) -> str:
 
 
 # Harbor's compaction (Terminus2._summarize) asks three subagents for text that is handed to the
-# next agent rather than executed: a summary, questions about it, and answers to them. The summary
-# and answers calls reuse the policy history, whose first message demands the JSON action format,
-# so without an explicit override the model replies with an unexecuted action.
+# next agent rather than executed: a summary, questions about it, and answers to them.
 HANDOFF_SUBAGENTS = frozenset(
     {
         "terminus-2-summarization-summary",
         "terminus-2-summarization-questions",
         "terminus-2-summarization-answers",
     }
-)
-HANDOFF_TEXT_CONTRACT = (
-    "\n\nWrite this reply as plain text for the other agent. It is not a terminal turn and nothing "
-    "in it will be executed, so do not use the JSON response format and do not include commands "
-    "or keystrokes."
 )
 
 
@@ -131,25 +123,6 @@ def _action_reply(content: str) -> Optional[dict[str, Any]]:
     if not isinstance(action, dict) or not {"analysis", "plan", "commands"} & action.keys():
         return None
     return action
-
-
-def handoff_text(content: str, reasoning: Optional[str]) -> str:
-    """The text a compaction subagent hands on: its reply, or its draft when it replied with an action."""
-    return handoff(content, reasoning)[0]
-
-
-def handoff(content: str, reasoning: Optional[str]) -> tuple[str, str]:
-    """The handed-on text and its source: ``content``, ``reasoning_fallback``, ``prose_fallback`` or ``empty``."""
-    action = _action_reply(content)
-    text, source = content, "content"
-    if action is not None and reasoning and reasoning.strip():
-        text, source = reasoning.strip(), "reasoning_fallback"
-    elif action is not None:
-        prose = [action.get(key) for key in ("analysis", "plan")]
-        joined = "\n\n".join(item.strip() for item in prose if isinstance(item, str) and item.strip())
-        if joined:
-            text, source = joined, "prose_fallback"
-    return text, source if text.strip() else "empty"
 
 
 def _extract_instruction(body_input: Any) -> tuple[str, Optional[str]]:
@@ -574,28 +547,20 @@ class StandaloneTerminus2(ServedContextTerminus2):
         return getattr(self, "_consecutive_completion_claims", 0) >= 2
 
     async def _run_subagent(self, prompt: str, *args: Any, agent_name: str, **kwargs: Any) -> tuple[Any, ...]:
-        """Ask compaction subagents for plain text and hand on text, never an unexecuted action.
-
-        The request keeps harbor's history (and so the policy row's prefix); only its last user
-        message gains the text contract. The trajectory records the reply as generated.
-        """
-        if agent_name not in HANDOFF_SUBAGENTS:
-            return await super()._run_subagent(prompt, *args, agent_name=agent_name, **kwargs)
-        response, trajectory_ref = await super()._run_subagent(
-            prompt + HANDOFF_TEXT_CONTRACT, *args, agent_name=agent_name, **kwargs
-        )
-        content, reasoning = response.content or "", response.reasoning_content or ""
-        text, source = handoff(content, reasoning)
-        self._handoff_calls.append(
-            CompactionHandoffCall(
-                call=agent_name.rsplit("-", 1)[-1],
-                handoff_source=source,
-                content_is_json_action=_action_reply(content) is not None,
-                content_bytes=len(content.encode()),
-                reasoning_bytes=len(reasoning.encode()),
+        """Record what each compaction subagent handed on; Harbor's request and handoff run unchanged."""
+        response, trajectory_ref = await super()._run_subagent(prompt, *args, agent_name=agent_name, **kwargs)
+        if agent_name in HANDOFF_SUBAGENTS:
+            content, reasoning = response.content or "", response.reasoning_content or ""
+            self._handoff_calls.append(
+                CompactionHandoffCall(
+                    call=agent_name.rsplit("-", 1)[-1],
+                    handoff_source="content" if content.strip() else "empty",
+                    content_is_json_action=_action_reply(content) is not None,
+                    content_bytes=len(content.encode()),
+                    reasoning_bytes=len(reasoning.encode()),
+                )
             )
-        )
-        return dataclasses.replace(response, content=text), trajectory_ref
+        return response, trajectory_ref
 
     async def run(self, instruction: str, environment: LocalEnvironment, context: AgentContext) -> None:
         """Keep completed turns when Terminus fails so Gym can score the partial trajectory."""

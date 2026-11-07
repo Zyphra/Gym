@@ -10,7 +10,7 @@ from aiohttp import web
 from harbor.llms.chat import Chat
 
 from nemo_gym.rollout_observability import AgentObservationBundle, ContextCompactionObservation
-from responses_api_agents.terminus_2_agent.app import StandaloneTerminus2, handoff
+from responses_api_agents.terminus_2_agent.app import StandaloneTerminus2
 from responses_api_agents.terminus_2_agent.llm import NemoGymLLM
 
 
@@ -69,15 +69,15 @@ async def _compaction(fixture, tmp_path, endpoint):
     return handoff_prompt, compaction
 
 
-async def test_cell_a_action_replies_report_the_reasoning_fallback(endpoint, tmp_path):
-    # Hero check 243745: under Harbor's prompts every compaction reply was an action.
+async def test_cell_a_action_replies_are_handed_on_as_generated(endpoint, tmp_path):
+    # Hero check 243745: under Harbor's prompts every compaction reply was an action, and Harbor hands it on.
     handoff_prompt, compaction = await _compaction(CELL_A, tmp_path, endpoint)
 
     replies = CELL_A["replies"]
     assert [call.model_dump() for call in compaction.handoff_calls] == [
         {
             "call": name,
-            "handoff_source": "reasoning_fallback",
+            "handoff_source": "content",
             "content_is_json_action": True,
             "content_bytes": len(replies[name]["content"].encode()),
             "reasoning_bytes": len(replies[name]["reasoning_content"].encode()),
@@ -86,23 +86,25 @@ async def test_cell_a_action_replies_report_the_reasoning_fallback(endpoint, tmp
     ]
     assert [call.content_bytes for call in compaction.handoff_calls] == [489, 1180, 722]
     assert [call.reasoning_bytes for call in compaction.handoff_calls] == [15607, 4412, 3185]
-    assert compaction.summary == handoff_prompt and replies["answers"]["reasoning_content"].strip() in handoff_prompt
+    assert compaction.summary == handoff_prompt and replies["answers"]["content"] in handoff_prompt
+    assert replies["answers"]["reasoning_content"].strip() not in handoff_prompt
 
 
-async def test_plain_text_replies_report_their_content(endpoint, tmp_path):
+async def test_plain_text_and_action_replies_are_both_reported(endpoint, tmp_path):
     # Run 217294: the questions call answered in plain text; summary and answers were actions.
     _, compaction = await _compaction(TRAINING, tmp_path, endpoint)
 
     assert [(call.call, call.handoff_source, call.content_is_json_action) for call in compaction.handoff_calls] == [
-        ("summary", "reasoning_fallback", True),
+        ("summary", "content", True),
         ("questions", "content", False),
-        ("answers", "reasoning_fallback", True),
+        ("answers", "content", True),
     ]
 
 
-def test_handoff_source_without_reasoning():
-    action = CELL_A["replies"]["summary"]["content"]
-    assert handoff(action, None)[1] == "prose_fallback"
-    assert handoff("", None) == ("", "empty")
-    assert handoff("   ", "   ") == ("   ", "empty")
-    assert handoff("Plain summary text.", "draft") == ("Plain summary text.", "content")
+async def test_empty_replies_report_empty(endpoint, tmp_path):
+    empty = {**TRAINING, "replies": {name: {"content": "", "reasoning_content": "draft"} for name in CALLS}}
+    _, compaction = await _compaction(empty, tmp_path, endpoint)
+
+    assert [(call.handoff_source, call.content_is_json_action) for call in compaction.handoff_calls] == [
+        ("empty", False)
+    ] * 3
