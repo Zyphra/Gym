@@ -127,3 +127,67 @@ def test_baseline_export_crosses_filesystems_and_survives_metadata_deletion(tmp_
         assert os.readlink(grader / "agent-link") == "new.sh"
         assert not (grader / "removed.txt").exists()
         assert not (repo / ".git").exists()
+
+
+def _old_git_shim(tmp_path, monkeypatch):
+    """Put a git on PATH that rejects --object-format like Git 2.25, delegating otherwise."""
+    real = shutil.which("git")
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        'for arg in "$@"; do case "$arg" in --object-format=*) '
+        'echo "error: unknown option \\`${arg#--}\'" >&2; exit 129;; esac; done\n'
+        f'exec {real} "$@"\n'
+    )
+    (shim / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ['PATH']}")
+
+
+def _plain_repo(tmp_path, monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "T"]):
+        subprocess.run(["git", *args], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("committed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    return repo
+
+
+def test_baseline_snapshot_supports_git_without_object_format(tmp_path, monkeypatch):
+    repo = _plain_repo(tmp_path, monkeypatch)
+    _old_git_shim(tmp_path, monkeypatch)
+    index = tmp_path / "state" / "baseline.index"
+    index.parent.mkdir()
+    baseline = _snapshot_repo(repo, index)
+    (repo / "tracked.txt").write_text("edited\n")
+    patch = _extract_patch(repo, index, baseline)
+    assert "-committed\n+edited\n" in patch
+
+
+def test_old_git_fallback_never_downgrades_a_sha256_store(tmp_path, monkeypatch):
+    for key in tuple(os.environ):
+        if key.startswith("GIT_"):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    if subprocess.run(["git", "init", "-q", "--object-format=sha256"], cwd=repo).returncode:
+        pytest.skip("this Git cannot create a SHA-256 repository")
+    for args in (["config", "user.email", "t@example.com"], ["config", "user.name", "T"]):
+        subprocess.run(["git", *args], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("committed\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    _old_git_shim(tmp_path, monkeypatch)
+    index = tmp_path / "state" / "baseline.index"
+    index.parent.mkdir()
+    with pytest.raises(subprocess.CalledProcessError):
+        _snapshot_repo(repo, index)

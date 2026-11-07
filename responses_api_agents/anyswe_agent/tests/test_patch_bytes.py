@@ -88,7 +88,9 @@ def test_recorded_patch_is_bounded_and_marked(tmp_path, monkeypatch):
     app.update_metrics(metrics, {"model_patch": app._recorded_patch(large), "model_patch_bytes": len(large.encode())})
     recorded = app.SWEBenchMetrics.model_validate_json(metrics.read_text())
     assert recorded.model_patch.startswith(large[:64])
-    assert recorded.model_patch.endswith(f"[model_patch truncated: {len(large)} characters, first 64 kept; the whole patch is patch.diff]\n")
+    assert recorded.model_patch.endswith(
+        f"[model_patch truncated: {len(large)} characters, first 64 kept; the whole patch is patch.diff]\n"
+    )
     assert len(recorded.model_patch) < 200
     assert recorded.model_patch_bytes == len(large.encode())
     assert json.loads(metrics.read_text())["model_patch_bytes"] > 2000

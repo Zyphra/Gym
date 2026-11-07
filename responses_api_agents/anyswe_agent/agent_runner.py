@@ -101,9 +101,17 @@ def _snapshot_repo(repo: Path, index_path: Path) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    subprocess.run(
-        ["git", "init", "--bare", "-q", f"--object-format={object_format}", str(git_dir)], check=True, env=env
+    init = subprocess.run(
+        ["git", "init", "--bare", "-q", f"--object-format={object_format}", str(git_dir)],
+        env=env,
+        capture_output=True,
     )
+    if init.returncode and object_format == "sha1" and b"object-format" in init.stderr:
+        # Git before 2.29 (e.g. Ubuntu 20.04's 2.25) has no --object-format;
+        # its stores are always SHA-1, so a plain init is the same store.
+        subprocess.run(["git", "init", "--bare", "-q", str(git_dir)], check=True, env=env)
+    elif init.returncode:
+        raise subprocess.CalledProcessError(init.returncode, init.args, init.stdout, init.stderr)
     for name in ("config", "info/exclude", "info/attributes"):
         source = subprocess.run(
             ["git", "rev-parse", "--git-path", name], cwd=repo, env=env, check=True, capture_output=True, text=True
