@@ -32,4 +32,4 @@ pi_agent:
       # written to ~/.pi/agent/settings.json; httpIdleTimeoutMs defaults to timeout
       settings_config: {}
       compaction_enabled: null
-      pi_version: 0.80.2
+      pi_version: 0.99.2
