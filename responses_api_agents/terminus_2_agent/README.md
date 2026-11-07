@@ -36,7 +36,7 @@ calls. Sampling parameters are forwarded to the configured model server.
 configuration. Harbor keeps the exact returned `reasoning_content` in retained
 assistant messages and echoes it on the next request, for training and evaluation.
 Compaction can discard old messages; retained messages keep their reasoning.
-The native summarization subagent's content-only prompt remains unchanged.
+Harbor's compaction prompts and summary handoff run unchanged.
 
 Each context summarization Harbor performs (proactive at `proactive_summarization_threshold` free
 tokens, or after a context-length error) is reported as a completed, failed or aborted
