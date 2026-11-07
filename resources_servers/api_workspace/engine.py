@@ -179,9 +179,11 @@ def _creation_for_score(collection: str, row: dict[str, Any]) -> str:
 def _partial(world: Workspace, expected: dict[str, Any]) -> dict[str, Any]:
     """Per-assertion record kept beside the binary reward; it never changes the reward.
 
-    Each required update, deletion and creation is one assertion. Preservation of
-    every other record and each named guard (for example a recipient that must not
-    receive mail) counts only when broken, so a no-op scores 0 and full success 1.
+    Each required update, deletion and creation is one assertion. A wrong creation
+    (wrong fields or the wrong vendor) or an undone deletion only fails its
+    assertion. Guards count collateral damage: a changed unrelated record, more
+    records created in a collection, across vendors, than the task creates there,
+    or mail to a named guard recipient. A no-op scores 0 and full success 1.
     """
     scenario, actual_world = world.scenario, world.records
     passed = 0
@@ -195,6 +197,10 @@ def _partial(world: Workspace, expected: dict[str, Any]) -> dict[str, Any]:
         targeted.setdefault((goal["vendor"], goal["collection"]), set()).add(goal["id"])
         passed += goal["id"] not in actual_world.get(goal["vendor"], {}).get(goal["collection"], {})
     broken = 0
+    # Created records counted by collection across vendors: one made on the wrong
+    # vendor is a wrong creation, and only records beyond the wanted count are stray.
+    made_count: dict[str, int] = {}
+    wanted_count: dict[str, int] = {}
     for vendor in set(expected) | set(actual_world):
         collections = expected.get(vendor, {})
         if set(actual_world.get(vendor, {})) != set(collections):
@@ -216,13 +222,15 @@ def _partial(world: Workspace, expected: dict[str, Any]) -> dict[str, Any]:
                 for identity, row in actual.items()
                 if identity not in records and identity not in initial
             )
-            reintroduced = any(identity in initial and identity not in records for identity in actual)
             remaining = list(made)
             for item in wanted:
                 if item in remaining:
                     remaining.remove(item)
                     passed += 1
-            broken += bool(changed or remaining or reintroduced)
+            made_count[collection] = made_count.get(collection, 0) + len(made)
+            wanted_count[collection] = wanted_count.get(collection, 0) + len(wanted)
+            broken += changed
+    broken += sum(count > wanted_count[collection] for collection, count in made_count.items())
     for guard in scenario.guards:
         rows = actual_world.get(guard["vendor"], {}).get("messages", {})
         initial = world.initial.get(guard["vendor"], {}).get("messages", {})

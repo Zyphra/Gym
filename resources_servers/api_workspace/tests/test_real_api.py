@@ -78,11 +78,17 @@ def test_every_v5_task_gold_noop_missing_guard_and_wrong_value(family):
             assert all(_apply(gold, plan)), identity
             score = gold.score()
             assert score["reward"] == 1 and score["assertions"]["partial"] == 1, (identity, score)
-            for broken in (plan[:-1], plan + [guard_breach(scenario)], wrong_value(plan)):
+            for broken, guarded in (
+                (plan[:-1], False),
+                (plan + [guard_breach(scenario)], True),
+                (wrong_value(plan), False),
+            ):
                 world = Workspace(scenario)
                 _apply(world, broken)
                 result = world.score()
                 assert result["reward"] == 0 and result["assertions"]["partial"] < 1, (identity, result)
+                # A missing or wrong write fails only its assertion; the extra action breaks a guard.
+                assert bool(result["assertions"]["guards_broken"]) is guarded, (identity, result)
             assert json.dumps(scenario.records, sort_keys=True) == json.dumps(
                 scenario_from_id(identity).records, sort_keys=True
             )

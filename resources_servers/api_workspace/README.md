@@ -54,7 +54,7 @@ Each world connects one of two fictional vendors per app; the other answers 401.
 
 [scenarios.py](scenarios.py) defines 12 multi-app workflow templates (`rx_*`). Each reads a current policy stated either in a mailbox email or in a spreadsheet tab, next to a superseded version, writes to at least two apps, and has guards: recipients that must not be emailed and records that must stay unchanged. Variants change names, counts, values, decision boundaries, connected vendors (including REST or GraphQL CRM), policy location and prompt layout. TRAIN has 80 variants per template (**960 tasks**) and VAL eight (**96 tasks**) from different seeds. Construction uses no model calls, external task corpus or benchmark records.
 
-The reward is the same binary final-state score as V4. `/verify` also returns `task_evidence.api_workspace_grading`: each required update, creation and deletion is one assertion, broken guards are added to the denominator, and `partial` is passed over that total. It is recorded for analysis and never changes the reward. V4 sessions return the same record.
+The reward is the same binary final-state score as V4. `/verify` also returns `task_evidence.api_workspace_grading`: each required update, creation and deletion is one assertion, and `partial` is passed over that total plus broken guards. A wrong creation (wrong fields or the wrong vendor) or an undone deletion only fails its assertion. A guard breaks on a changed unrelated record, on more records created in a collection across vendors than the task creates there, or on mail to a named guard recipient. The record is kept for analysis and never changes the reward. V4 sessions return the same record.
 
 ## Request and session behavior
 
