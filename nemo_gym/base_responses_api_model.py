@@ -66,6 +66,7 @@ from nemo_gym.model_call_capture_files import (
     RequestPrefixes,
     _append_locked,
     expand_request_prefixes,
+    read_capture,
     read_capture_bytes,
     sealed_capture_path,
 )
@@ -765,13 +766,17 @@ class CaptureStore:
         return [stripped for line in raw.split(b"\n") if (stripped := line.strip())]
 
     def read(self, rollout_id: str) -> list[dict[str, Any]]:
-        exchanges = list(expand_request_prefixes(orjson.loads(line) for line in self._lines(rollout_id)))
-        if any(exchange is None for exchange in exchanges):
-            raise ValueError(f"capture {rollout_id!r} references a request it does not hold")
-        return exchanges
+        try:
+            return read_capture(self.path_for(rollout_id), orjson.loads)
+        except FileNotFoundError:
+            return []
 
     def read_available(self, rollout_id: str) -> tuple[list[tuple[int, dict[str, Any]]], int]:
-        """Read valid exchanges without letting one damaged line hide the rest."""
+        """Read valid exchanges, counting damaged lines instead of raising.
+
+        A record stored as an extension of a damaged line cannot be rebuilt, so it counts as
+        damaged too; records that do not depend on the damaged line are still returned.
+        """
         parsed: list[Any] = []
         for line in self._lines(rollout_id):
             try:

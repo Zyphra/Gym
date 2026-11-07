@@ -23,7 +23,7 @@ from nemo_gym.base_responses_api_model import (
     clear_model_call_captures_for_rollouts,
     read_available_model_call_records,
 )
-from nemo_gym.model_call_capture_files import REQUEST_PREFIX_KEY, seal_capture
+from nemo_gym.model_call_capture_files import REQUEST_PREFIX_KEY, read_capture, seal_capture
 from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
 
@@ -214,6 +214,7 @@ def test_equal_messages_with_different_tools_are_distinct_bases(tmp_path):
         store.record("episode", call)
 
     assert store.read("episode") == calls
+    assert read_capture(store.path_for("episode")) == calls
     first, second, third = (line[REQUEST_PREFIX_KEY] for line in stored_lines(store, "episode"))
     assert first["sha256"] != second["sha256"]
     # The third request extends the request whose tools it shares, and inherits them.
@@ -236,5 +237,6 @@ def test_tool_sets_that_change_every_turn_round_trip(tmp_path, seal_after):
         store.record("episode", call)
 
     assert store.read("episode") == calls
+    assert read_capture(store.path_for("episode")) == calls
     exchanges, invalid = store.read_available("episode")
     assert invalid == 0 and [exchange for _, exchange in exchanges] == calls

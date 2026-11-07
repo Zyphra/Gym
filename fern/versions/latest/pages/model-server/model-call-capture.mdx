@@ -161,10 +161,10 @@ the same messages but different `tools` are different bases. Its `request.messag
 `request.input`) holds only the new messages, and non-scalar request fields that equal the base's
 (such as `tools`) are omitted. Sampling parameters and other scalar request fields are always
 stored. The first request of each session, and any request that rewrites earlier history (for
-example after compaction), is stored whole, so a single-call capture line contains the complete
-request. `CaptureStore.read`, `read_model_call_records` and `expand_request_prefixes` (in
-`nemo_gym.model_call_capture_files`) return full requests. A line whose base cannot be read is
-reported as damaged rather than guessed.
+example after compaction), is stored whole. Read captures through `read_capture` (in
+`nemo_gym.model_call_capture_files`), `CaptureStore.read` or `read_model_call_records`, which return
+full requests; parsing the stored lines directly returns partial requests. A line whose base cannot
+be read is reported as damaged rather than guessed.
 
 Writes are flushed and fsynced. Capture failures are logged without failing model requests. Resume
 attempts use an `-a<n>` suffix so their data does not mix with an earlier attempt. Before dispatch,

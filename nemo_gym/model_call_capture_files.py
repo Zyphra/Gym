@@ -16,8 +16,9 @@
 
 Writers append JSONL records under an exclusive ``flock``. ``seal_capture`` moves a
 capture's records into its zstd file (one frame per seal) and removes the plain file;
-later appends start a new plain file. Readers use ``open_capture``/``read_capture_bytes``,
-which return the sealed records followed by the plain ones. Standard library and
+later appends start a new plain file. Readers use ``read_capture``, which returns the
+sealed records followed by the plain ones with full requests; ``open_capture``/
+``read_capture_bytes`` return the stored bytes. Standard library and
 ``zstandard`` only, so offline readers need no server dependencies.
 
 An agentic request resends the whole conversation, so a record stores only the messages
@@ -280,6 +281,22 @@ def read_capture_bytes(path: str | Path) -> bytes:
     """The JSONL bytes of a capture, sealed or not (see ``open_capture``)."""
     with open_capture(path) as lines:
         return b"".join(lines)
+
+
+def read_capture(path: str | Path, loads: Callable[[bytes], Any] = json.loads) -> list[Any]:
+    """A capture's records in append order with full requests, sealed or not.
+
+    This is the reader for capture files: a stored record may hold only the messages its
+    base request lacked, so parsing lines directly returns partial requests. ``loads`` parses
+    one line. Raises ``ValueError`` (a ``JSONDecodeError`` for an unparsable line) when a line
+    cannot be read or names a base the capture does not hold.
+    """
+    records = [loads(line) for line in read_capture_bytes(path).split(b"\n") if line.strip()]
+    expanded = list(expand_request_prefixes(records))
+    for index, record in enumerate(expanded):
+        if record is None:
+            raise ValueError(f"capture {str(path)!r} line {index} references a request it does not hold")
+    return expanded
 
 
 def seal_capture(path: str | Path) -> bool:
