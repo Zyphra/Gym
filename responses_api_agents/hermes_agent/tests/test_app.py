@@ -16,7 +16,6 @@ import asyncio
 import json
 import os
 import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,7 +36,6 @@ from responses_api_agents.hermes_agent.app import (
     HermesAgentRunRequest,
     ModelServerRef,
     ResourcesServerRef,
-    _execute_every_tool_call,
     _split_input_to_user_and_history,
     _trajectory_to_output_items,
 )
@@ -417,21 +415,23 @@ class TestMaxTokens:
     def test_retained_context_stop_is_typed_and_other_errors_stay_failed(self, monkeypatch, context_stop):
         from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 
-        raw = json.loads((Path(__file__).parent / "fixtures/context-stop.json").read_text())
-        message = raw["error"]["message"] if context_stop else "API request failed"
+        message = "Your request grew too large for the model" if context_stop else "API request failed"
         agent, _ = self._agent_and_seen(
             monkeypatch,
+            # The terminal result shape of Hermes' agent/turn_overflow.py fail_turn.
             retained_result={
                 "error": message,
                 "completed": False,
                 "partial": True,
-                "api_calls": int(raw["metadata"]["turns"]),
+                "failed": True,
+                "failure_reason": "context_overflow" if context_stop else "invalid_response",
+                "api_calls": 109,
                 "messages": [{"role": "assistant", "content": "retained partial output"}],
             },
         )
         response = asyncio.run(agent._create_response(NeMoGymResponseCreateParamsNonStreaming(input="continue")))
         assert response.metadata["hermes_error"] == message
-        assert response.metadata["turns"] == raw["metadata"]["turns"]
+        assert response.metadata["turns"] == "109"
         if context_stop:
             assert response.status == "incomplete" and response.error is None
             assert response.metadata["stop_reason"] == "context_exhausted"
@@ -587,27 +587,6 @@ class TestObservability:
             )
 
 
-class TestEveryToolCallExecutes:
-    def test_hermes_guardrails_keep_duplicate_and_excess_delegate_calls(self) -> None:
-        from types import SimpleNamespace
-
-        from run_agent import AIAgent  # pyright: ignore[reportMissingImports]
-        from tools.delegate_tool import MAX_CONCURRENT_CHILDREN  # pyright: ignore[reportMissingImports]
-
-        def call(name: str, arguments: str) -> SimpleNamespace:
-            return SimpleNamespace(function=SimpleNamespace(name=name, arguments=arguments))
-
-        calls = [call("terminal", '{"command": "ls"}'), call("terminal", '{"command": "ls"}')] + [
-            call("delegate_task", json.dumps({"goal": str(index)})) for index in range(MAX_CONCURRENT_CHILDREN + 1)
-        ]
-        agent = object.__new__(AIAgent)
-        # Stock Hermes drops the duplicate and the delegate call past the cap.
-        assert len(agent._cap_delegate_task_calls(agent._deduplicate_tool_calls(calls))) == len(calls) - 2
-
-        _execute_every_tool_call(agent)
-        assert agent._cap_delegate_task_calls(agent._deduplicate_tool_calls(calls)) == calls
-
-
 class _ScriptedChatServer:
     """OpenAI chat-completions endpoint that replays scripted assistant turns."""
 
@@ -617,6 +596,7 @@ class _ScriptedChatServer:
 
         self.turns = list(turns)
         self.requests: list[dict] = []
+        self.probes: list[str] = []
         server = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -625,6 +605,11 @@ class _ScriptedChatServer:
 
             def do_POST(self) -> None:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if not self.path.endswith("/chat/completions"):
+                    # Hermes' local-server probes (Ollama /api/show for num_ctx) are not policy turns.
+                    server.probes.append(self.path)
+                    self.send_error(404)
+                    return
                 server.requests.append(body)
                 message = server.turns.pop(0) if server.turns else {"role": "assistant", "content": "unscripted"}
                 choice = {
@@ -698,7 +683,6 @@ class TestFinishTool:
                 enabled_toolsets=["terminal", "file"],
                 disabled_toolsets=["code_execution"],
                 compression_enabled=False,
-                chat_template_kwargs_enabled=False,
                 **config_kwargs,
             ),
             server_client=server_client,

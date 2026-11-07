@@ -36,29 +36,38 @@ Example training reward for small multi environment test is shown [here](https:/
 
 Runs [hermes-agent](https://github.com/NousResearch/hermes-agent) in a nemo gym agent server via the `run_agent.AIAgent` entrypoint, which matches the hermes-agent CLI and user experience. Can be used for benchmarks with hermes agent, or training in the harness.
 
-Every newly produced tool result is limited to **20,000 characters, including a
-truncation note**. Smaller results remain unchanged. This applies to every tool
-and both sequential and concurrent execution, for all Hermes lanes. It bounds
-each result, not the combined observations from a multi-tool turn or the total
-context. Earlier history, assistant reasoning, tool IDs, execution and rewards
-are unchanged. The pinned Hermes runtime's `file_read_max_chars` setting covers
-file reads only; its larger general result ceiling is hardcoded, so Gym applies
-this limit at the common tool-dispatch boundary.
-
-Focused CPU controls exercise real Hermes search execution and preserve small
-results, previous history and thinking. They do not establish a model pass-rate
-gain or qualify a changed source under an earlier end-to-end run. Run the focused
-controls with the declared Hermes runtime and selected Gym source:
-
-```bash
-python -m unittest responses_api_agents.hermes_agent.tests.test_tool_results -v
-```
-
 ## Setup
 
-`hermes-agent` is pinned in `requirements.txt` to a fork branch with patches for token id tracking, chat template, and sampling parameters needed for training.
+Hermes runs unmodified: `scripts/hermes_agent_deps.sh` pins a NousResearch/hermes-agent
+commit, places that source tree in the agent runtime and installs Hermes' own `uv.lock`
+(Python 3.14), then Gym's dependencies. Hermes refuses wheel builds, so it is not listed in
+`requirements.txt`. Where the two lock files pin different versions, Gym's pin wins (the OpenAI
+SDK: Gym mirrors its audited version's Responses types).
 
-For agent integrations like this, the agent must point at Gym's model server, it must include prompt and generation token id in requests for Nemo RL and other trainer integration on policy token id correction, it must not override sampling parameters like temperature and top p, and it must preserve sampled reasoning in retained history. When compression is enabled, Hermes runs its stock compressor (`agent/context_compressor.py`) unchanged, and its `call_llm(task="compression")` request is answered by the calling run's policy client, model and rollout URL, as a self-hosted deployment without an auxiliary provider resolves it. The request is Hermes' own: one user message, no tools, Hermes' summary `max_tokens` and temperature. An empty summary leaves only the compaction marker and a failed call drops the middle turns; the run continues in both cases.
+Gym adds no Hermes behaviour. Training data comes from the policy endpoint, which records the
+served prompt and generated token IDs, log probabilities and routes; Hermes' messages are not
+read for tokens. Sampling parameters are the endpoint's: Hermes sends no temperature, top-p or
+top-k on its turns or on its compression summary, so both are sampled at the run's policy
+settings. Hermes is configured only through its own `config.yaml` and constructor:
+
+- `provider: custom` with the run's rollout URL, so Hermes' auxiliary routing sends the
+  compression summary to the same per-run endpoint and model;
+- `model.context_length` from `context_window`, `model.streaming: false`;
+- `compression.threshold` / `target_ratio` from the fields below;
+- `auxiliary.title_generation.enabled: false` and no background review, so the compression
+  summary is the only auxiliary request that reaches the policy;
+- `auxiliary.compression.timeout` from `api_timeout`.
+
+Hermes streams its compression request; the rollout endpoint serves whole completions only and
+refuses it, and Hermes repeats the request without streaming. When the endpoint ends an episode
+(an empty reply with a stop reason and no sampled tokens), Gym stops the run at Hermes' own
+interrupt check, as the `finish` tool does, instead of letting Hermes nudge or retry.
+
+The Gym-side controls run real Hermes against a recording OpenAI-compatible endpoint:
+
+```bash
+python -m pytest responses_api_agents/hermes_agent/tests -q
+```
 
 ## Resources server compatibility
 
@@ -81,7 +90,6 @@ hermes_agent:
       enabled_toolsets: [terminal, file, code_execution]
       max_turns: 30
       concurrency: 32
-      temperature: 1.0
       system_prompt: |
         your system prompt here.
 ```
@@ -93,7 +101,6 @@ hermes_agent:
 | `model` | `null` | served model id; defaults to `model_server.name` for backward compatibility |
 | `max_turns` | `30` | maps to `AIAgent.max_iterations` |
 | `concurrency` | `32` | max simultaneous `run()` calls |
-| `temperature` | `1.0` | sampling temperature passed to `AIAgent` |
 | `terminal_backend` | `local` | sets `TERMINAL_ENV` (process-global); `local`, `docker`, `daytona`, `modal`, `ssh` |
 | `terminal_timeout` | `60` | sets `TERMINAL_TIMEOUT` (process-global); per-command wall-clock seconds |
 | `system_prompt` | `null` | passed as `system_message` to `run_conversation`; falls back to any system item in `body.input` |
@@ -101,30 +108,9 @@ hermes_agent:
 
 The model-server url is resolved at request time and passed to `AIAgent(base_url=..., api_key="gym")`. <!-- pragma: allowlist secret -->
 
-`context_window` binds the native compressor to the served model window; model-name fallback metadata must not override a configured training window. `compression_threshold` (default `0.50`, Hermes' `compression.threshold` default) is the fraction of that window at which Hermes compresses. `compression_summary_temperature` (default `null`) replaces the temperature of the compression request; `null` keeps Hermes' own `0.3`.
-
-### Summary output budget
-
-`compression_summary_max_output_tokens` defaults to `32768` and projects to
-Hermes' `compression.summary_max_output_tokens`. It includes reasoning and visible
-summary tokens. Thinking and the visible-summary target remain unchanged;
-`compression_target_ratio` only controls recent-tail retention. Choose an output
-budget that fits the policy model's context window together with the summary input.
-Requires the Hermes runtime's summary-output-budget configuration support.
-
-`compression_summary_keep_first_copy` (default `false`) cuts a visible summary that
-restarts at its own first heading (the template written twice) to its first copy
-before Hermes reads it. Hermes' summary guard rejects a summary with a repeated
-heading and keeps the old context, so the run re-compacts on its next turn; with
-this option such a summary is accepted once. The served completion, including both
-copies, is unchanged. Other repeated headings, empty and length-cut summaries still
-reach the guard.
-
-## Local command output budget
-
-The pinned Hermes source bounds command output while it drains the process.
-Above 64 MiB it kills the owned command group and returns exit125 with a bounded
-head/tail observation, so runaway output cannot keep growing the agent's buffer.
-Finite file-operation reads remain complete within that budget; terminal display
-keeps its existing presentation limit. Existing sealed runtime archives need to
-be rebuilt and selected explicitly to consume this source change.
+`context_window` binds Hermes' compressor to the served model window. `compression_threshold`
+(default `0.50`) is Hermes' `compression.threshold`: Hermes compresses when the provider-reported
+prompt reaches that fraction of the window less the turn's output reserve (`max_tokens`), with a
+floor of 0.75 for windows under 512K tokens. A threshold of `1.0` therefore compresses when the
+next turn could no longer receive its full `max_tokens`. `compression_target_ratio` is Hermes'
+`compression.target_ratio`; Hermes' default `lean` tail mode keeps a 10K-25K token recent tail.
