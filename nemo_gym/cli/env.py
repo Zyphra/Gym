@@ -27,7 +27,7 @@ from subprocess import Popen, TimeoutExpired
 from tempfile import TemporaryDirectory
 from threading import Thread
 from time import monotonic, sleep, time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import rich
@@ -666,23 +666,38 @@ Process `{process_name}` stderr:
         deadline = monotonic() + graceful_timeout
         killed_process_names: List[str] = []
         unreaped_process_names: List[str] = []
+        # Drain first: every child gets what is left of the one shared deadline.
+        stragglers: Dict[str, Any] = {}
         for process_name, process in self._processes.items():
             try:
                 process.wait(timeout=max(0.0, deadline - monotonic()))
             except TimeoutExpired:
-                if process in owned_groups:
-                    try:
-                        os.killpg(process.pid, SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    process.kill()
-                killed_process_names.append(process_name)
-                # Reap the child after SIGKILL to avoid leaving a <defunct> entry.
+                stragglers[process_name] = process
+        # Then terminate all stragglers at once and reap them against one shared
+        # deadline, so N stubborn children cost one reap window, not N.
+        for process_name, process in stragglers.items():
+            print(
+                f"[gym-child-live] name={json.dumps(process_name)} pid={process.pid} "
+                f"cmd={json.dumps(getattr(process, 'args', None), default=str)}",
+                flush=True,
+            )
+        for process_name, process in stragglers.items():
+            if process in owned_groups:
                 try:
-                    process.wait(timeout=_FORCE_KILL_REAP_TIMEOUT_SEC)
-                except TimeoutExpired:
-                    unreaped_process_names.append(process_name)
+                    os.killpg(process.pid, SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
+            killed_process_names.append(process_name)
+        reap_deadline = monotonic() + _FORCE_KILL_REAP_TIMEOUT_SEC
+        for process_name, process in stragglers.items():
+            # Reap the child after SIGKILL to avoid leaving a <defunct> entry.
+            try:
+                process.wait(timeout=max(0.0, reap_deadline - monotonic()))
+            except TimeoutExpired:
+                unreaped_process_names.append(process_name)
+        for process_name, process in self._processes.items():
             # Popen retains the unmodified wait result (negative for signals).
             # Log every owned child before discarding the process table; an
             # unreaped child remains explicitly unknown, never a clean exit.
