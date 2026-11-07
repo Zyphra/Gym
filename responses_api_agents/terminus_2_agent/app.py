@@ -61,6 +61,7 @@ from nemo_gym.openai_utils import (
 from nemo_gym.rollout_observability import (
     AgentInvocation,
     AgentObservationBundle,
+    CompactionHandoffCall,
     ContextCompactionObservation,
     ObservationGap,
 )
@@ -129,13 +130,21 @@ def _action_reply(content: str) -> Optional[dict[str, Any]]:
 
 def handoff_text(content: str, reasoning: Optional[str]) -> str:
     """The text a compaction subagent hands on: its reply, or its draft when it replied with an action."""
+    return handoff(content, reasoning)[0]
+
+
+def handoff(content: str, reasoning: Optional[str]) -> tuple[str, str]:
+    """The handed-on text and its source: ``content``, ``reasoning_fallback``, ``prose_fallback`` or ``empty``."""
     action = _action_reply(content)
-    if action is None:
-        return content
-    if reasoning and reasoning.strip():
-        return reasoning.strip()
-    prose = [action.get(key) for key in ("analysis", "plan")]
-    return "\n\n".join(text.strip() for text in prose if isinstance(text, str) and text.strip()) or content
+    text, source = content, "content"
+    if action is not None and reasoning and reasoning.strip():
+        text, source = reasoning.strip(), "reasoning_fallback"
+    elif action is not None:
+        prose = [action.get(key) for key in ("analysis", "plan")]
+        joined = "\n\n".join(item.strip() for item in prose if isinstance(item, str) and item.strip())
+        if joined:
+            text, source = joined, "prose_fallback"
+    return text, source if text.strip() else "empty"
 
 
 def _extract_instruction(body_input: Any) -> tuple[str, Optional[str]]:
@@ -443,6 +452,7 @@ class StandaloneTerminus2(ServedContextTerminus2):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._compactions: list[ContextCompactionObservation] = []
+        self._handoff_calls: list[CompactionHandoffCall] = []
         self._compaction_trigger = "context_length_exceeded"
         # Harbor unwinds an overflowing history before summarizing what is left: its size before unwinding.
         self._unwound_from_tokens: Optional[int] = None
@@ -480,6 +490,7 @@ class StandaloneTerminus2(ServedContextTerminus2):
         overflowing history to it. Recording never changes the hand-off's result or error.
         """
         tokens_before, self._unwound_from_tokens = self._unwound_from_tokens, None
+        self._handoff_calls = []
         if not chat.messages and tokens_before is None:
             return await super()._summarize(chat, original_instruction, *args, **kwargs)
         if tokens_before is None:
@@ -509,6 +520,7 @@ class StandaloneTerminus2(ServedContextTerminus2):
                         tokens_before=tokens_before if type(tokens_before) is int and tokens_before >= 0 else None,
                         outcome=outcome,
                         summary=summary if isinstance(summary, str) else None,
+                        handoff_calls=list(self._handoff_calls),
                     )
                 )
             except Exception:
@@ -553,7 +565,17 @@ class StandaloneTerminus2(ServedContextTerminus2):
         response, trajectory_ref = await super()._run_subagent(
             prompt + HANDOFF_TEXT_CONTRACT, *args, agent_name=agent_name, **kwargs
         )
-        text = handoff_text(response.content or "", response.reasoning_content)
+        content, reasoning = response.content or "", response.reasoning_content or ""
+        text, source = handoff(content, reasoning)
+        self._handoff_calls.append(
+            CompactionHandoffCall(
+                call=agent_name.rsplit("-", 1)[-1],
+                handoff_source=source,
+                content_is_json_action=_action_reply(content) is not None,
+                content_bytes=len(content.encode()),
+                reasoning_bytes=len(reasoning.encode()),
+            )
+        )
         return dataclasses.replace(response, content=text), trajectory_ref
 
     async def run(self, instruction: str, environment: LocalEnvironment, context: AgentContext) -> None:
