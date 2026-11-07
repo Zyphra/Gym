@@ -109,6 +109,15 @@ HANDOFF_SUBAGENTS = frozenset(
         "terminus-2-summarization-answers",
     }
 )
+# Harbor's summary prompt does not ask for the edited files or the last check, and summaries lose them
+# compaction by compaction (run 245281: 24.6% of first summaries recall every edited file, 8.4% of
+# third ones). The summary request, and the answers request that replays it, carry this ask.
+SUMMARY_HANDOFF_ASK = """
+
+Also include:
+5. **Files Created or Modified** - Every file you created or modified, each with its full path.
+6. **Last Test or Verification** - The last test or verification command you ran, exactly as you
+            ran it, and its result."""
 
 
 def _action_reply(content: str) -> Optional[dict[str, Any]]:
@@ -445,6 +454,7 @@ class StandaloneTerminus2(ServedContextTerminus2):
         super().__init__(*args, **kwargs)
         self._compactions: list[ContextCompactionObservation] = []
         self._handoff_calls: list[CompactionHandoffCall] = []
+        self._summary_prompt: Optional[str] = None
         self._compaction_trigger = "context_length_exceeded"
         # Harbor unwinds an overflowing history before summarizing what is left: its size before unwinding.
         self._unwound_from_tokens: Optional[int] = None
@@ -482,7 +492,7 @@ class StandaloneTerminus2(ServedContextTerminus2):
         overflowing history to it. Recording never changes the hand-off's result or error.
         """
         tokens_before, self._unwound_from_tokens = self._unwound_from_tokens, None
-        self._handoff_calls = []
+        self._handoff_calls, self._summary_prompt = [], None
         if not chat.messages and tokens_before is None:
             return await super()._summarize(chat, original_instruction, *args, **kwargs)
         if tokens_before is None:
@@ -546,9 +556,30 @@ class StandaloneTerminus2(ServedContextTerminus2):
     def finished_naturally(self) -> bool:
         return getattr(self, "_consecutive_completion_claims", 0) >= 2
 
-    async def _run_subagent(self, prompt: str, *args: Any, agent_name: str, **kwargs: Any) -> tuple[Any, ...]:
-        """Record what each compaction subagent handed on; Harbor's request and handoff run unchanged."""
-        response, trajectory_ref = await super()._run_subagent(prompt, *args, agent_name=agent_name, **kwargs)
+    async def _run_subagent(
+        self, prompt: str, message_history: list[dict], *args: Any, agent_name: str, **kwargs: Any
+    ) -> tuple[Any, ...]:
+        """Add the edited-files ask to Harbor's summary prompt and record what each compaction call handed on.
+
+        The answers call replays the summary exchange, so its copy of the summary prompt, in the request and
+        in its trajectory, gains the same ask.
+        """
+        if agent_name == "terminus-2-summarization-summary":
+            self._summary_prompt = prompt
+            prompt += SUMMARY_HANDOFF_ASK
+        elif agent_name == "terminus-2-summarization-answers" and self._summary_prompt is not None:
+            message_history = [
+                {**message, "content": message["content"] + SUMMARY_HANDOFF_ASK}
+                if message.get("role") == "user" and message.get("content") == self._summary_prompt
+                else message
+                for message in message_history
+            ]
+            for step in kwargs.get("steps", []):
+                if step.source == "user" and step.message == self._summary_prompt:
+                    step.message += SUMMARY_HANDOFF_ASK
+        response, trajectory_ref = await super()._run_subagent(
+            prompt, message_history, *args, agent_name=agent_name, **kwargs
+        )
         if agent_name in HANDOFF_SUBAGENTS:
             content, reasoning = response.content or "", response.reasoning_content or ""
             self._handoff_calls.append(
