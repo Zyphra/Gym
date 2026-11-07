@@ -597,6 +597,7 @@ signal.pause()
     def test_stubborn_children_cost_one_drain_and_one_reap_window(self, capsys) -> None:
         """Three children that ignore SIGINT and cannot be reaped (uninterruptible sleep)
         are listed once, killed together, and reaped against one shared deadline."""
+
         def stubborn(name: str) -> MagicMock:
             child = MagicMock()
             child.pid = 1000 + len(name)
