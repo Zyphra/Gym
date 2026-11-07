@@ -581,12 +581,30 @@ async def test_private_setup_timeout_is_retained_and_classified(tmp_path, monkey
     assert (params.persistent_dir / "setup.stderr").read_text() == "deadline\n"
 
 
+# Hero 241110 scale_swe grader verdicts for test sessions that ran out of budget on
+# rows other sessions resolved (nemo_service/nodes/*/results/anyswe_results_*/grader.stdout).
+_RECORDED_TEST_BUDGET_VERDICTS = [
+    'SCALESWE_VERDICT {"cause": "test_budget_exhausted", "exit": 80, "outcome": "infra", '
+    f'"row": "{row}", "stage": "tests", "test_budget_s": {budget}}}'
+    for row, budget in (
+        ("pyout_pyout_pr108", 1739.36),
+        ("joblib_joblib_pr1463", 1737.71),
+        ("python-poetry_cleo_pr13", 1739.64),
+        ("dwavesystems_dwave-cloud-client_pr222", 1739.35),
+    )
+]
+
+
 @pytest.mark.parametrize(
     ("result", "expected"),
     [
+        *[
+            (SandboxExecResult(verdict + "\n", "", 80), (False, None, "grader test budget exhausted rc=80"))
+            for verdict in _RECORDED_TEST_BUDGET_VERDICTS
+        ],
         (SandboxExecResult("passed", "", 0), (True, None, None)),
         (SandboxExecResult("failed", "", 86), (False, None, None)),
-        (SandboxExecResult("timed out", "", 80), (False, "eval_timeout", "grader exec error_type=None rc=80")),
+        (SandboxExecResult("timed out", "", 80), (False, None, "grader test budget exhausted rc=80")),
         (SandboxExecResult("broken", "", 17), (False, "grader", "grader exec error_type=None rc=17")),
         (
             SandboxExecResult("", "transport", 1, "sandbox"),
@@ -1112,6 +1130,8 @@ class TestSandboxAPI:
         assert not _should_mask_sample(True, "other", False, None)
         assert _should_mask_sample(False, None, True, None)
         assert _should_mask_sample(False, None, False, "eval_timeout")
+        # A test-budget exhaustion returns no error kind: a scored, unresolved 0.
+        assert not _should_mask_sample(False, None, False, None)
         assert _should_mask_sample(False, None, False, "sandbox")
         assert _should_mask_sample(False, None, False, "grader")
         assert not _should_mask_sample(False, None, False, "eval_error")

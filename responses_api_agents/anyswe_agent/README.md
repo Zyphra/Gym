@@ -58,8 +58,11 @@ A `private_grader` configuration names `target` (`module:function(payload,
 patch)` returning the grading command, working directory, environment and
 files), the row `metadata_key` holding the private payload, an
 `unresolved_return_code` and an optional `timeout_return_code`. Exit `0`
-resolves, the unresolved code is an ordinary `0` reward, the timeout code is an
-evaluation timeout, and any other result is a grader error and masked. Called
+resolves, the unresolved code is an ordinary `0` reward, the timeout code (the
+submitted code's tests exhausted their budget) is also an unresolved `0`, as the
+SWE-bench harness counts a test timeout, and any other result is a grader error
+and masked. A grader exec that the sandbox itself times out stays an evaluation
+timeout and is masked. Called
 with no patch, the same target supplies the setup command that runs before the
 agent starts. A configuration may also set `swe_grader`, a trusted
 `module:function(instance, patch)` returning `{"script": ..., "grade":
