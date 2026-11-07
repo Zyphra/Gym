@@ -158,6 +158,21 @@ class SandboxObservation(ObservationModel):
     error_type: Optional[str] = None
 
 
+class CompactionHandoffCall(ObservationModel):
+    """What one compaction call (summary, questions or answers) handed to the next agent."""
+
+    call: Literal["summary", "questions", "answers"]
+    handoff_source: Literal["content", "reasoning_fallback", "prose_fallback", "empty"] = Field(
+        description=(
+            "content: the reply as generated; reasoning_fallback / prose_fallback: the reply was an action and "
+            "its reasoning (else its analysis and plan) was handed on instead; empty: nothing was handed on."
+        )
+    )
+    content_is_json_action: bool
+    content_bytes: int = Field(ge=0)
+    reasoning_bytes: int = Field(ge=0)
+
+
 class ContextCompactionObservation(ObservationModel):
     """An explicit context-compaction event reported by the Agent harness."""
 
@@ -192,6 +207,10 @@ class ContextCompactionObservation(ObservationModel):
     after_model_call: Optional[ModelCallRef] = Field(
         default=None,
         description="First invocation model call observed after compaction.",
+    )
+    handoff_calls: list[CompactionHandoffCall] = Field(
+        default_factory=list,
+        description="Per compaction call, the source of the text handed to the next agent, when the harness reports it.",
     )
 
 
