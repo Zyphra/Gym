@@ -23,7 +23,7 @@ import tempfile
 from asyncio import Semaphore
 from collections.abc import Mapping
 from time import time
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
 import model_tools  # noqa: F401  # fail-fast if hermes-agent isn't installed  # pyright: ignore[reportMissingImports]
@@ -325,6 +325,10 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # Hermes' compression.target_ratio: the kept recent tail as a fraction of the threshold.
     # None keeps Hermes' default (0.20).
     compression_target_ratio: float | None = Field(default=None, ge=0.10, le=0.80, allow_inf_nan=False)
+    # Hermes' compression.tail_mode (hermes_cli/config_defaults.py): "lean" (Hermes' default) adds a
+    # detailed session log to the summary request and a clamped tail; "legacy" keeps the structured
+    # summary and the target_ratio tail. None keeps Hermes' default.
+    compression_tail_mode: Literal["lean", "legacy"] | None = None
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
     checkpoints_enabled: bool = False
@@ -429,6 +433,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 **(
                     {"target_ratio": self.config.compression_target_ratio}
                     if self.config.compression_target_ratio is not None
+                    else {}
+                ),
+                **(
+                    {"tail_mode": self.config.compression_tail_mode}
+                    if self.config.compression_tail_mode is not None
                     else {}
                 ),
             },

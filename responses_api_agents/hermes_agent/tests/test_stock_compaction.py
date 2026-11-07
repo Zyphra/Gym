@@ -265,19 +265,21 @@ def test_hermes_config_carries_the_compaction_trigger(monkeypatch, tmp_path):
             native_agents,
             compression_threshold=0.75,
             compression_target_ratio=0.10,
+            compression_tail_mode="legacy",
             api_timeout=5400,
         )
         _run(app, "hi", "rollout-c")
     import os
 
     written = yaml.safe_load((Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text())
-    assert written["compression"] == {"enabled": True, "threshold": 0.75, "target_ratio": 0.10}
+    assert written["compression"] == {"enabled": True, "threshold": 0.75, "target_ratio": 0.10, "tail_mode": "legacy"}
     assert written["model"]["context_length"] == CONTEXT_WINDOW and written["model"]["streaming"] is False
     assert written["auxiliary"] == {"title_generation": {"enabled": False}, "compression": {"timeout": 5400}}
     [native] = native_agents
     compressor = native.context_compressor
     assert compressor.context_length == CONTEXT_WINDOW
     assert compressor.threshold_percent == 0.75 and compressor.summary_target_ratio == 0.10
+    assert compressor.tail_mode == "legacy"
     # Hermes probes a local server for an Ollama context size; that is not a policy request.
     assert {path for path, _ in policy.requests} == {"/ng-rollout/rollout-c/v1/chat/completions"}
 
