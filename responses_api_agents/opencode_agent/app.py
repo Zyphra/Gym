@@ -568,11 +568,14 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 {"baseURL": self._resolve_model_base_url(rollout_id), "apiKey": "EMPTY"}  # pragma: allowlist secret
             )
             model = nemo.setdefault("models", {}).get(self.config.model, {})
+            # The reasoning field name depends on the OpenCode release and the server
+            # (`reasoning` for current ones; 1.14.x accepts only `reasoning_content` or
+            # `reasoning_details`), so a configured value wins over this default.
+            model.setdefault("interleaved", {"field": "reasoning"})
             self._deep_merge(
                 model,
                 {
                     "name": self.config.model,
-                    "interleaved": {"field": "reasoning"},
                     "limit": {"context": self.config.context_window, "output": self.config.max_output_tokens},
                 },
             )
