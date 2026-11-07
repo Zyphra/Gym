@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import binascii
 import email
+import email.errors
 import email.policy
 import hashlib
 import json
@@ -387,6 +388,53 @@ def _addresses(message: Any, header: str) -> list[str]:
     return found
 
 
+# Header names a sent message may carry. Any other name in the header block is body text
+# that ended up above the blank line (``Body: ...``), so its text would be lost.
+_MAIL_HEADERS = {
+    "to", "cc", "bcc", "from", "sender", "reply-to", "subject", "date", "message-id", "in-reply-to",
+    "references", "comments", "keywords", "mime-version", "content-type", "content-transfer-encoding",
+    "content-disposition", "content-id", "content-description", "content-language", "importance", "priority",
+    "thread-topic", "thread-index", "return-path", "received",
+}  # fmt: skip
+_ENCODE_HINT = (
+    "Write the message as headers (To, Cc, Subject) one per line, then one empty line, then the body, using "
+    "real line-break characters (CR LF or LF), not the typed text backslash-r backslash-n; then base64url-encode "
+    "that text into raw (workspace_codec encode does this)."
+)
+_LITERAL_BREAK = re.compile(r"\\[rn]")
+
+
+def _mime_layout_error(message: Any) -> str | None:
+    """Explain why a decoded message's layout loses its text, or None when it is well formed."""
+    for part in message.walk():
+        for defect in part.defects:
+            if isinstance(defect, email.errors.MissingHeaderBodySeparatorDefect):
+                return (
+                    "The decoded message has no empty line between its headers and its body, so the first body "
+                    f"line was read as a malformed header. {_ENCODE_HINT}"
+                )
+    for name, value in message.raw_items():
+        escape = _LITERAL_BREAK.search(value)
+        if escape:
+            return (
+                f"The {name} header holds typed backslash-{escape.group()[1]} text where a line break was meant, so "
+                f"the following headers and the body ran into it. {_ENCODE_HINT}"
+            )
+        if name.lower() not in _MAIL_HEADERS and not name.lower().startswith("x-"):
+            return (
+                f"'{name}: {value.strip()[:40]}' is in the header block but {name!r} is not a mail header; the "
+                f"body was likely written before the empty line that ends the headers. {_ENCODE_HINT}"
+            )
+    return None
+
+
+def _literal_body_breaks(text: str) -> bool:
+    """A body whose line breaks arrived as backslash escapes instead of newline characters."""
+    if "\\r\\n" in text or "\\n\\n" in text:
+        return True
+    return bool(_LITERAL_BREAK.search(text)) and "\n" not in text
+
+
 def _mail_send(world: Any, store: dict[str, Any], payload: Any) -> tuple[int, dict[str, Any]]:
     if payload is _ABSENT:
         raise _bad('Request body is required: {"raw": "<base64url-encoded RFC 2822 message>"}.')
@@ -409,6 +457,9 @@ def _mail_send(world: Any, store: dict[str, Any], payload: Any) -> tuple[int, di
     except ValueError as error:
         raise _bad("Invalid value at 'message.raw': it is not valid base64url.") from error
     message = email.message_from_bytes(data, policy=email.policy.default)
+    layout_error = _mime_layout_error(message)
+    if layout_error is not None:
+        raise _bad(layout_error)
     to, cc, bcc = (_addresses(message, header) for header in ("To", "Cc", "Bcc"))
     if not to + cc + bcc:
         raise _bad(
@@ -423,6 +474,11 @@ def _mail_send(world: Any, store: dict[str, Any], payload: Any) -> tuple[int, di
         text = part.get_content() if part is not None and part.get_content_maintype() == "text" else ""
     except (LookupError, ValueError) as error:
         raise _bad("The message body could not be decoded; use UTF-8 text.") from error
+    if isinstance(text, str) and _literal_body_breaks(text):
+        raise _bad(
+            "The message body holds typed backslash-n or backslash-r backslash-n text where line breaks were "
+            f"meant, so the recipient would see it verbatim. {_ENCODE_HINT}"
+        )
     thread = payload.get("threadId")
     if thread is not None:
         known = {_thread(row, key) for key, row in store["messages"].items()}
