@@ -27,7 +27,8 @@ install_portable_python() {
 # Task images without glibc (Alpine/musl) cannot exec the glibc CPython. Bundle the
 # build host's glibc loader and core libraries under $DEPS_DIR/glibc and replace the
 # interpreter entry points with a launcher that uses them only when the image has no
-# glibc loader. On musl images --argv0 keeps sys.executable on the launcher, so child
+# real glibc loader. Alpine images with gcompat ship a glibc-named loader shim over musl,
+# so a musl loader (/lib/ld-musl-x86_64.so.1) also selects the bundled glibc. On musl images --argv0 keeps sys.executable on the launcher, so child
 # interpreters come back through it; glibc images exec the interpreter directly. A
 # build host without these libraries fails the install instead of shipping a
 # glibc-only runtime.
@@ -52,7 +53,7 @@ install_glibc_launcher() {
     cat > "$DEPS_DIR/bin/$name" <<LAUNCHER
 #!/bin/sh
 R="\${0%/bin/*}"
-if [ -e /lib64/ld-linux-x86-64.so.2 ]; then exec "\$R/bin/$name.real" "\$@"; fi
+if [ -e "\${NGSWE_SYSROOT:-}/lib64/ld-linux-x86-64.so.2" ] && [ ! -e "\${NGSWE_SYSROOT:-}/lib/ld-musl-x86_64.so.1" ]; then exec "\$R/bin/$name.real" "\$@"; fi
 exec "\$R/glibc/ld-linux-x86-64.so.2" --library-path "\$R/glibc:\$R/lib" --argv0 "\$R/bin/$name" "\$R/bin/$name.real" "\$@"
 LAUNCHER
     chmod 755 "$DEPS_DIR/bin/$name"
