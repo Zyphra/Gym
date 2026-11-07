@@ -74,6 +74,14 @@ exactly at 18:00 is allowed). The tool returns an error naming the rule and chan
 and in the grader's replay, so a refused attempt followed by a legal booking scores like the legal booking alone.
 All 1,800 reference trajectories of the pinned `train` and `validation` exports satisfy the window.
 
+## Tool arguments
+
+A tool call whose arguments include a name its schema does not declare is refused before the tool runs, so no
+state changes. The error names the unknown parameter and lists the accepted ones, for example
+`Error executing tool 'calendar_search_events': unknown parameter 'participant_email'. Accepted parameters: query,
+time_min, time_max, page, page_size.`, followed by a hint when an accepted parameter's description already covers
+the name (`query` matches participant emails) or when the tool has no pagination. Grading replays calls unchanged.
+
 ## Generating Additional Training Data
 
 To generate your own training JSONL for this environment using NeMo Data Designer, see the [synthetic data generation example](notebooks/synthetic-data-generation/).

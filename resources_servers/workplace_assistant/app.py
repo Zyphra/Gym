@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import re
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
@@ -53,6 +54,39 @@ class WorkbenchVerifyRequest(BaseVerifyRequest):
 
 class WorkbenchVerifyResponse(BaseVerifyResponse):
     pass
+
+
+_PAGINATION_PARAMETERS = {"page", "page_size", "limit", "offset", "max_results"}
+
+
+def unknown_argument_error(tool_name: str, args: Dict[str, Any], schemas: List[Dict[str, Any]]) -> Optional[str]:
+    """Name the arguments a tool's schema does not accept, with the accepted list.
+
+    Without this the tool function raises a TypeError whose text never says
+    which parameters exist, so the model keeps guessing.
+    """
+    schema = next((s for s in schemas if s["name"] == tool_name), None)
+    if schema is None:
+        return None
+    properties = schema["parameters"].get("properties", {})
+    unknown = [name for name in args if name not in properties]
+    if not unknown:
+        return None
+    noun = "parameter" if len(unknown) == 1 else "parameters"
+    message = (
+        f"Error executing tool '{tool_name}': unknown {noun} {', '.join(repr(name) for name in unknown)}. "
+        f"Accepted parameters: {', '.join(properties) or '(none)'}."
+    )
+    hints = []
+    for name in unknown:
+        word = re.compile(rf"\b{re.escape(name)}\b")
+        covering = [p for p, spec in properties.items() if word.search(spec.get("description", ""))]
+        if covering:
+            description = properties[covering[0]]["description"].rstrip(".")
+            hints.append(f"Hint: pass the {name} value in '{covering[0]}' ({description}).")
+        elif name in _PAGINATION_PARAMETERS and not _PAGINATION_PARAMETERS & properties.keys():
+            hints.append(f"Hint: '{tool_name}' has no pagination; it returns every matching record in one response.")
+    return " ".join([message, *hints])
 
 
 class WorkbenchResourcesServer(SimpleResourcesServer):
@@ -102,6 +136,10 @@ class WorkbenchResourcesServer(SimpleResourcesServer):
 
         tool_env = self.session_id_to_tool_env[session_id]
         args = {key: value for key, value in body.model_dump(exclude_unset=True).items() if value is not None}
+
+        argument_error = unknown_argument_error(path, args, tool_env["schemas"])
+        if argument_error is not None:
+            return WorkbenchResponse(output=argument_error)
 
         try:
             function = tool_env["functions"][path]
