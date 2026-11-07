@@ -1614,7 +1614,7 @@ class TestApp:
 
     async def test_extra_arguments_error_handling(self, config: WorkbenchResourcesServerConfig) -> None:
         """
-        Tests if the server correctly handles a TypeError when a tool function is called with an unexpected keyword argument and hence will be added as part of model context
+        An argument outside the tool schema is refused with the accepted parameter list, returned to the model
         """
 
         mock_email_data = [
@@ -1662,7 +1662,7 @@ class TestApp:
 
             assert isinstance(response, WorkbenchResponse)
 
-            assert (
-                "get_email_information_by_id': EmailTool.get_email_information_by_id() got an unexpected keyword argument 'useless_argument'"
-                in response.output
+            assert response.output == (
+                "Error executing tool 'email_get_email_information_by_id': unknown parameter 'useless_argument'. "
+                "Accepted parameters: email_id, field."
             )
