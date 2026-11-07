@@ -156,13 +156,15 @@ for readability but stored as one JSONL line.
 
 An agentic request resends the whole conversation, so a line stores only the messages that an
 earlier request of the same rollout did not hold. Such a line carries a `request_prefix` entry that
-names its base request by digest. Its `request.messages` (or `request.input`) holds only the new
-messages, and non-scalar request fields that equal the base's (such as `tools`) are omitted.
-Sampling parameters and other scalar request fields are always stored. The first request of each
-session, and any request that rewrites earlier history (for example after compaction), is stored
-whole, so a single-call capture line contains the complete request. `CaptureStore.read`,
-`read_model_call_records` and `expand_request_prefixes` (in `nemo_gym.model_call_capture_files`)
-return full requests. A line whose base cannot be read is reported as damaged rather than guessed.
+names its base request by a digest of its messages and its non-scalar fields, so two requests with
+the same messages but different `tools` are different bases. Its `request.messages` (or
+`request.input`) holds only the new messages, and non-scalar request fields that equal the base's
+(such as `tools`) are omitted. Sampling parameters and other scalar request fields are always
+stored. The first request of each session, and any request that rewrites earlier history (for
+example after compaction), is stored whole, so a single-call capture line contains the complete
+request. `CaptureStore.read`, `read_model_call_records` and `expand_request_prefixes` (in
+`nemo_gym.model_call_capture_files`) return full requests. A line whose base cannot be read is
+reported as damaged rather than guessed.
 
 Writes are flushed and fsynced. Capture failures are logged without failing model requests. Resume
 attempts use an `-a<n>` suffix so their data does not mix with an earlier attempt. Before dispatch,

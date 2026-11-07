@@ -23,11 +23,12 @@ which return the sealed records followed by the plain ones. Standard library and
 An agentic request resends the whole conversation, so a record stores only the messages
 an earlier request of its rollout did not already hold (``RequestPrefixes``), and
 ``expand_request_prefixes`` rebuilds the full request. A record whose request carries a
-message list (``messages`` or ``input``) has a ``request_prefix`` entry: ``field``,
-``count`` and ``sha256`` name the full list and its digest chain. With ``base``
-(``sha256``, ``count``, ``inherit``) the stored list holds only the messages after the
-base request's ``count``, and each key in ``inherit`` (a non-scalar value such as
-``tools``) equals the base request's. Scalar request fields such as sampling parameters
+message list (``messages`` or ``input``) has a ``request_prefix`` entry: ``field`` and
+``count`` describe the full list, and ``sha256`` identifies the request by the digest chain
+of that list together with every non-scalar request field (such as ``tools``), so requests
+with equal messages but different tools are distinct bases. With ``base`` (``sha256``,
+``count``, ``inherit``) the stored list holds only the messages after the base request's
+``count``, and each key in ``inherit`` equals the base request's. Scalar request fields such as sampling parameters
 are always stored. A rollout's first request, and one that no earlier request prefixes
 (a compaction rewrite, or another session's first call), is stored whole.
 """
@@ -71,9 +72,10 @@ class RequestPrefixes:
     """Store each request as the messages its rollout's earlier requests did not hold.
 
     A process remembers the last ``bases_per_rollout`` requests it appended for each of its
-    ``rollouts`` most recent rollouts. A base is named by the digest chain of its message list,
-    so a reference resolves to the same messages wherever the base record now sits (plain or
-    sealed) and however other writers interleaved. ``encode`` returns the record to append and
+    ``rollouts`` most recent rollouts. A base is named by the digest chain of its message list
+    combined with the digests of its non-scalar fields, so a reference resolves to the same
+    messages and inherited fields wherever the base record now sits (plain or sealed) and
+    however other writers interleaved. ``encode`` returns the record to append and
     a callback that registers it as a base once the append has succeeded.
     """
 
@@ -81,7 +83,7 @@ class RequestPrefixes:
         self._rollouts = rollouts
         self._bases_per_rollout = bases_per_rollout
         self._lock = threading.Lock()
-        self._bases: OrderedDict[str, list[tuple[str, int, str, dict[str, bytes]]]] = OrderedDict()
+        self._bases: OrderedDict[str, list[tuple[str, int, str, str, dict[str, bytes]]]] = OrderedDict()
 
     def encode(
         self, rollout_id: str, exchange: dict[str, Any], capture_exists: bool
@@ -100,30 +102,34 @@ class RequestPrefixes:
             for key, value in request.items()
             if key != field and isinstance(value, (dict, list))
         }
+        identity = hashlib.sha256(
+            bytes.fromhex(chain[-1]) + b"".join(key.encode() + b"\0" + keys[key] for key in sorted(keys))
+        ).hexdigest()
         with self._lock:
             if not capture_exists:
                 # A cleared capture no longer holds this process's bases.
                 self._bases.pop(rollout_id, None)
             candidates = list(self._bases.get(rollout_id, ()))
-        prefix: dict[str, Any] = {"field": field, "count": len(messages), "sha256": chain[-1]}
+        prefix: dict[str, Any] = {"field": field, "count": len(messages), "sha256": identity}
         stored = request
+        # Longest matching message prefix first, then the most inherited fields, then the latest.
         matching = [
-            candidate
-            for candidate in candidates
-            if candidate[0] == field and candidate[1] <= len(messages) and chain[candidate[1] - 1] == candidate[2]
+            (count, len(inherit), position, base_identity, inherit)
+            for position, (base_field, count, base_chain, base_identity, base_keys) in enumerate(candidates)
+            if base_field == field and count <= len(messages) and chain[count - 1] == base_chain
+            for inherit in [sorted(key for key, value in keys.items() if base_keys.get(key) == value)]
         ]
         if matching:
-            _, count, base_digest, base_keys = max(matching, key=lambda candidate: candidate[1])
-            inherit = sorted(key for key, value in keys.items() if base_keys.get(key) == value)
+            count, _, _, base_identity, inherit = max(matching)
             stored = {key: value for key, value in request.items() if key not in inherit}
             stored[field] = messages[count:]
-            prefix["base"] = {"sha256": base_digest, "count": count, "inherit": inherit}
+            prefix["base"] = {"sha256": base_identity, "count": count, "inherit": inherit}
 
         def commit() -> None:
             with self._lock:
                 bases = self._bases.setdefault(rollout_id, [])
                 self._bases.move_to_end(rollout_id)
-                bases.append((field, len(messages), chain[-1], keys))
+                bases.append((field, len(messages), chain[-1], identity, keys))
                 del bases[: -self._bases_per_rollout]
                 while len(self._bases) > self._rollouts:
                     self._bases.popitem(last=False)

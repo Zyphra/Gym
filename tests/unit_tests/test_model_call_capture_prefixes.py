@@ -196,3 +196,45 @@ def test_selected_capture_stores_prefixes_within_its_byte_bounds(tmp_path):
     read = store.read("episode")
     assert [{k: v for k, v in r.items() if k != "capture_retention"} for r in read] == calls
     assert all(len(line["request"]["messages"]) == 2 for line in stored_lines(store, "episode")[1:])
+
+
+def with_tools(call: dict, tools: list) -> dict:
+    return {**call, "request": {**call["request"], "tools": tools}}
+
+
+SEARCH = {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}
+EDIT = {"type": "function", "function": {"name": "edit", "parameters": {"type": "object"}}}
+
+
+def test_equal_messages_with_different_tools_are_distinct_bases(tmp_path):
+    # Messages M with tools T1, then M with T2, then M plus one turn with T1.
+    store = CaptureStore(tmp_path)
+    calls = [with_tools(chat_turn(1), [SEARCH]), with_tools(chat_turn(1), [EDIT]), with_tools(chat_turn(2), [SEARCH])]
+    for call in calls:
+        store.record("episode", call)
+
+    assert store.read("episode") == calls
+    first, second, third = (line[REQUEST_PREFIX_KEY] for line in stored_lines(store, "episode"))
+    assert first["sha256"] != second["sha256"]
+    # The third request extends the request whose tools it shares, and inherits them.
+    assert third["base"]["sha256"] == first["sha256"] and "tools" in third["base"]["inherit"]
+
+
+@pytest.mark.parametrize("seal_after", [None, 2, 4])
+def test_tool_sets_that_change_every_turn_round_trip(tmp_path, seal_after):
+    tool_sets = [[SEARCH], [SEARCH, EDIT], [EDIT], [SEARCH, EDIT], [], [SEARCH], [SEARCH]]
+    calls = []
+    for index, tools in enumerate(tool_sets):
+        call = with_tools(chat_turn(index // 2), tools)
+        if not tools:
+            call["request"].pop("tools")
+        calls.append(call)
+    store = CaptureStore(tmp_path)
+    for index, call in enumerate(calls):
+        if index == seal_after:
+            assert seal_capture(store.path_for("episode"))
+        store.record("episode", call)
+
+    assert store.read("episode") == calls
+    exchanges, invalid = store.read_available("episode")
+    assert invalid == 0 and [exchange for _, exchange in exchanges] == calls
