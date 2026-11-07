@@ -137,7 +137,7 @@ def _old_git_shim(tmp_path, monkeypatch):
     (shim / "git").write_text(
         "#!/bin/sh\n"
         'for arg in "$@"; do case "$arg" in --object-format=*) '
-        "echo \"error: unknown option \\`${arg#--}'\" >&2; exit 129;; esac; done\n"
+        'echo "error: unknown option \\`${arg#--}\'" >&2; exit 129;; esac; done\n'
         f'exec {real} "$@"\n'
     )
     (shim / "git").chmod(0o755)
