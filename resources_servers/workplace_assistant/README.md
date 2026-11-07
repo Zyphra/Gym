@@ -65,6 +65,15 @@ integer-minute values, so equivalent ISO timestamps and leading-zero durations
 are accepted. Naive and timezone-aware timestamps remain distinct; different
 times or durations still fail.
 
+## Booking window
+
+The dataset system prompt says "Meetings must not start before 9am or end after 6pm", and every task that books
+or moves a meeting works on weekdays. `calendar_create_event` and `calendar_update_event` (`event_start` or
+`duration`) therefore refuse a meeting that is on a weekend, starts before 09:00 or ends after 18:00 (ending
+exactly at 18:00 is allowed). The tool returns an error naming the rule and changes no state, in the live session
+and in the grader's replay, so a refused attempt followed by a legal booking scores like the legal booking alone.
+All 1,800 reference trajectories of the pinned `train` and `validation` exports satisfy the window.
+
 ## Generating Additional Training Data
 
 To generate your own training JSONL for this environment using NeMo Data Designer, see the [synthetic data generation example](notebooks/synthetic-data-generation/).
