@@ -389,6 +389,27 @@ class TestEnv:
         assert env["OPENAI_BASE_URL"] == "http://model/v1"
         assert provider["options"]["baseURL"] == "http://model/v1"
         assert provider["models"]["Qwen3.6-35B-A3B"]["limit"]["output"] == 131072
+        assert provider["models"]["Qwen3.6-35B-A3B"]["interleaved"] == {"field": "reasoning"}
+
+    def test_configured_interleaved_field_wins(self) -> None:
+        # OpenCode 1.14.x accepts only reasoning_content/reasoning_details here.
+        agent = _make_agent(
+            model="model",
+            model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+            context_window=65536,
+            opencode_config={
+                "provider": {"nemo": {"models": {"model": {"interleaved": {"field": "reasoning_content"}}}}}
+            },
+        )
+        with patch.object(agent, "_resolve_model_base_url", return_value="http://model/v1"):
+            config = agent._build_opencode_config()
+
+        model = config["provider"]["nemo"]["models"]["model"]
+        assert model["interleaved"] == {"field": "reasoning_content"}
+        assert model["limit"]["context"] == 65536
+        assert agent.config.opencode_config["provider"]["nemo"]["models"]["model"] == {
+            "interleaved": {"field": "reasoning_content"}
+        }
 
 
 class TestRolloutObservability:
