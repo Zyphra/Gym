@@ -32,11 +32,11 @@ The agent converts the Terminus-2 trajectory to Responses API messages and tool
 calls. Sampling parameters are forwarded to the configured model server.
 
 
-`interleaved_thinking` defaults to `true` in both the typed agent and standalone
-configuration. Harbor keeps the exact returned `reasoning_content` in retained
-assistant messages and echoes it on the next request, for training and evaluation.
-Compaction can discard old messages; retained messages keep their reasoning.
-Harbor's compaction prompts and summary handoff run unchanged.
+`interleaved_thinking` defaults to `false`, as in Harbor's Terminus-2: retained
+assistant messages carry only their content. A route that sets it to `true` makes
+Harbor keep the exact returned `reasoning_content` in retained assistant messages
+and echo it on the next request. Harbor's compaction prompts and summary handoff
+run unchanged.
 
 Each context summarization Harbor performs (proactive at `proactive_summarization_threshold` free
 tokens, or after a context-length error) is reported as a completed, failed or aborted
