@@ -19,6 +19,29 @@ import pandas as pd
 from resources_servers.workplace_assistant.workplace_assistant_tools._csv import read_csv
 
 
+BOOKING_OPENS = pd.Timedelta(hours=9)
+BOOKING_CLOSES = pd.Timedelta(hours=18)
+
+
+def slot_error(event_start, duration):
+    """Return the refusal text for a meeting outside Monday-Friday 09:00-18:00, else None.
+
+    The dataset system prompt states "Meetings must not start before 9am or end after 6pm", and
+    every task that books or moves a meeting uses weekdays only, so the tool enforces the same
+    window that the reference calls satisfy. A refused call changes no state, live or in replay.
+    """
+    start = pd.Timestamp(event_start)
+    end = start + pd.Timedelta(minutes=int(duration))
+    day = start.normalize()
+    if start.weekday() >= 5 or start < day + BOOKING_OPENS or end > day + BOOKING_CLOSES:
+        return (
+            f"Meeting from {start.strftime('%Y-%m-%d %H:%M:%S')} for {int(duration)} minutes is outside the booking "
+            "window. Meetings must be on a weekday (Monday to Friday), must not start before 09:00 and must end "
+            "by 18:00. Choose a different time or duration."
+        )
+    return None
+
+
 class CalendarTool:
     def __init__(self):
         self.reset_state()
@@ -133,6 +156,10 @@ class CalendarTool:
         except ValueError:
             return "Invalid duration format. Expected a number of minutes."
 
+        refusal = slot_error(event_start, duration_val)
+        if refusal:
+            return refusal
+
         participant_email = participant_email.lower()
 
         event_id = str(int(self._calendar_events["event_id"].max()) + 1).zfill(8)
@@ -190,6 +217,14 @@ class CalendarTool:
                 return "Invalid duration format. Expected a number of minutes."
 
         if event_id in self._calendar_events["event_id"].values:
+            if field in ("event_start", "duration"):
+                current = self._calendar_events[self._calendar_events["event_id"] == event_id].iloc[0]
+                refusal = slot_error(
+                    new_value if field == "event_start" else current["event_start"],
+                    new_value if field == "duration" else current["duration"],
+                )
+                if refusal:
+                    return refusal
             if field == "participant_email":
                 new_value = new_value.lower()
             self._calendar_events.loc[self._calendar_events["event_id"] == event_id, field] = new_value
