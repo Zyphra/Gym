@@ -29,6 +29,7 @@ from nemo_gym.base_responses_api_model import (
 from nemo_gym.model_call_capture_files import (
     _append_locked,
     capture_paths,
+    expand_request_prefixes,
     open_capture,
     read_capture_bytes,
     seal_capture,
@@ -208,7 +209,7 @@ def test_open_capture_streams_sealed_then_plain_lines(tmp_path):
     store.record("episode", turn(2))
 
     with open_capture(store.path_for("episode")) as lines:
-        assert [orjson.loads(line) for line in lines] == [turn(1), turn(2)]
+        assert list(expand_request_prefixes(orjson.loads(line) for line in lines)) == [turn(1), turn(2)]
     with pytest.raises(FileNotFoundError):
         with open_capture(tmp_path / "missing.capture.jsonl"):
             pass
@@ -231,13 +232,18 @@ def test_plain_captures_read_without_zstandard(tmp_path):
     assert result.stdout == store.path_for("episode").read_bytes()
 
 
-def test_agentic_capture_compresses_by_more_than_twenty_times(tmp_path):
+def test_agentic_capture_stores_each_message_once_and_seals_smaller(tmp_path):
     store = CaptureStore(tmp_path)
     for index in range(40):
         store.record("episode", turn(index))
-    raw = store.path_for("episode").stat().st_size
+    whole = sum(len(orjson.dumps(turn(index))) + 1 for index in range(40))
+    stored = store.path_for("episode").stat().st_size
     seal_capture(store.path_for("episode"))
     sealed = sealed_capture_path(store.path_for("episode")).stat().st_size
 
-    assert raw > 1_000_000
-    assert raw / sealed > 20
+    # Forty whole requests repeat the conversation 40 times; stored, each message appears once.
+    final_request = len(orjson.dumps(turn(39)["request"]))
+    assert whole > 1_000_000
+    assert stored < 2 * final_request
+    assert sealed < stored
+    assert store.read("episode") == [turn(index) for index in range(40)]

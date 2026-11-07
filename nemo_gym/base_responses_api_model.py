@@ -63,7 +63,9 @@ from nemo_gym.chat_streaming import sanitize_streaming_chat_body, synthesize_cha
 from nemo_gym.config_types import ROLLOUT_PATH_PREFIX, TOKEN_CAPTURE_PATH_SEGMENT, ModelServerRef
 from nemo_gym.model_call_capture_files import (
     CAPTURE_SUFFIX,
+    RequestPrefixes,
     _append_locked,
+    expand_request_prefixes,
     read_capture_bytes,
     sealed_capture_path,
 )
@@ -570,7 +572,9 @@ class CaptureStore:
     """Append-only, rollout-keyed JSONL sink for model exchanges.
 
     Records append to ``<id>.capture.jsonl``; ``seal_capture`` later compresses them
-    into ``<id>.capture.jsonl.zst``. Reads return both, sealed records first.
+    into ``<id>.capture.jsonl.zst``. Reads return both, sealed records first. A request
+    is stored as the messages its rollout's earlier requests lacked and read back whole
+    (``RequestPrefixes`` / ``expand_request_prefixes``).
     """
 
     def __init__(self, root: str | Path, selection: ModelCallCaptureSelection | None = None) -> None:
@@ -579,6 +583,7 @@ class CaptureStore:
         self._root.mkdir(parents=True, exist_ok=True, mode=0o700 if selection else 0o777)
         self._pending = None
         self._writer = None
+        self._prefixes = RequestPrefixes()
         self.dropped: dict[str, int] = {}
         if selection is not None:
             info = self._root.lstat()
@@ -673,6 +678,7 @@ class CaptureStore:
             "capture_until": selection.capture_until.isoformat(),
             "replay_eligible": not redacted and exchange.get("request") is not None,
         }
+        clean, commit = self._prefixes.encode(rollout_id, clean, self.exists(rollout_id))
         line = orjson.dumps(clean, default=str, option=orjson.OPT_APPEND_NEWLINE)
         if len(line) > selection.max_record_bytes:
             self.drop("record_byte_limit")
@@ -705,6 +711,7 @@ class CaptureStore:
                 line,
                 lambda path: self._private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT),
             )
+        commit()
 
     @property
     def root(self) -> Path:
@@ -741,12 +748,14 @@ class CaptureStore:
         if self._selection is not None:
             self._bounded_record(rollout_id, exchange)
             return
+        exchange, commit = self._prefixes.encode(rollout_id, exchange, self.exists(rollout_id))
         line = orjson.dumps(exchange, default=str, option=orjson.OPT_APPEND_NEWLINE)
         _append_locked(
             self.path_for(rollout_id),
             line,
             lambda path: os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o666),
         )
+        commit()
 
     def _lines(self, rollout_id: str) -> list[bytes]:
         try:
@@ -756,22 +765,29 @@ class CaptureStore:
         return [stripped for line in raw.split(b"\n") if (stripped := line.strip())]
 
     def read(self, rollout_id: str) -> list[dict[str, Any]]:
-        return [orjson.loads(line) for line in self._lines(rollout_id)]
+        exchanges = list(expand_request_prefixes(orjson.loads(line) for line in self._lines(rollout_id)))
+        if any(exchange is None for exchange in exchanges):
+            raise ValueError(f"capture {rollout_id!r} references a request it does not hold")
+        return exchanges
 
     def read_available(self, rollout_id: str) -> tuple[list[tuple[int, dict[str, Any]]], int]:
         """Read valid exchanges without letting one damaged line hide the rest."""
+        parsed: list[Any] = []
+        for line in self._lines(rollout_id):
+            try:
+                parsed.append(orjson.loads(line))
+            except orjson.JSONDecodeError:
+                parsed.append(None)
         exchanges: list[tuple[int, dict[str, Any]]] = []
         invalid_count = 0
-        for capture_index, line in enumerate(self._lines(rollout_id)):
-            try:
-                exchange = orjson.loads(line)
-            except orjson.JSONDecodeError:
-                invalid_count += 1
+        # A damaged line never resolves as a base, so requests built on it count as damaged too.
+        expanded = iter(expand_request_prefixes(item for item in parsed if item is not None))
+        for capture_index, item in enumerate(parsed):
+            exchange = next(expanded) if item is not None else None
+            if isinstance(exchange, dict):
+                exchanges.append((capture_index, exchange))
             else:
-                if isinstance(exchange, dict):
-                    exchanges.append((capture_index, exchange))
-                else:
-                    invalid_count += 1
+                invalid_count += 1
         return exchanges, invalid_count
 
 
