@@ -14,7 +14,7 @@ anyterminal_pi:
         workspace_root: /tmp/pi-agent
         thinking: high
         timeout: 3600
-        pi_version: 0.84.4
+        pi_version: 0.99.2
         models_config: {}
 
       container_formatter: "docker://{docker_image}"

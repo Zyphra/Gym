@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/_portable_python.sh"
 : "${NEMO_GYM_ROOT:?NEMO_GYM_ROOT must be set}"
 
 NODE_VERSION="${NODE_VERSION:-22.19.0}"
-PI_VERSION="${PI_VERSION:-0.84.4}"
+PI_VERSION="${PI_VERSION:-0.99.2}"
 
 install_portable_python
 install_nemo_gym_deps

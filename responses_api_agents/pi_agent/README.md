@@ -48,7 +48,7 @@ agent creates the Pi provider entry automatically. Without `model_server`, the e
 configuration is unchanged.
 
 The generated provider explicitly keeps thinking in `reasoning_content`, rather
-than folding it into answer text or relying on URL detection. Pi-ai 0.84.4
+than folding it into answer text or relying on URL detection. Pi-ai 0.99.2
 already replays a sampled thinking block under its captured wire signature;
 the explicit compatibility settings preserve this behavior for episode URLs
 and supply an empty reasoning field for assistant turns without one. They do
