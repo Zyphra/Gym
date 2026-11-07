@@ -281,6 +281,11 @@ def _notify_agent_finished(policy: Any, result: Any) -> None:
         callback(result)
 
 
+def _agent_phase_seconds(exec_timeout_s: int) -> int:
+    """The runner's agent deadline: the exec timeout minus a patch-extraction reserve."""
+    return max(1, exec_timeout_s - min(300, exec_timeout_s // 10))
+
+
 def _should_mask_sample(
     resolved: bool,
     agent_error_kind: Optional[str],
@@ -679,6 +684,11 @@ class AnySweSandboxRunner:
             # Never leak the worker's wrapper/Task imports into the task image.
             "PYTHONPATH": AGENT_OVERLAY_DIR if getattr(params, "agent_overlay_files", None) else "",
         }
+        # The runner enforces the agent phase itself, leaving time to reap the
+        # harness's process tree and extract the patch inside the exec timeout.
+        timeout_s = getattr(params, "swebench_agent_timeout", None)
+        if timeout_s is not None:
+            env["NGSWE_AGENT_TIMEOUT_S"] = str(_agent_phase_seconds(timeout_s))
         # Invocation identity remains available even when a sandbox relay owns
         # upstream URL scoping. Its explicit endpoint prevents double scoping.
         if params.rollout_id:
@@ -1132,7 +1142,10 @@ class AnySweSandboxRunner:
         # A runner exception outside the typed transport cases retains the old
         # task-zero behavior. Its partial patch is evidence, not a successful
         # harness completion; transient failures below remain native masks.
-        if saved is not None and (saved.metadata or {}).get("runner_exception") == "true" and harness_error is None:
+        if saved is not None and (saved.metadata or {}).get("agent_wall_timeout") == "true":
+            # The runner enforced the same agent deadline the exec timeout would.
+            agent_timed_out = True
+        elif saved is not None and (saved.metadata or {}).get("runner_exception") == "true" and harness_error is None:
             error_kind = error_kind or "agent"
         if patch.strip() and error_kind is None:
             grading_started_at = time.time()

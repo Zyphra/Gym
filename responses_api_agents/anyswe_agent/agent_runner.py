@@ -17,8 +17,11 @@ import importlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -309,16 +312,110 @@ def _exception_response(exc: Exception, body):
     )
 
 
+_PR_SET_CHILD_SUBREAPER = 36
+
+
+def _become_subreaper() -> bool:
+    """Adopt every orphan the agent's tools leave, including ones that call setsid."""
+    try:
+        import ctypes
+
+        return ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    except (AttributeError, OSError):
+        return False
+
+
+def _descendants(root: int) -> dict[int, str]:
+    """Live descendants of ``root`` and their states, from /proc parent links."""
+    parents: dict[int, tuple[int, str]] = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as stream:
+                data = stream.read()
+        except OSError:
+            continue
+        fields = data[data.rindex(b")") + 2 :].split()
+        parents[int(entry)] = (int(fields[1]), fields[0].decode())
+    found: dict[int, str] = {}
+    frontier = {root}
+    while frontier:
+        frontier = {pid for pid, (ppid, _) in parents.items() if ppid in frontier and pid not in found and pid != root}
+        found.update({pid: parents[pid][1] for pid in frontier})
+    return found
+
+
+def _reap_agent_tree(timeout_s: float = 30.0) -> int:
+    """Stop, then kill and reap, every process the harness left behind.
+
+    A background test runner can hold the sandbox's whole memory budget after the
+    agent returns, and patch extraction then thrashes in reclaim for hours without
+    an OOM kill. Stopping first keeps a forking tree from outrunning the kill.
+    """
+    me = os.getpid()
+    killed: set[int] = set()
+    deadline = time.monotonic() + timeout_s
+    while True:
+        live = [pid for pid, state in _descendants(me).items() if state != "Z"]
+        for sig in (signal.SIGSTOP, signal.SIGKILL):
+            for pid in live:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+        killed.update(live)
+        for pid in list(killed):
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+        if not live or time.monotonic() > deadline:
+            return len(killed)
+        time.sleep(0.05)
+
+
+def _agent_deadline_s() -> float | None:
+    value = os.environ.get("NGSWE_AGENT_TIMEOUT_S")
+    return float(value) if value else None
+
+
 def _run_and_capture(agent, request, body, repo, index_path, baseline_tree, output_dir: Path) -> None:
     """Write response and patch even when a harness raises after editing files."""
+    deadline_s = _agent_deadline_s()
+    expired = threading.Event()
+
+    def on_deadline() -> None:
+        # The tools, not the coroutine, are what block: killing them unblocks the
+        # agent even when its sandbox is in memory livelock.
+        expired.set()
+        while not finished.wait(1.0):
+            _reap_agent_tree(timeout_s=1.0)
+
+    finished = threading.Event()
+    timer = threading.Timer(deadline_s, on_deadline) if deadline_s else None
+    if timer is not None:
+        timer.daemon = True
+        timer.start()
     try:
         try:
-            response = asyncio.run(agent.responses(request=request, body=body))
+            response = asyncio.run(asyncio.wait_for(agent.responses(request=request, body=body), timeout=deadline_s))
         except Exception as exc:
+            if expired.is_set() or isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                expired.set()
+                exc = TimeoutError(f"agent wall timeout after {deadline_s}s")
             response = _exception_response(exc, body)
+            if expired.is_set():
+                response.metadata = {**(response.metadata or {}), "agent_wall_timeout": "true"}
         (output_dir / "response.json").write_text(response.model_dump_json())
         print(f"agent finished: {len(response.output)} output items", flush=True)
     finally:
+        finished.set()
+        if timer is not None:
+            timer.cancel()
+        reaped = _reap_agent_tree()
+        if reaped:
+            print(f"reaped {reaped} leftover agent processes", flush=True)
         try:
             patch = _extract_patch(repo, index_path, baseline_tree) if repo and baseline_tree else ""
             (output_dir / "patch.diff").write_text(patch)
@@ -382,6 +479,7 @@ def main() -> None:
         **sampling,
     )
     request = _agent_request(os.environ.get("NGSWE_ROLLOUT_ID"))
+    _become_subreaper()
     _run_and_capture(agent, request, body, repo, index_path, baseline_tree, Path("/trajectories_mount"))
 
 
