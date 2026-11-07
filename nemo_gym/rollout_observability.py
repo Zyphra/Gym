@@ -162,11 +162,8 @@ class CompactionHandoffCall(ObservationModel):
     """What one compaction call (summary, questions or answers) handed to the next agent."""
 
     call: Literal["summary", "questions", "answers"]
-    handoff_source: Literal["content", "reasoning_fallback", "prose_fallback", "empty"] = Field(
-        description=(
-            "content: the reply as generated; reasoning_fallback / prose_fallback: the reply was an action and "
-            "its reasoning (else its analysis and plan) was handed on instead; empty: nothing was handed on."
-        )
+    handoff_source: Literal["content", "empty"] = Field(
+        description="content: the reply was handed on as generated; empty: the reply was empty, so nothing was."
     )
     content_is_json_action: bool
     content_bytes: int = Field(ge=0)
