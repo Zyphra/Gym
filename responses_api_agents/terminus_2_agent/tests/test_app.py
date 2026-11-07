@@ -25,6 +25,7 @@ from nemo_gym.openai_utils import NeMoGymEasyInputMessage, NeMoGymResponseCreate
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.terminus_2_agent.app import (
     COMMAND_NAMESPACE,
+    HARNESS_LOGS,
     HARNESS_MOUNTS,
     SETUP_FAILED_TMUX_UNAVAILABLE,
     LocalEnvironment,
@@ -167,6 +168,7 @@ class TestLocalTmuxSession:
             session_name=f"ready-{os.getpid()}",
             environment=environment,
             logging_path=tmp_path / "pane.log",
+            harness_logs_dir=tmp_path / "harness",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
         )
@@ -190,6 +192,7 @@ class TestLocalTmuxSession:
             session_name=f"missing-{os.getpid()}",
             environment=environment,
             logging_path=tmp_path / "pane.log",
+            harness_logs_dir=tmp_path / "harness",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
         )
@@ -204,6 +207,7 @@ class TestLocalTmuxSession:
             session_name="terminus-test",
             environment=MagicMock(),
             logging_path=tmp_path / "pane.log",
+            harness_logs_dir=tmp_path / "harness",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
         )
@@ -217,13 +221,14 @@ class TestLocalTmuxSession:
             session_name="terminus-test",
             environment=MagicMock(),
             logging_path=tmp_path / "pane.log",
+            harness_logs_dir=tmp_path / "harness",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
         )
         with patch("responses_api_agents.terminus_2_agent.app.sys.platform", "linux"):
             command = session._tmux_start_session
         upstream = Terminus2SessionBase._tmux_start_session.fget(session)
-        hidden = [arg for path in HARNESS_MOUNTS for arg in ("--hide", path)]
+        hidden = [arg for path in (*HARNESS_MOUNTS, str(tmp_path / "harness")) for arg in ("--hide", path)]
         assert shlex.split(command) == [sys.executable, "-I", str(COMMAND_NAMESPACE), *hidden, "bash", "-c", upstream]
         assert "script -qc" in upstream
 
@@ -245,6 +250,7 @@ class TestCommandNamespace:
             session_name=f"contained-{os.getpid()}",
             environment=environment,
             logging_path=tmp_path / "pane.log",
+            harness_logs_dir=tmp_path / "harness",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
         )
@@ -672,7 +678,9 @@ class TestConfig:
 
 def _setup_agent(logs_dir: Path) -> StandaloneTerminus2:
     agent = object.__new__(StandaloneTerminus2)
-    agent.logs_dir = logs_dir
+    agent.terminal_logs_dir = logs_dir
+    agent.logs_dir = logs_dir / HARNESS_LOGS
+    agent.logs_dir.mkdir()
     agent._record_terminal_session = False
     agent._tmux_pane_width, agent._tmux_pane_height = 160, 40
     agent._session = None
