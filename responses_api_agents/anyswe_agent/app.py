@@ -824,10 +824,13 @@ class AnySweSandboxRunner:
         if result.return_code == params.private_grader.unresolved_return_code:
             return False, None, None
         if result.return_code == params.private_grader.timeout_return_code:
+            # The submitted code ran its tests past their budget. SWE-bench's harness
+            # (run_evaluation.run_instance, "Test timed out") leaves such an instance
+            # unresolved; it scores 0 here too, with the timeout kept as detail.
             return (
                 False,
-                "eval_timeout",
-                _error_detail(f"grader exec error_type={result.error_type}", f"rc={result.return_code}"),
+                None,
+                _error_detail(f"grader test budget exhausted rc={result.return_code}"),
             )
         return (
             False,
