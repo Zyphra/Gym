@@ -47,7 +47,7 @@ V5 tasks use three tools instead of the V4 four:
 
 Each world connects one of two fictional vendors per app; the other answers 401. [realapi.py](realapi.py) implements the conventions:
 
-- **Mail:** list returns IDs and page tokens; a message's body is base64url in `payload.body.data`; sending takes `{"raw": base64url(RFC 2822 message)}` plus an optional `threadId`; label changes take label IDs.
+- **Mail:** list returns IDs and page tokens; a message's body is base64url in `payload.body.data`; sending takes `{"raw": base64url(RFC 2822 message)}` plus an optional `threadId`, and refuses with 400 a message whose headers are not followed by an empty line, whose header block holds a non-header line such as `Body: ...`, or whose headers or body hold typed `\r`/`\n` escape text instead of line breaks; label changes take label IDs.
 - **Spreadsheets:** A1 ranges in the URL path, `valueInputOption` as a query parameter (in the body for `values:batchUpdate`), `{"values": [[...]]}` envelopes, `:append` after the last table row.
 - **Chat:** method endpoints; reads use GET with params and writes POST a JSON body. Channels and users are addressed by ID. Failures return HTTP 200 with `ok: false`.
 - **CRM:** one vendor speaks REST with `{"properties": {...}}` envelopes, filter-group search and `paging.next.after`; the other speaks GraphQL with `first`/`after`/`filter` connections and update/create mutations.

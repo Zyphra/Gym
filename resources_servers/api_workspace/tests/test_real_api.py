@@ -212,6 +212,61 @@ def test_mail_send_requires_encoded_rfc2822_and_parses_headers():
     assert sent["subject"] == "Hi there" and sent["body"] == "Line one\nLine two\n" and sent["labels"] == ["SENT"]
 
 
+MALFORMED_MIME = {
+    "no empty line before the body": (
+        "To: a@b.invalid\r\nSubject: Re: X\r\nRefund approved for WO-1.",
+        "no empty line between its headers and its body",
+    ),
+    "body text in the header block": (
+        "To: a@b.invalid\nSubject: Re: X\nBody: Refund approved for WO-1.",
+        "'Body' is not a mail header",
+    ),
+    "typed escapes for every line break": (
+        "To: a@b.invalid\\r\\nSubject: Re: X\\r\\n\\r\\nRefund approved for WO-1.",
+        "To header holds typed backslash-r text",
+    ),
+    "typed escapes after the subject": (
+        "To: a@b.invalid\r\nSubject: Re: X\\n\\nRefund approved for WO-1.",
+        "Subject header holds typed backslash-n text",
+    ),
+    "typed escapes in the body": (
+        "To: a@b.invalid\r\nSubject: Re: X\r\n\r\nLine one\\nLine two",
+        "body holds typed backslash-n",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(MALFORMED_MIME))
+def test_mail_send_refuses_a_malformed_mime_layout_and_changes_nothing(case):
+    raw, reason = MALFORMED_MIME[case]
+    scenario = scenario_from_id(f"{REVISION_V5}:train:rx_refund_review:0000")
+    world = Workspace(scenario)
+    url = f"{_connected(scenario, 'mail').base}/mail/v1/users/me/messages/send"
+    before = json.dumps(world.records, sort_keys=True)
+    status, body = realapi.fetch(world, "POST", url, body=json.dumps({"raw": realapi.b64url_encode(raw)}))
+    assert status == 400 and body["error"]["status"] == "INVALID_ARGUMENT"
+    assert reason in body["error"]["message"] and "then one empty line, then the body" in body["error"]["message"]
+    assert json.dumps(world.records, sort_keys=True) == before
+
+
+@pytest.mark.parametrize(
+    "raw, stored",
+    [
+        ("To: a@b.invalid\nSubject: Re: X\n\nRefund approved for WO-1.", "Refund approved for WO-1."),
+        ("To: a@b.invalid\r\nSubject: Re: X\r\nX-Mailer: m\r\n\r\nSee C:\\new\r\nok", "See C:\\new\r\nok"),
+        ("To: a@b.invalid\r\nSubject: Re: X\r\n\r\nWO-1: approved", "WO-1: approved"),
+    ],
+)
+def test_mail_send_accepts_well_formed_layouts(raw, stored):
+    scenario = scenario_from_id(f"{REVISION_V5}:train:rx_refund_review:0000")
+    world = Workspace(scenario)
+    vendor = _connected(scenario, "mail")
+    url = f"{vendor.base}/mail/v1/users/me/messages/send"
+    status, body = realapi.fetch(world, "POST", url, body=json.dumps({"raw": realapi.b64url_encode(raw)}))
+    assert status == 200, body
+    assert world.records[vendor.name]["messages"][body["id"]]["body"] == stored
+
+
 @pytest.mark.parametrize(
     "app, method, path, params, body",
     [
