@@ -16,25 +16,160 @@
 
 Writers append JSONL records under an exclusive ``flock``. ``seal_capture`` moves a
 capture's records into its zstd file (one frame per seal) and removes the plain file;
-later appends start a new plain file. Readers use ``open_capture``/``read_capture_bytes``,
-which return the sealed records followed by the plain ones. Standard library and
+later appends start a new plain file. Readers use ``read_capture``, which returns the
+sealed records followed by the plain ones with full requests; ``open_capture``/
+``read_capture_bytes`` return the stored bytes. Standard library and
 ``zstandard`` only, so offline readers need no server dependencies.
+
+An agentic request resends the whole conversation, so a record stores only the messages
+an earlier request of its rollout did not already hold (``RequestPrefixes``), and
+``expand_request_prefixes`` rebuilds the full request. A record whose request carries a
+message list (``messages`` or ``input``) has a ``request_prefix`` entry: ``field`` and
+``count`` describe the full list, and ``sha256`` identifies the request by the digest chain
+of that list together with every non-scalar request field (such as ``tools``), so requests
+with equal messages but different tools are distinct bases. With ``base`` (``sha256``,
+``count``, ``inherit``) the stored list holds only the messages after the base request's
+``count``, and each key in ``inherit`` equals the base request's. Scalar request fields such as sampling parameters
+are always stored. A rollout's first request, and one that no earlier request prefixes
+(a compaction rewrite, or another session's first call), is stored whole.
 """
 
 import fcntl
+import hashlib
 import io
 import itertools
+import json
 import os
 import stat
 import struct
+import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 
 CAPTURE_SUFFIX = ".capture.jsonl"
 SEALED_CAPTURE_SUFFIX = CAPTURE_SUFFIX + ".zst"
+REQUEST_PREFIX_KEY = "request_prefix"
+
+
+def _message_field(request: Any) -> Optional[str]:
+    if isinstance(request, dict):
+        for field in ("messages", "input"):
+            if isinstance(request.get(field), list) and request[field]:
+                return field
+    return None
+
+
+def _value_digest(value: Any) -> bytes:
+    # Writer side only: readers trust the stored digests and never re-hash.
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+    return hashlib.sha256(encoded.encode("utf-8", "surrogatepass")).digest()
+
+
+class RequestPrefixes:
+    """Store each request as the messages its rollout's earlier requests did not hold.
+
+    A process remembers the last ``bases_per_rollout`` requests it appended for each of its
+    ``rollouts`` most recent rollouts. A base is named by the digest chain of its message list
+    combined with the digests of its non-scalar fields, so a reference resolves to the same
+    messages and inherited fields wherever the base record now sits (plain or sealed) and
+    however other writers interleaved. ``encode`` returns the record to append and
+    a callback that registers it as a base once the append has succeeded.
+    """
+
+    def __init__(self, rollouts: int = 1024, bases_per_rollout: int = 8) -> None:
+        self._rollouts = rollouts
+        self._bases_per_rollout = bases_per_rollout
+        self._lock = threading.Lock()
+        self._bases: OrderedDict[str, list[tuple[str, int, str, str, dict[str, bytes]]]] = OrderedDict()
+
+    def encode(
+        self, rollout_id: str, exchange: dict[str, Any], capture_exists: bool
+    ) -> tuple[dict[str, Any], Callable[[], None]]:
+        request = exchange.get("request")
+        field = _message_field(request)
+        if field is None:
+            return exchange, lambda: None
+        messages = request[field]
+        chain, digest = [], bytes(32)
+        for message in messages:
+            digest = hashlib.sha256(digest + _value_digest(message)).digest()
+            chain.append(digest.hex())
+        keys = {
+            key: _value_digest(value)
+            for key, value in request.items()
+            if key != field and isinstance(value, (dict, list))
+        }
+        identity = hashlib.sha256(
+            bytes.fromhex(chain[-1]) + b"".join(key.encode() + b"\0" + keys[key] for key in sorted(keys))
+        ).hexdigest()
+        with self._lock:
+            if not capture_exists:
+                # A cleared capture no longer holds this process's bases.
+                self._bases.pop(rollout_id, None)
+            candidates = list(self._bases.get(rollout_id, ()))
+        prefix: dict[str, Any] = {"field": field, "count": len(messages), "sha256": identity}
+        stored = request
+        # Longest matching message prefix first, then the most inherited fields, then the latest.
+        matching = [
+            (count, len(inherit), position, base_identity, inherit)
+            for position, (base_field, count, base_chain, base_identity, base_keys) in enumerate(candidates)
+            if base_field == field and count <= len(messages) and chain[count - 1] == base_chain
+            for inherit in [sorted(key for key, value in keys.items() if base_keys.get(key) == value)]
+        ]
+        if matching:
+            count, _, _, base_identity, inherit = max(matching)
+            stored = {key: value for key, value in request.items() if key not in inherit}
+            stored[field] = messages[count:]
+            prefix["base"] = {"sha256": base_identity, "count": count, "inherit": inherit}
+
+        def commit() -> None:
+            with self._lock:
+                bases = self._bases.setdefault(rollout_id, [])
+                self._bases.move_to_end(rollout_id)
+                bases.append((field, len(messages), chain[-1], identity, keys))
+                del bases[: -self._bases_per_rollout]
+                while len(self._bases) > self._rollouts:
+                    self._bases.popitem(last=False)
+
+        return {**exchange, "request": stored, REQUEST_PREFIX_KEY: prefix}, commit
+
+
+def expand_request_prefixes(exchanges: Iterable[Any]) -> Iterator[Optional[Any]]:
+    """Yield each exchange with its full request; ``None`` for one whose base is unreadable.
+
+    Exchanges are in capture order. Records without ``request_prefix`` pass through unchanged.
+    """
+    bases: dict[str, dict[str, Any]] = {}
+    for exchange in exchanges:
+        if not isinstance(exchange, dict) or REQUEST_PREFIX_KEY not in exchange:
+            yield exchange
+            continue
+        exchange = dict(exchange)
+        prefix = exchange.pop(REQUEST_PREFIX_KEY)
+        request = exchange.get("request")
+        try:
+            field = prefix["field"]
+            base_ref = prefix.get("base")
+            if base_ref is not None:
+                base = bases[base_ref["sha256"]]
+                if len(base[field]) != base_ref["count"]:
+                    raise ValueError("base request length differs from its reference")
+                full = {key: base[key] for key in base_ref["inherit"]}
+                full.update(request)
+                full[field] = base[field] + request[field]
+                request = full
+            if len(request[field]) != prefix["count"]:
+                raise ValueError("rebuilt request length differs from its record")
+        except (KeyError, TypeError, ValueError):
+            yield None
+            continue
+        bases[prefix["sha256"]] = request
+        exchange["request"] = request
+        yield exchange
 
 
 def sealed_capture_path(path: str | Path) -> Path:
@@ -146,6 +281,22 @@ def read_capture_bytes(path: str | Path) -> bytes:
     """The JSONL bytes of a capture, sealed or not (see ``open_capture``)."""
     with open_capture(path) as lines:
         return b"".join(lines)
+
+
+def read_capture(path: str | Path, loads: Callable[[bytes], Any] = json.loads) -> list[Any]:
+    """A capture's records in append order with full requests, sealed or not.
+
+    This is the reader for capture files: a stored record may hold only the messages its
+    base request lacked, so parsing lines directly returns partial requests. ``loads`` parses
+    one line. Raises ``ValueError`` (a ``JSONDecodeError`` for an unparsable line) when a line
+    cannot be read or names a base the capture does not hold.
+    """
+    records = [loads(line) for line in read_capture_bytes(path).split(b"\n") if line.strip()]
+    expanded = list(expand_request_prefixes(records))
+    for index, record in enumerate(expanded):
+        if record is None:
+            raise ValueError(f"capture {str(path)!r} line {index} references a request it does not hold")
+    return expanded
 
 
 def seal_capture(path: str | Path) -> bool:
