@@ -69,3 +69,26 @@ def test_extracted_patch_recreates_exact_candidate(tmp_path, monkeypatch, before
     assert (grader / "plain.py").read_bytes() == b"baseline = 2\n"
     assert (grader / "plain.py").stat().st_mode & 0o111 == 0o111
     assert (attributes.read_bytes() if attributes.exists() else None) == original_attributes
+
+
+def test_recorded_patch_is_bounded_and_marked(tmp_path, monkeypatch):
+    """Run 241110 wrote a 6.5 GB patch into nemo_gym_metrics.json; the record is now capped."""
+    import json
+
+    from responses_api_agents.anyswe_agent import app
+
+    monkeypatch.setattr(app, "MODEL_PATCH_RECORD_CHARS", 64)
+    metrics = tmp_path / "nemo_gym_metrics.json"
+    metrics.write_text("{}")
+    small = "diff --git a/x b/x\n+ok\n"
+    assert app._recorded_patch(small) == small
+    assert app._recorded_patch("") is None
+
+    large = "diff --git a/big b/big\n" + "+" + "é" * 1000 + "\n"
+    app.update_metrics(metrics, {"model_patch": app._recorded_patch(large), "model_patch_bytes": len(large.encode())})
+    recorded = app.SWEBenchMetrics.model_validate_json(metrics.read_text())
+    assert recorded.model_patch.startswith(large[:64])
+    assert recorded.model_patch.endswith(f"[model_patch truncated: {len(large)} characters, first 64 kept; the whole patch is patch.diff]\n")
+    assert len(recorded.model_patch) < 200
+    assert recorded.model_patch_bytes == len(large.encode())
+    assert json.loads(metrics.read_text())["model_patch_bytes"] > 2000
