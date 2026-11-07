@@ -166,6 +166,7 @@ class TestLocalTmuxSession:
         session = LocalTmuxSession(
             session_name=f"ready-{os.getpid()}",
             environment=environment,
+            logs_dir=tmp_path / "logs",
             logging_path=tmp_path / "pane.log",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
@@ -189,6 +190,7 @@ class TestLocalTmuxSession:
         session = EmptyLauncher(
             session_name=f"missing-{os.getpid()}",
             environment=environment,
+            logs_dir=tmp_path / "logs",
             logging_path=tmp_path / "pane.log",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
@@ -203,6 +205,7 @@ class TestLocalTmuxSession:
         session = LocalTmuxSession(
             session_name="terminus-test",
             environment=MagicMock(),
+            logs_dir=tmp_path / "logs",
             logging_path=tmp_path / "pane.log",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
@@ -213,19 +216,26 @@ class TestLocalTmuxSession:
         assert "tmux new-session" in command
 
     def test_linux_launcher_runs_upstream_start_in_the_command_namespace(self, tmp_path: Path) -> None:
+        environment = MagicMock()
+        environment._tmux_directory.name = str(tmp_path / "gym-tmux-test")
+        environment.cwd = tmp_path / "workspace"
         session = LocalTmuxSession(
             session_name="terminus-test",
-            environment=MagicMock(),
-            logging_path=tmp_path / "pane.log",
+            environment=environment,
+            logs_dir=tmp_path / "logs",
+            logging_path=tmp_path / "logs" / "pane.log",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
         )
         with patch("responses_api_agents.terminus_2_agent.app.sys.platform", "linux"):
             command = session._tmux_start_session
         upstream = Terminus2SessionBase._tmux_start_session.fget(session)
-        hidden = [arg for path in HARNESS_MOUNTS for arg in ("--hide", path)]
-        assert shlex.split(command) == [sys.executable, "-I", str(COMMAND_NAMESPACE), *hidden, "bash", "-c", upstream]
-        assert "script -qc" in upstream
+        paths = (*HARNESS_MOUNTS, str(tmp_path / "logs"), str(tmp_path / "gym-tmux-test"))
+        hidden = [arg for path in paths for arg in ("--hide", path)]
+        argv = shlex.split(command)
+        assert argv[: 3 + len(hidden)] == [sys.executable, "-I", str(COMMAND_NAMESPACE), *hidden]
+        assert argv[3 + len(hidden) : -1] == ["bash", "-c"]
+        assert argv[-1].startswith(f"{upstream} && ") and "script -qc" in upstream
 
 
 async def _wait_for(predicate, timeout_s: float = 20.0) -> None:
@@ -244,6 +254,7 @@ class TestCommandNamespace:
         session = LocalTmuxSession(
             session_name=f"contained-{os.getpid()}",
             environment=environment,
+            logs_dir=tmp_path / "logs",
             logging_path=tmp_path / "pane.log",
             local_asciinema_recording_path=None,
             remote_asciinema_recording_path=None,
@@ -672,7 +683,9 @@ class TestConfig:
 
 def _setup_agent(logs_dir: Path) -> StandaloneTerminus2:
     agent = object.__new__(StandaloneTerminus2)
-    agent.logs_dir = logs_dir
+    # The policy's terminal never sees the logs directory, so it is not the workspace.
+    agent.logs_dir = logs_dir / "logs"
+    agent.logs_dir.mkdir()
     agent._record_terminal_session = False
     agent._tmux_pane_width, agent._tmux_pane_height = 160, 40
     agent._session = None
