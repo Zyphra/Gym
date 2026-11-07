@@ -594,6 +594,37 @@ signal.pause()
         assert bad.wait.call_count == 2
         assert runner._processes == {}
 
+    def test_stubborn_children_cost_one_drain_and_one_reap_window(self, capsys) -> None:
+        """Three children that ignore SIGINT and cannot be reaped (uninterruptible sleep)
+        are listed once, killed together, and reaped against one shared deadline."""
+        def stubborn(name: str) -> MagicMock:
+            child = MagicMock()
+            child.pid = 1000 + len(name)
+            child.args = ["python", "-m", name]
+
+            def wait(timeout=None):
+                sleep(timeout)
+                raise TimeoutExpired(cmd=name, timeout=timeout)
+
+            child.wait.side_effect = wait
+            return child
+
+        children = {name: stubborn(name) for name in ("one", "three", "seven")}
+        runner = self._make_runner_with_processes(children)
+        runner._graceful_shutdown_timeout_s = 0.3
+        started = monotonic()
+        runner.shutdown()
+        elapsed = monotonic() - started
+
+        # Drain (0.3 s) + one reap window; sequential reaps would cost 3 x the window.
+        assert elapsed < 0.3 + _FORCE_KILL_REAP_TIMEOUT_SEC + 1.0
+        out: str = capsys.readouterr().out
+        for name, child in children.items():
+            child.kill.assert_called_once()
+            assert f'[gym-child-live] name="{name}" pid={child.pid} cmd=["python", "-m", "{name}"]' in out
+            assert f'[gym-child-exit] name="{name}"' in out and "reaped=false" in out
+        assert runner._processes == {}
+
     def test_unreaped_server_after_sigkill_is_warned(self, capsys) -> None:
         zombie = MagicMock()
         zombie.wait.side_effect = TimeoutExpired(cmd="zombie", timeout=_GRACEFUL_SHUTDOWN_TIMEOUT_SEC)
