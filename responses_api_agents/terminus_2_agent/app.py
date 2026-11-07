@@ -43,7 +43,7 @@ from harbor.agents.terminus_2.tmux_session import TmuxSession
 from harbor.environments.base import ExecResult
 from harbor.models.agent.context import AgentContext
 from openai.types.responses.response_error import ResponseError
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, Body, SimpleResponsesAPIAgent
@@ -81,12 +81,11 @@ COMMAND_NAMESPACE = Path(__file__).with_name("command_namespace.py")
 # these paths. The agent's terminal does not see them: a task container run by
 # Harbor has none of them. Paths absent from a sandbox are left alone.
 HARNESS_MOUNTS = ("/trajectories_mount", "/nemo_gym_mount", "/agent_deps_mount")
-# Harbor's run logs (trajectory*.json, episode-N/prompt.txt and response.txt) live in this
-# subdirectory of a run's logs directory. The harness writes them during the episode; the
-# agent's terminal sees the directory empty, so a policy cannot read its own history back.
-# The tmux pane log and asciinema recording are written from inside the agent's namespace
-# and stay beside it.
-HARNESS_LOGS = "harness"
+# The harness's own files are hidden the same way, so a policy cannot read its history
+# back: the run's logs directory (Harbor's trajectory*.json and episode-N/prompt.txt and
+# response.txt, written during the episode, and the pane log) and the tmux socket directory.
+# The start waits up to this long for tmux to open the pane log before the hide.
+PANE_LOG_OPEN_TIMEOUT_SECONDS = 5.0
 NATIVE_COMMAND_PROCESS = Path("/native_command_process.py")
 NATIVE_POLICY_BRIDGE = Path("/native_policy_bridge.py")
 NATIVE_CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -408,9 +407,9 @@ class TerminusSetupError(RuntimeError):
 class LocalTmuxSession(TmuxSession):
     """Use Harbor's Linux launcher and a BSD-compatible macOS launcher."""
 
-    def __init__(self, *args: Any, harness_logs_dir: Path, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, logs_dir: Path, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self._harness_logs_dir = harness_logs_dir
+        self._logs_dir = logs_dir
 
     async def start(self) -> None:
         await super().start()
@@ -439,10 +438,20 @@ class LocalTmuxSession(TmuxSession):
             # The tmux server, and every command the agent types into it, starts
             # in its own PID namespace as the preferred OOM victim: the agent's
             # kill commands and the task's memory use cannot end this harness.
+            if Path(self.environment.cwd).is_relative_to(self._logs_dir):
+                raise ValueError(f"Terminus-2 workspace {self.environment.cwd} is inside its hidden logs directory")
+            hidden = (*HARNESS_MOUNTS, str(self._logs_dir), self.environment._tmux_directory.name)
+            # tmux opens the pane log from a forked shell after its client returns. The
+            # hide follows ARGV, so ARGV waits until that open has happened (the file exists).
+            polls = int(PANE_LOG_OPEN_TIMEOUT_SECONDS / 0.01)
+            pane_log_opened = (
+                f'i=0; until [ -e {shlex.quote(str(self._logging_path))} ] || [ "$i" -ge {polls} ]; '
+                "do sleep 0.01; i=$((i+1)); done"
+            )
             return (
                 f"{shlex.quote(sys.executable)} -I {shlex.quote(str(COMMAND_NAMESPACE))} "
-                + "".join(f"--hide {shlex.quote(path)} " for path in (*HARNESS_MOUNTS, str(self._harness_logs_dir)))
-                + f"bash -c {shlex.quote(super()._tmux_start_session)}"
+                + "".join(f"--hide {shlex.quote(path)} " for path in hidden)
+                + f"bash -c {shlex.quote(f'{super()._tmux_start_session} && {{ {pane_log_opened}; }}')}"
             )
 
         session_name = shlex.quote(self._session_name)
@@ -459,12 +468,8 @@ class LocalTmuxSession(TmuxSession):
 class StandaloneTerminus2(ServedContextTerminus2):
     """Run Terminus-2 in a unique tmux session."""
 
-    def __init__(self, *args: Any, logs_dir: Path, **kwargs: Any) -> None:
-        # Harbor writes its run logs into its logs_dir; the terminal's own files stay in the run's.
-        self.terminal_logs_dir = Path(logs_dir)
-        harness_logs_dir = self.terminal_logs_dir / HARNESS_LOGS
-        harness_logs_dir.mkdir(parents=True, exist_ok=True)
-        super().__init__(*args, logs_dir=harness_logs_dir, **kwargs)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
         self._compactions: list[ContextCompactionObservation] = []
         self._handoff_calls: list[CompactionHandoffCall] = []
         self._compaction_trigger = "context_length_exceeded"
@@ -665,12 +670,12 @@ class StandaloneTerminus2(ServedContextTerminus2):
     async def _setup_session(self, environment: LocalEnvironment) -> None:
         self._consecutive_completion_claims = 0
         self._standalone_session_name = f"terminus-2-{uuid4().hex[:12]}"
-        recording_path = self.terminal_logs_dir / "recording.cast" if self._record_terminal_session else None
+        recording_path = self.logs_dir / "recording.cast" if self._record_terminal_session else None
         self._session = LocalTmuxSession(
             session_name=self._standalone_session_name,
             environment=environment,
-            harness_logs_dir=self.logs_dir,
-            logging_path=self.terminal_logs_dir / "terminus_2.pane",
+            logs_dir=self.logs_dir,
+            logging_path=self.logs_dir / "terminus_2.pane",
             local_asciinema_recording_path=recording_path,
             remote_asciinema_recording_path=recording_path,
             pane_width=self._tmux_pane_width,
@@ -728,6 +733,16 @@ class Terminus2AgentConfig(BaseResponsesAPIAgentConfig):
     timeout: float = 10800
     keep_logs: bool = False
     logs_root: str = "outputs/terminus_2_agent/runs"
+
+    @field_validator("record_terminal_session")
+    @classmethod
+    def _recording_stays_out_of_the_terminal(cls, value: bool) -> bool:
+        if value:
+            raise ValueError(
+                "record_terminal_session runs asciinema inside the policy's terminal, where its "
+                "recording of the episode would be readable by the policy"
+            )
+        return value
 
 
 class Terminus2AgentRunRequest(BaseRunRequest):
@@ -857,7 +872,7 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
                 except Exception as error:
                     LOG.warning("Terminus-2 environment teardown failed (ignored): %s", error)
 
-            trajectory_path = logs_dir / HARNESS_LOGS / "trajectory.json"
+            trajectory_path = logs_dir / "trajectory.json"
             trajectory = json.loads(trajectory_path.read_text()) if trajectory_path.exists() else {"steps": []}
             flags = {
                 "context_length_exceeded": agent.context_length_exceeded,
