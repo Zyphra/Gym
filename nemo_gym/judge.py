@@ -32,7 +32,8 @@ exception it sees, so covering a whole ``verify()`` would misfile ordinary bugs
 """
 
 import functools
-from typing import Any, Awaitable, Callable, Type, TypeVar
+import re
+from typing import Any, Awaitable, Callable, Mapping, Type, TypeVar
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -46,6 +47,33 @@ ResponseT = TypeVar("ResponseT", bound=BaseModel)
 
 class JudgeError(Exception):
     """A judge call failed; judge_failsafe routes the row to the failures sidecar."""
+
+
+def parse_judge_grade(judge_text: str, labels: Mapping[str, str], default: str) -> str:
+    """Map a judge reply to its grade letter, anchored to where a verdict is written.
+
+    ``labels`` maps each label word to its letter (``{"CORRECT": "A", ...}``); the
+    letters are the valid grades. Tried in order, the first hit wins:
+
+    1. a leading letter followed by a non-letter, on the whole reply or its last
+       line (covers the bare letter, ``A: CORRECT`` and ``B - INCORRECT``);
+    2. an explicit ``Grade: X`` / ``grade is X`` (the last one);
+    3. one distinct label word, upper case, as a whole word.
+
+    Anything else returns ``default``. A letter or label is never matched inside
+    other text, so ``NOT_ATTEMPTED`` or ``INCORRECT`` cannot read as ``A``.
+    """
+    letters = "".join(sorted(set(labels.values())))
+    text = judge_text.strip().strip("*_`\"'()[] \t")
+    last_line = text.rsplit("\n", 1)[-1].strip().strip("*_`\"'()[] \t")
+    for candidate in (text, last_line):
+        if m := re.match(rf"([{letters}])(?![A-Za-z])", candidate):
+            return m.group(1)
+    if graded := re.findall(rf"(?i:\bgrade)\s*(?:is|:|=)?\s*[*_`\"'(\[]*([{letters}])(?![A-Za-z])", text):
+        return graded[-1]
+    words = "|".join(sorted(map(re.escape, labels), key=len, reverse=True))
+    found = {labels[w] for w in re.findall(rf"(?<![A-Za-z_])({words})(?![A-Za-z_])", text)}
+    return found.pop() if len(found) == 1 else default
 
 
 async def reraise_judge_errors(coro: Awaitable[Any]) -> Any:

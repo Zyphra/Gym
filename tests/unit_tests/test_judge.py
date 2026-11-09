@@ -18,7 +18,7 @@ import orjson
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from nemo_gym.judge import JudgeError, call_judge, judge_failsafe, reraise_judge_errors
+from nemo_gym.judge import JudgeError, call_judge, judge_failsafe, parse_judge_grade, reraise_judge_errors
 
 
 class _Req(BaseModel):
@@ -104,3 +104,45 @@ class TestJudgeFailsafe:
         assert data["response"] == {"final": "answer"}
         # Transient: never terminal, so resume re-dispatches it.
         assert "_ng_failure_terminal" not in data
+
+
+_FOUR = {"CORRECT": "A", "INCORRECT": "B", "PARTIAL_ANSWER": "C", "NOT_ATTEMPTED": "D"}
+_THREE = {"CORRECT": "A", "INCORRECT": "B", "NOT_ATTEMPTED": "C"}
+
+
+class TestParseJudgeGrade:
+    @pytest.mark.parametrize(
+        "text, labels, default, expected",
+        [
+            # Replies a judge model produced (bare letters, as the prompt requests).
+            ("A", _FOUR, "B", "A"),
+            ("D\n", _FOUR, "B", "D"),
+            ("  C  ", _THREE, "B", "C"),
+            ("**B**", _FOUR, "B", "B"),
+            # Leading letter, on the reply or its last line.
+            ("A: CORRECT", _THREE, "B", "A"),
+            ("B - INCORRECT", _THREE, "C", "B"),
+            ("The predicted answer differs.\nC (NOT_ATTEMPTED)", _THREE, "B", "C"),
+            # Explicit grade statements.
+            ("The grade is A based on analysis", _FOUR, "B", "A"),
+            ("Reasoning with a letter A inside.\nGrade: D", _FOUR, "B", "D"),
+            # Label words map to the prompt's letters, which differ by rubric.
+            ("NOT_ATTEMPTED", _FOUR, "B", "D"),
+            ("NOT_ATTEMPTED", _THREE, "B", "C"),
+            ("INCORRECT", _FOUR, "C", "B"),
+            ("The answer is CORRECT.", _THREE, "B", "A"),
+            ("This is PARTIAL_ANSWER because it adds detail", _FOUR, "B", "C"),
+            # Not a substring test: a capital A or a label inside a word is not a grade.
+            ("INCORRECT_ANSWER", _FOUR, "C", "C"),
+            ("Grade: C (NOT_ATTEMPTED)", _THREE, "B", "C"),
+            ("The model said NOT_ATTEMPTED, so no match to Alice", _THREE, "B", "C"),
+            ("no clear grade here", _THREE, "B", "B"),
+            ("Both CORRECT and INCORRECT apply", _THREE, "B", "B"),
+            ("", _THREE, "C", "C"),
+        ],
+    )
+    def test_parse(self, text, labels, default, expected) -> None:
+        assert parse_judge_grade(text, labels, default) == expected
+
+    def test_letter_outside_rubric_is_not_a_grade(self) -> None:
+        assert parse_judge_grade("D", _THREE, "B") == "B"

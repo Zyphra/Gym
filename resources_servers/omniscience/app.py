@@ -48,6 +48,7 @@ from nemo_gym.base_resources_server import (
 )
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.judge import JudgeError, call_judge
+from nemo_gym.judge import parse_judge_grade as parse_judge_grade_text
 from nemo_gym.openai_utils import (
     NeMoGymChatCompletion,
     NeMoGymChatCompletionCreateParamsNonStreaming,
@@ -109,26 +110,16 @@ def extract_text_from_response(response: NeMoGymResponse, strip_thinking: bool =
     return ""
 
 
+_GRADE_LABELS = {"CORRECT": "A", "INCORRECT": "B", "PARTIAL_ANSWER": "C", "NOT_ATTEMPTED": "D"}
+
+
 def parse_judge_grade(judge_text: str) -> str:
     """Parse the single-letter grade (A/B/C/D) from the judge's response.
 
     Returns "A", "B", "C", or "D". Falls back to "B" (INCORRECT) when the
     output cannot be reliably parsed.
     """
-    cleaned = judge_text.strip()
-    if cleaned in ("A", "B", "C", "D"):
-        return cleaned
-
-    last_line = cleaned.rsplit("\n", 1)[-1].strip()
-    for letter in ("A", "B", "C", "D"):
-        if last_line == letter:
-            return letter
-
-    for letter in ("A", "B", "C", "D"):
-        if letter in cleaned:
-            return letter
-
-    return "B"
+    return parse_judge_grade_text(judge_text, _GRADE_LABELS, "B")
 
 
 # ---------------------------------------------------------------------------
