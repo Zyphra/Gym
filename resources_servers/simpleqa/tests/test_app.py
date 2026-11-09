@@ -65,6 +65,13 @@ class TestParseJudgeGrade:
         assert parse_judge_grade("B - INCORRECT") == "B"
         assert parse_judge_grade("C, NOT_ATTEMPTED") == "C"
 
+    def test_label_word_is_not_read_as_a_substring(self) -> None:
+        # Substring search read every capital "A" inside these as CORRECT.
+        assert parse_judge_grade("NOT_ATTEMPTED") == "C"
+        assert parse_judge_grade("Reasoning.\nINCORRECT") == "B"
+        assert parse_judge_grade("Grade: C (NOT_ATTEMPTED)") == "C"
+        assert parse_judge_grade("INCORRECT_ANSWER") == "C"
+
 
 class TestExtractTextFromResponse:
     def _make_response(self, text: str) -> NeMoGymResponse:

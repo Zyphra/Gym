@@ -47,6 +47,7 @@ from nemo_gym.base_resources_server import (
 )
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.judge import JudgeError, call_judge
+from nemo_gym.judge import parse_judge_grade as parse_judge_grade_text
 from nemo_gym.openai_utils import (
     NeMoGymChatCompletion,
     NeMoGymChatCompletionCreateParamsNonStreaming,
@@ -84,7 +85,7 @@ def extract_text_from_response(response: NeMoGymResponse) -> str:
     return ""
 
 
-_VALID_GRADES = ("A", "B", "C")
+_GRADE_LABELS = {"CORRECT": "A", "INCORRECT": "B", "NOT_ATTEMPTED": "C"}
 
 
 def parse_judge_grade(judge_text: str) -> str:
@@ -93,23 +94,10 @@ def parse_judge_grade(judge_text: str) -> str:
     Falls back to "C" (NOT_ATTEMPTED) when the output cannot be reliably
     parsed — matches Skills' SimpleQAMetrics behavior of treating
     unparseable judgements as NOT_ATTEMPTED (DEFAULT_GRADE_IF_UNPARSEABLE = "C").
+    Skills accepts the leading character of the reply; the shared parser keeps
+    that and refuses to find a letter anywhere else in the text.
     """
-    # Skills' is_correct_judgement_label_matching matches either the whole
-    # cleaned string or judgement[0] — covered by the cleaned[:1] check on
-    # the stripped string and on the last line.
-    cleaned = judge_text.strip()
-    if cleaned[:1] in _VALID_GRADES:
-        return cleaned[:1]
-
-    last_line = cleaned.rsplit("\n", 1)[-1].strip()
-    if last_line[:1] in _VALID_GRADES:
-        return last_line[:1]
-
-    for letter in _VALID_GRADES:
-        if letter in cleaned:
-            return letter
-
-    return "C"
+    return parse_judge_grade_text(judge_text, _GRADE_LABELS, "C")
 
 
 # ---------------------------------------------------------------------------
