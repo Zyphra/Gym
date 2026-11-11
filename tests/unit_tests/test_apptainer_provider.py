@@ -145,6 +145,45 @@ def test_apptainer_subprocess_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert "APPTAINER_SYSTEMD_CGROUPS" not in env
 
 
+def test_apptainer_subprocess_env_drops_the_inherited_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/home/user")
+    monkeypatch.setenv("APPTAINER_CONFIGDIR", str(tmp_path))
+    monkeypatch.setenv("APPTAINERENV_KEEP", "1")
+    monkeypatch.setenv("VERL_RUN_RECORD_JSON", "x" * 90_000)
+    monkeypatch.setenv("TASK_SOMETHING", "y" * 90_000)
+
+    env = apptainer_provider._apptainer_subprocess_env(None)
+    assert env["HOME"] == "/home/user" and env["APPTAINERENV_KEEP"] == "1"
+    assert "VERL_RUN_RECORD_JSON" not in env and "TASK_SOMETHING" not in env
+    assert sum(len(k) + len(v) + 2 for k, v in env.items()) < 16_384
+    assert max(len(k) + len(v) + 1 for k, v in env.items()) < 65_536
+
+
+def test_apptainer_subprocess_env_keeps_what_the_client_and_helpers_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name, value in {
+        "PATH": "/usr/bin",
+        "LD_LIBRARY_PATH": "/opt/lib",
+        "TMPDIR": "/tmp",
+        "LC_CTYPE": "C.UTF-8",
+        "XDG_RUNTIME_DIR": "/run/user/1",
+        "APPTAINER_CACHEDIR": "/cache",
+        "SINGULARITY_BIND": "/a",
+        "APPTAINERENV_X": "1",
+        "APPTAINER_CONFIGDIR": str(tmp_path),
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    env = apptainer_provider._apptainer_subprocess_env("/ap/bin")
+    for name in ("LD_LIBRARY_PATH", "TMPDIR", "LC_CTYPE", "XDG_RUNTIME_DIR", "APPTAINER_CACHEDIR", "SINGULARITY_BIND", "APPTAINERENV_X"):
+        assert env[name] == os.environ[name]
+    assert env["PATH"] == "/ap/bin:/usr/bin"
+
+
 def test_coerce_config() -> None:
     coerce = apptainer_provider._coerce_config
     cls = apptainer_provider.ApptainerExecConfig
