@@ -83,6 +83,13 @@ gym eval run --no-serve \
     --max-output-tokens 2048
 ```
 
+## Environments
+
+The `enroot` client and the container init start from the allow-listed environment of
+`sandbox_client_environment` (`providers/utils.py`) plus `ENROOT_*`, not a copy of the
+calling process's. `spec.env` is added on top of it and handed to the container with
+`-e NAME`, so every variable a container needs must be named in `spec.env`.
+
 ## Selecting and configuring the provider
 
 The provider config is a single-key mapping: `{"enroot": {<kwargs>}}`. The kwargs

@@ -145,6 +145,126 @@ def test_apptainer_subprocess_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     assert "APPTAINER_SYSTEMD_CGROUPS" not in env
 
 
+def _live_shaped_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The shape of a Ray episode worker's environment: 592 variables, one of them 89 KB."""
+    for name in list(os.environ):
+        monkeypatch.delenv(name)
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", "/home/user")
+    monkeypatch.setenv("VERL_RUN_RECORD_JSON", "x" * 89_500)
+    monkeypatch.setenv("ENROOT_MOUNTS_FROM_PYXIS", "m" * 43_394)
+    monkeypatch.setenv("JUDGE_API_KEY", "secret")
+    for index in range(580):
+        monkeypatch.setenv(f"TASK_VALUE_{index}", "v" * 120)
+
+
+def test_apptainer_subprocess_env_drops_the_inherited_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _live_shaped_environment(monkeypatch)
+    monkeypatch.setenv("APPTAINER_CONFIGDIR", str(tmp_path))
+    monkeypatch.setenv("APPTAINERENV_KEEP", "1")
+
+    env = apptainer_provider._apptainer_subprocess_env(None)
+    assert env["HOME"] == "/home/user" and env["APPTAINERENV_KEEP"] == "1"
+    assert set(env) == {"PATH", "HOME", "APPTAINER_CONFIGDIR", "APPTAINERENV_KEEP", "APPTAINER_CONFIG_FILE"}
+    assert sum(len(k) + len(v) + 2 for k, v in env.items()) < 16_384
+    assert max(len(k) + len(v) + 1 for k, v in env.items()) < 65_536
+
+
+def test_apptainer_subprocess_env_keeps_what_the_client_and_helpers_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name, value in {
+        "PATH": "/usr/bin",
+        "LD_LIBRARY_PATH": "/opt/lib",
+        "TMPDIR": "/tmp",
+        "TERM": "xterm",
+        "LC_CTYPE": "C.UTF-8",
+        "XDG_RUNTIME_DIR": "/run/user/1",
+        "APPTAINER_CACHEDIR": "/cache",
+        "SINGULARITY_BIND": "/a",
+        "APPTAINERENV_X": "1",
+        "https_proxy": "http://proxy",
+        "APPTAINER_CONFIGDIR": str(tmp_path),
+        "OPENAI_API_KEY": "secret",
+        "PYTHONPATH": "/leak",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    env = apptainer_provider._apptainer_subprocess_env("/ap/bin")
+    for name in (
+        "LD_LIBRARY_PATH",
+        "TMPDIR",
+        "TERM",
+        "LC_CTYPE",
+        "XDG_RUNTIME_DIR",
+        "APPTAINER_CACHEDIR",
+        "SINGULARITY_BIND",
+        "APPTAINERENV_X",
+        "https_proxy",
+    ):
+        assert env[name] == os.environ[name]
+    assert env["PATH"] == "/ap/bin:/usr/bin"
+    assert "OPENAI_API_KEY" not in env and "PYTHONPATH" not in env
+
+
+def test_provider_hands_every_client_command_the_allow_listed_environment(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _live_shaped_environment(monkeypatch)
+    monkeypatch.setenv("APPTAINER_CONFIGDIR", str(tmp_path))
+    provider = apptainer_provider.ApptainerProvider()
+    assert "VERL_RUN_RECORD_JSON" not in provider._subprocess_env
+    assert "JUDGE_API_KEY" not in provider._subprocess_env
+    assert len(provider._subprocess_env) == len(apptainer_provider._apptainer_subprocess_env(None))
+
+
+async def test_clients_run_with_the_allow_listed_environment(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The real ``_run`` starts the client process with ``_subprocess_env`` and nothing else."""
+    _live_shaped_environment(monkeypatch)
+    monkeypatch.setenv("APPTAINER_CONFIGDIR", str(tmp_path))
+    provider = apptainer_provider.ApptainerProvider()
+    seen: list[dict[str, str]] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*argv: str, **kwargs: Any) -> Any:
+        seen.append(dict(kwargs["env"]))
+        return await real_exec("/bin/sh", "-c", "exit 0", **kwargs)
+
+    monkeypatch.setattr(apptainer_provider.asyncio, "create_subprocess_exec", spy)
+    assert (await provider._run([FAKE_BINARY, "version"], timeout_s=10))[0] == 0
+    assert seen == [provider._subprocess_env]
+    assert "VERL_RUN_RECORD_JSON" not in seen[0]
+
+
+async def test_create_and_exec_always_run_the_container_with_cleanenv(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    staging = tmp_path / "staging"
+    monkeypatch.setattr(apptainer_provider.tempfile, "mkdtemp", lambda prefix: str(staging.mkdir() or staging))
+
+    def responder(argv: list[str]) -> tuple[int, str, str]:
+        return (0, apptainer_provider.READY_PROBE_EXPECTED if "exec" in argv else "", "")
+
+    provider, rec = _make_provider(monkeypatch, responder)
+    handle = await provider.create(SandboxSpec(image="ubuntu:22.04", env={"FOO": "bar"}))
+    await provider.exec(handle, "true", env={"A": "b"})
+    for call in rec.calls:
+        assert call["argv"].count("--cleanenv") == 1, call["argv"]
+
+    # A caller that already asks for it (``--cleanenv`` or its short form) is not given a second one.
+    provider, rec = _make_provider(
+        monkeypatch,
+        responder,
+        exec={"extra_exec_args": ["-e", "--contain"]},
+    )
+    await provider.exec(handle, "true")
+    assert rec.calls[0]["argv"].count("--cleanenv") == 0 and rec.calls[0]["argv"].count("-e") == 1
+
+
 def test_coerce_config() -> None:
     coerce = apptainer_provider._coerce_config
     cls = apptainer_provider.ApptainerExecConfig

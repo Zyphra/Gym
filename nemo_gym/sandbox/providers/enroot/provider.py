@@ -51,6 +51,7 @@ from nemo_gym.sandbox.providers.base import (
 )
 from nemo_gym.sandbox.providers.utils import coerce_config as _coerce_config
 from nemo_gym.sandbox.providers.utils import path_under_mount as _path_under_mount
+from nemo_gym.sandbox.providers.utils import sandbox_client_environment
 from nemo_gym.setup_timeout import setup_timeout_seconds
 
 
@@ -91,6 +92,9 @@ class EnrootCreateError(SandboxCreateError):
 
 class EnrootCreateVerificationError(SandboxCreateVerificationError):
     """Raised when a newly-created sandbox cannot execute a probe command."""
+
+
+_ENROOT_ENV_PREFIXES = ("ENROOT",)
 
 
 def _read_proc_cmdline(pid: int) -> str:
@@ -362,8 +366,9 @@ class EnrootProvider:
         for directory in (data_path, cache_path, runtime_path, self._sqsh_cache_dir):
             Path(directory).mkdir(parents=True, exist_ok=True, mode=0o700)
 
+        # The client and the container init start from the allow-listed environment, not the worker's.
         self._enroot_env = {
-            **os.environ,
+            **sandbox_client_environment(_ENROOT_ENV_PREFIXES),
             "ENROOT_DATA_PATH": data_path,
             "ENROOT_CACHE_PATH": cache_path,
             "ENROOT_RUNTIME_PATH": runtime_path,

@@ -18,9 +18,57 @@ These were previously duplicated verbatim across the enroot, apptainer, and
 opensandbox providers. They live here so there is a single implementation.
 """
 
+import os
 import posixpath
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
+
+
+# What a sandbox runtime client (``apptainer``, ``enroot``) and its helpers read from the environment
+# they are started in. Everything a container needs travels explicitly (``--env-file`` or ``-e``);
+# nothing reaches it by inheriting the worker's environment. Some Apptainer paths hang when the
+# client environment holds a variable over 64 KiB (the trainer's run record is one), and a worker
+# environment carries credentials no sandbox should see.
+CLIENT_ENV_NAMES = frozenset(
+    {
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TZ",
+        "TERM",
+        "TMPDIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        # Enroot's cgroup hooks mount the delegated Slurm step cgroup only when this is set.
+        "SLURM_STEP_ID",
+        # Kept by ``apptainer --cleanenv`` itself, so the client must still receive them.
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "FTP_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "ftp_proxy",
+        "no_proxy",
+    }
+)
+CLIENT_ENV_PREFIXES = ("LC_", "XDG_")
+
+
+def sandbox_client_environment(
+    extra_prefixes: Iterable[str] = (),
+    *,
+    extra_names: Iterable[str] = (),
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The allow-listed subset of ``environ`` (default ``os.environ``) a sandbox client process receives."""
+    names = CLIENT_ENV_NAMES.union(extra_names)
+    prefixes = (*CLIENT_ENV_PREFIXES, *extra_prefixes)
+    source = os.environ if environ is None else environ
+    return {name: value for name, value in source.items() if name in names or name.startswith(prefixes)}
 
 
 def coerce_config(value: Any, config_cls: type[Any]) -> Any:

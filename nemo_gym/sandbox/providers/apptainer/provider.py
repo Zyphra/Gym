@@ -44,6 +44,7 @@ from nemo_gym.sandbox.providers.base import (
 )
 from nemo_gym.sandbox.providers.utils import coerce_config as _coerce_config
 from nemo_gym.sandbox.providers.utils import path_under_mount as _path_under_mount
+from nemo_gym.sandbox.providers.utils import sandbox_client_environment
 from nemo_gym.sandbox.utils import remove_private_directory
 from nemo_gym.setup_timeout import setup_timeout_seconds
 
@@ -94,8 +95,16 @@ def _require_apptainer(bin_path: str | None = None) -> str:
     )
 
 
+# The Apptainer client is the only consumer of this environment: the container gets its own
+# through ``--cleanenv`` and ``--env-file``. With ``--fakeroot`` and no /etc/subuid mapping,
+# Apptainer captures the client's environment from the output of ``fakeroot-sysv env`` and stops
+# reading at a variable longer than 64 KiB; the rest of ``env``'s output then fills the pipe and
+# the exec hangs until its timeout (the Hero trainer environment holds an 89 KB variable).
+_APPTAINER_ENV_PREFIXES = ("APPTAINER", "SINGULARITY")
+
+
 def _apptainer_subprocess_env(bin_path: str | None) -> dict[str, str]:
-    env = os.environ.copy()
+    env = sandbox_client_environment(_APPTAINER_ENV_PREFIXES)
     # Instances are children of the enclosing Slurm/Pyxis job. Asking
     # Apptainer to create a user-systemd scope moves lifecycle ownership away
     # from the job and races scope teardown during instance start. This host
@@ -108,6 +117,11 @@ def _apptainer_subprocess_env(bin_path: str | None) -> dict[str, str]:
     if bin_path:
         env["PATH"] = f"{bin_path}:{env.get('PATH', '')}"
     return env
+
+
+def _with_cleanenv(args: list[str]) -> list[str]:
+    """Every container starts from its own environment plus ``--env-file``, never the client's."""
+    return [*args] if "--cleanenv" in args or "-e" in args else ["--cleanenv", *args]
 
 
 @dataclass(frozen=True)
@@ -827,7 +841,7 @@ class ApptainerProvider:
             argv += ["--bind", bind]
         for bind in extra_binds:
             argv += ["--bind", bind]
-        start_args = list(self._create_config.extra_start_args)
+        start_args = _with_cleanenv(self._create_config.extra_start_args)
         if self._create_config.disk_backed_overlay:
             start_args = [arg for arg in start_args if arg != "--writable-tmpfs"]
             # Apptainer's implicit host home/tmp binds would expose backing
@@ -1013,7 +1027,7 @@ class ApptainerProvider:
             flags.append("--fakeroot")
             effective_command = f"su -s /bin/sh -c {shlex.quote(command)} {shlex.quote(str(user))}"
 
-        flags += list(self._exec_config.extra_exec_args)
+        flags += _with_cleanenv(self._exec_config.extra_exec_args)
 
         effective_timeout = timeout_s if timeout_s is not None else self._exec_config.default_timeout_s
 

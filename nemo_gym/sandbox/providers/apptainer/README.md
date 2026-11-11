@@ -176,6 +176,17 @@ The spec is provider-neutral; the Apptainer provider uses these fields:
 Instances are named `nemo-gym-<uuid>` and persist across `exec` calls, so state written
 by one command is visible to the next — agents rely on this.
 
+### Environments: the client's, and the container's
+
+The `apptainer` client starts from an allow-listed environment (`PATH`, `HOME`, `TMPDIR`,
+locale, `XDG_*`, `APPTAINER*`, `SINGULARITY*`, ...; see `sandbox_client_environment` in
+`providers/utils.py`), never a copy of the calling process's. Every `instance start` and
+`exec` also gets `--cleanenv`, so a container sees only its image, `spec.env` and the
+per-call `env` (written to a private `--env-file`). Nothing reaches a container by
+inheriting the worker's environment. A very large inherited variable (the trainer's run
+record is 89 KB) also hangs `--fakeroot` execs under a root-mapped user namespace, because
+`fakeroot-sysv env` output is read through a 64 KiB line limit.
+
 ### Why `create` runs `instance start` in "daemonize" mode
 
 `apptainer instance start` is different from every other command the provider runs: it
