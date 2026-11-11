@@ -94,8 +94,25 @@ def _require_apptainer(bin_path: str | None = None) -> str:
     )
 
 
+# The Apptainer client is the only consumer of this environment: the container gets its own
+# through --cleanenv and --env-file. With --fakeroot and no /etc/subuid mapping, Apptainer
+# captures the client's environment from the output of ``fakeroot-sysv env`` and stops reading
+# at a variable longer than 64 KiB; the rest of ``env``'s output then fills the pipe and the
+# exec hangs until its timeout (the Hero trainer environment holds a 89 KB variable; a 4 KiB
+# pipe, which a user over fs.pipe-user-pages-soft gets, hangs it on 2 KB of remaining output).
+# Pass on only the variables the client and its helpers read.
+_APPTAINER_ENV_NAMES = frozenset(
+    {"PATH", "LD_LIBRARY_PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TMPDIR", "DBUS_SESSION_BUS_ADDRESS"}
+)
+_APPTAINER_ENV_PREFIXES = ("APPTAINER", "SINGULARITY", "LC_", "XDG_")
+
+
 def _apptainer_subprocess_env(bin_path: str | None) -> dict[str, str]:
-    env = os.environ.copy()
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in _APPTAINER_ENV_NAMES or name.startswith(_APPTAINER_ENV_PREFIXES)
+    }
     # Instances are children of the enclosing Slurm/Pyxis job. Asking
     # Apptainer to create a user-systemd scope moves lifecycle ownership away
     # from the job and races scope teardown during instance start. This host
