@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import io
+import os
 import shlex
 import shutil
 from pathlib import Path
@@ -269,6 +270,42 @@ def test_constructor_pins_enroot_env(fake_binary: str, tmp_path: Path) -> None:
     # Directories are created eagerly.
     assert (tmp_path / "home" / "data").is_dir()
     assert provider._sqsh_cache_dir.is_dir()
+
+
+def test_constructor_hands_enroot_only_the_allow_listed_environment(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in list(os.environ):
+        monkeypatch.delenv(name)
+    for name, value in {
+        "PATH": "/usr/bin",
+        "HOME": "/home/user",
+        "TMPDIR": "/tmp",
+        "LD_LIBRARY_PATH": "/opt/enroot/lib",
+        "ENROOT_LIBRARY_PATH": "/opt/enroot/lib",
+        "SLURM_STEP_ID": "0",
+        "LC_ALL": "C",
+        "VERL_RUN_RECORD_JSON": "x" * 89_500,
+        "JUDGE_API_KEY": "secret",
+        "PYTHONPATH": "/leak",
+        "SLURM_JOB_NODELIST": "cnode-[1-9]",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    provider = enroot_provider.EnrootProvider(create={"base_dir": str(tmp_path / "home")})
+    assert set(provider._enroot_env) == {
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "LD_LIBRARY_PATH",
+        "ENROOT_LIBRARY_PATH",
+        "SLURM_STEP_ID",
+        "LC_ALL",
+        "ENROOT_DATA_PATH",
+        "ENROOT_CACHE_PATH",
+        "ENROOT_RUNTIME_PATH",
+        "ENROOT_UNSHARE_PID",
+    }
 
 
 # --------------------------------------------------------------------------- #
