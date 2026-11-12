@@ -232,12 +232,33 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
             self.resolved = False
             if self.verifier_reward is not None:
                 self.verifier_reward = 0.0
+        # Two different zeros. (a) The verifier ran and read the policy's deliverable as worth
+        # nothing: a scored sample, even at reward 0. (b) The verifier produced no reward at all
+        # (judge or API error, unreadable reward file): an infrastructure failure of grading, so
+        # the episode is unscored and masked like a container timeout or a sandbox failure.
         self.mask_sample = bool(
             self.mask_sample
             or self.container_timed_out
             or self.sandbox_failed
+            or self.verifier_reward_unreadable
             or (self.agent_timed_out and not agent_timeout_is_failure)
         )
+
+
+def _verifier_error_report(verifier_dir: Path) -> Optional[str]:
+    """The verifier's own error, when it wrote ``verification.json`` with ``status: error``.
+
+    The JobBench verifier writes it for every judge, API or protocol failure it did not turn
+    into a score. It also writes it for an output tree it refuses (a symlink or special file),
+    which the policy can cause; the report does not name that case apart.
+    """
+    try:
+        report = json.loads((verifier_dir / "verification.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if isinstance(report, dict) and report.get("status") == "error" and report.get("error"):
+        return str(report["error"])[:512]
+    return None
 
 
 def _checked_reward(value: float, fractional: bool) -> float:
@@ -1591,8 +1612,14 @@ class RunTerminalAgent(BaseModel):
         verifier_reward_unreadable = bool(
             reward_problem and eval_run_time is not None and not (container_timed_out or sandbox_failed)
         )
+        verifier_unscored_detail = None
         if verifier_reward_unreadable:
             print(f"[{cfg.task_name}] eval finished without a readable reward.txt: {reward_problem}", flush=True)
+            # Case (b) of TerminalBenchMetrics.apply_timeout_policy: record the verifier's own
+            # account of why it graded nothing, so the mask names its cause.
+            verifier_unscored_detail = "verifier_reward_unreadable: " + (
+                _verifier_error_report(cfg.verifier_dir) or reward_problem or "unknown"
+            )
 
         metrics = TerminalBenchMetrics(
             ray_queue_time=time.time() - cfg.ray_queue_timestamp,
@@ -1611,7 +1638,7 @@ class RunTerminalAgent(BaseModel):
             agent_run_time=agent_run_time,
             eval_run_time=eval_run_time,
             total_run_time=total_run_time,
-            error_detail=memory_kill or verifier_kill or sandbox_problem,
+            error_detail=memory_kill or verifier_kill or sandbox_problem or verifier_unscored_detail,
             verifier_phase_memory_events=verifier_phase_events or None,
             memory_failure_phase="verifier"
             if verifier_phase_kill

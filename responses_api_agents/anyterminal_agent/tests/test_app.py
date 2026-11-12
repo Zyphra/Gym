@@ -1585,11 +1585,58 @@ class TestProcessSingleDatapoint:
 
         assert result is False
         metrics = json.loads(cfg.metrics_fpath.read_text())
-        # test.sh writes 0 or 1: a completed eval without reward.txt is labelled, not masked.
+        # test.sh writes 0 or 1: a completed eval without reward.txt did not grade, so it is unscored.
         assert metrics["verifier_reward_unreadable"] is True
-        assert metrics["mask_sample"] is False
+        assert metrics["mask_sample"] is True
+        assert metrics["error_detail"].startswith("verifier_reward_unreadable: FileNotFoundError")
 
-    async def test_unparsable_reward_is_labelled_not_masked(self, tmp_path: Path, capsys) -> None:
+    async def test_judge_error_is_unscored_with_the_verifiers_own_error(self, tmp_path: Path) -> None:
+        # JobBench shape: verify.py exits 1 on a judge API failure, writes verification.json with
+        # status "error" and never writes reward.txt.
+        cfg = _make_instance_config(tmp_path)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.verifier_dir / "verification.json").write_text(
+                    json.dumps({"status": "error", "error": "Judge failed for jobbench_rubric_1.log: API exit 1, HTTP 402"})
+                )
+                return _sandbox_result(return_code=1)
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=verifier), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                result = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        assert result is False
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["verifier_reward_unreadable"] is True
+        assert metrics["mask_sample"] is True
+        assert metrics["container_timed_out"] is False and metrics["sandbox_failed"] is False
+        assert "HTTP 402" in metrics["error_detail"]
+        assert metrics["error_detail"].startswith("verifier_reward_unreadable:")
+
+    async def test_verifier_zero_stays_scored(self, tmp_path: Path) -> None:
+        # The verifier ran and the deliverable earned nothing (JobBench: empty output is a valid 0).
+        cfg = _make_instance_config(tmp_path)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.verifier_dir / "reward.txt").write_text("0")
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=verifier), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                result = await RunTerminalAgent(config=cfg).process_single_datapoint()
+
+        assert result is False
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["verifier_reward_unreadable"] is False
+        assert metrics["mask_sample"] is False
+        assert metrics.get("error_detail") is None
+
+    async def test_unparsable_reward_is_unscored(self, tmp_path: Path, capsys) -> None:
         cfg = _make_instance_config(tmp_path)
 
         async def verifier(command, **kwargs):
@@ -1609,7 +1656,7 @@ class TestProcessSingleDatapoint:
         assert result is False
         metrics = json.loads(cfg.metrics_fpath.read_text())
         assert metrics["verifier_reward_unreadable"] is True
-        assert metrics["mask_sample"] is False
+        assert metrics["mask_sample"] is True
         assert "without a readable reward.txt: ValueError" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
