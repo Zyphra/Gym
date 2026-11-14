@@ -22,11 +22,13 @@ import os
 import shlex
 import shutil
 import signal
+import socket
+import urllib.request
 from asyncio import Semaphore
 from collections.abc import Mapping
 from pathlib import Path
 from time import time
-from typing import Any, Callable, ClassVar, Optional
+from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
 import psutil
@@ -308,6 +310,49 @@ def parse_openclaw_session_events(session_text: str) -> list[dict[str, Any]]:
     return events
 
 
+def merge_harbor_config(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    """Merge a config patch the way the LiveClawBench Harbor adapter's node script does.
+
+    claw-harbor v0.2.0 ``agents/installed/openclaw.py`` (``_MERGE_NODE_SCRIPT``): MCP servers and
+    ``agents.defaults`` merge key by key, ``env`` always merges, each provider entry merges field by
+    field, and ``browser`` merges ``headless``, ``noSandbox`` and ``ssrfPolicy``. Nothing else in the
+    existing config is touched.
+    """
+    cfg = copy.deepcopy(base)
+    if "mcp" in patch:
+        mcp = cfg.setdefault("mcp", {})
+        mcp["servers"] = {**(mcp.get("servers") or {}), **patch["mcp"].get("servers", {})}
+    if "agents" in patch:
+        cfg.setdefault("agents", {}).setdefault("defaults", {}).update(patch["agents"].get("defaults", {}))
+    cfg.setdefault("env", {}).update(patch.get("env") or {})
+    if "models" in patch:
+        providers = cfg.setdefault("models", {}).setdefault("providers", {})
+        for name, provider in patch["models"]["providers"].items():
+            providers.setdefault(name, {}).update(provider)
+    if "browser" in patch:
+        browser = cfg.setdefault("browser", {})
+        for key in ("headless", "noSandbox"):
+            if key in patch["browser"]:
+                browser[key] = patch["browser"][key]
+        if "ssrfPolicy" in patch["browser"]:
+            browser.setdefault("ssrfPolicy", {}).update(patch["browser"]["ssrfPolicy"])
+    return cfg
+
+
+def _free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _gateway_ready(url: str) -> bool:
+    try:
+        with urllib.request.urlopen(url + "/ready", timeout=2) as response:  # noqa: S310
+            return json.loads(response.read() or b"{}").get("ready") is True
+    except Exception:
+        return False
+
+
 def _extract_instruction(body_input) -> tuple[str, Optional[str]]:
     """Return (user_message, system_message) from a responses body input list."""
     items = list(body_input)
@@ -361,6 +406,30 @@ class OpenClawAgentConfig(BaseResponsesAPIAgentConfig):
     max_output_tokens: Optional[int] = None
     # required: every config must pin an explicit version so runs are reproducible and cannot silently drift
     openclaw_version: str
+    # Provider id of the generated model entry (``model_server``); OpenClaw keys its request wrappers on it.
+    provider: str = "nemo"
+    # Tools denied to the agent; the default keeps the interactive "message" channel away from a headless run.
+    denied_tools: list[str] = Field(default_factory=lambda: ["message"])
+    # "local": ``openclaw onboard`` into a per-run HOME, then ``openclaw agent --local``.
+    # "gateway": the LiveClawBench Harbor adapter's launch (claw-harbor v0.2.0, its default mode). Nothing is
+    # onboarded; the provider, model, env and browser patch is merged into ``<home>/.openclaw/openclaw.json``;
+    # ``openclaw gateway run --allow-unconfigured`` is started and polled for /ready; ``openclaw agent --json
+    # --session-id <session_id> --thinking <thinking> --timeout <s>`` runs through it with OPENCLAW_STATE_DIR.
+    # HOME and the state directory are task state the grader reads, so nothing is deleted afterwards.
+    launch: Literal["local", "gateway"] = "local"
+    home: Optional[str] = None
+    state_dir: Optional[str] = None
+    session_id: Optional[str] = None
+    gateway_token: str = "harbor-bench-token"  # pragma: allowlist secret
+    gateway_ready_timeout: int = 90
+    # Environment variable carrying the caller's agent clock in seconds (AnyTerminal sets NGTB_AGENT_TIMEOUT_S).
+    # The gateway run passes OpenClaw that clock less ``timeout_margin``, so OpenClaw ends its own run and the
+    # gateway is stopped before the caller's clock kills the process tree.
+    timeout_env: Optional[str] = None
+    timeout_margin: int = 60
+    # gateway: the agent's combined output is also written here (Harbor tees it to /logs/agent/openclaw.txt,
+    # which some verifiers read).
+    output_log: Optional[str] = None
 
     @property
     def command_parts(self) -> list[str]:
@@ -390,9 +459,6 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
     sigterm_handler_installed: bool = False
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    # deny the interactive "message" channel so the headless agent finishes
-    _HEADLESS_TOOL_DENY: ClassVar[tuple[str, ...]] = ("message",)
-
     def model_post_init(self, __context: Any) -> None:
         self.sem = Semaphore(self.config.concurrency)
         ensure_openclaw(self.config.openclaw_version)
@@ -410,36 +476,61 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
         return base
 
     def _merge_headless_tool_denies(self, cfg: dict[str, Any]) -> None:
+        if not self.config.denied_tools:
+            return
         tools = cfg.setdefault("tools", {})
         deny = tools.get("deny")
         if not isinstance(deny, list):
             deny = []
-        merged = list(dict.fromkeys([item for item in deny if isinstance(item, str)] + list(self._HEADLESS_TOOL_DENY)))
+        merged = list(dict.fromkeys([item for item in deny if isinstance(item, str)] + self.config.denied_tools))
         tools["deny"] = merged
+
+    def _model_entry(self) -> dict[str, Any]:
+        entry = {
+            "id": self.config.model,
+            "name": self.config.model,
+            "api": "openai-completions",
+            "reasoning": True,
+            "input": ["text"],
+        }
+        if self.config.context_window is not None:
+            entry["contextWindow"] = self.config.context_window
+        if self.config.max_output_tokens is not None:
+            entry["maxTokens"] = self.config.max_output_tokens
+        return entry
+
+    def _harbor_config_patch(self, rollout_id: Optional[str]) -> dict[str, Any]:
+        """The patch claw-harbor's OpenClaw adapter writes, for this agent's model server."""
+        patch: dict[str, Any] = {
+            "agents": {"defaults": {"model": self._effective_model()}},
+            "env": {"shellEnv": {"enabled": True}, "OPENCLAW_GATEWAY_TOKEN": self.config.gateway_token},
+            # Inside a container: no display server and no kernel sandbox for the browser tool.
+            "browser": {"headless": True, "noSandbox": True, "ssrfPolicy": {"dangerouslyAllowPrivateNetwork": True}},
+        }
+        if self.config.model_server:
+            patch["models"] = {
+                "providers": {
+                    self.config.provider: {
+                        "baseUrl": self._resolve_model_base_url(rollout_id),
+                        "api": "openai-completions",
+                        "apiKey": "EMPTY",  # pragma: allowlist secret
+                        "models": [self._model_entry()],
+                    }
+                }
+            }
+        return patch
 
     def _build_openclaw_config(self, base: dict[str, Any], rollout_id: Optional[str] = None) -> dict[str, Any]:
         cfg = copy.deepcopy(base)
         self._deep_merge(cfg, copy.deepcopy(self.config.openclaw_config))
         if self.config.model_server:
             providers = cfg.setdefault("models", {}).setdefault("providers", {})
-            nemo = providers.setdefault("nemo", {})
-            model_entry = {
-                "id": self.config.model,
-                "name": self.config.model,
-                "api": "openai-completions",
-                "reasoning": True,
-                "input": ["text"],
-            }
-            if self.config.context_window is not None:
-                model_entry["contextWindow"] = self.config.context_window
-            if self.config.max_output_tokens is not None:
-                model_entry["maxTokens"] = self.config.max_output_tokens
-            nemo.update(
+            providers.setdefault(self.config.provider, {}).update(
                 {
                     "api": "openai-completions",
                     "baseUrl": self._resolve_model_base_url(rollout_id),
                     "apiKey": "EMPTY",  # pragma: allowlist secret
-                    "models": [model_entry],
+                    "models": [self._model_entry()],
                 }
             )
         self._merge_headless_tool_denies(cfg)
@@ -451,7 +542,7 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
         return self.resolve_model_base_url(self.config.model_server.name, rollout_id)
 
     def _effective_model(self) -> str:
-        return f"nemo/{self.config.model}" if self.config.model_server else self.config.model
+        return f"{self.config.provider}/{self.config.model}" if self.config.model_server else self.config.model
 
     def _workspace_root(self) -> Path:
         root = Path(self.config.workspace_root).expanduser() / f"openclaw_{uuid4().hex[:8]}"
@@ -573,6 +664,8 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
     ) -> tuple[list[Any], dict[str, int], str]:
         """setup and run agent. returns (output_items, usage, model_name)."""
         prompt = instruction if not system_prompt else f"{system_prompt}\n\n{instruction}"
+        if self.config.launch == "gateway":
+            return await self._run_openclaw_gateway(prompt, rollout_id, observation_collector)
         work_dir = self._workspace_root()
         home = work_dir / ".openclaw-home"
         home.mkdir(parents=True, exist_ok=True)
@@ -609,74 +702,185 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
                 prompt,
                 *self.config.extra_args,
             ]
-            # Run OpenClaw, salvaging a partial transcript if the run is cut short. It can be cut
-            # short two ways: our own self.config.timeout (raises TimeoutError), or an outer
-            # harness/sandbox timeout that SIGTERMs this whole process during its grace window before
-            # SIGKILL. In the SIGTERM case a plain `finally` would not run in time and the workdir
-            # would be lost, so we stop waiting on the signal, read OpenClaw's incrementally-written
-            # session off disk, and return it. Returning quickly lets the harness still write the
-            # response before the SIGKILL, so no harness change is needed.
-            code, stdout, stderr = None, "", ""
-            self._install_sigterm_handler()
-            sigterm_hit = asyncio.Event()
-            self.sigterm_events.add(sigterm_hit)
-            run_task = asyncio.ensure_future(
-                self._run_exec(cmd, cwd=str(work_dir), env=env, timeout=self.config.timeout)
-            )
-            try:
-                term_task = asyncio.ensure_future(sigterm_hit.wait())
-                done, _ = await asyncio.wait({run_task, term_task}, return_when=asyncio.FIRST_COMPLETED)
-                term_task.cancel()
-                if run_task in done:
-                    code, stdout, stderr = run_task.result()
-                else:
-                    LOG.warning("openclaw received SIGTERM; salvaging partial session")
-                    run_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await run_task
-            except TimeoutError:
-                LOG.warning("openclaw timed out after %ds; salvaging partial session", self.config.timeout)
-            finally:
-                self.sigterm_events.discard(sigterm_hit)
-
-            if code:
-                LOG.warning("openclaw exited %d: %s", code, stderr)
-            if stdout:
-                LOG.debug("openclaw stdout (%d chars): %s", len(stdout), stdout[:2000])
-
-            fallback_items, usage = parse_openclaw_output(stdout)
-            envelope = _decode_last_json_dict_suffix(stdout)
-
-            # On a normal finish the envelope points at the session file; on a cut-short run there is
-            # no envelope, so fall back to locating the partial session that OpenClaw wrote to disk.
-            output_items: list[Any] = []
-            session_path = self._session_file(envelope) or self._find_partial_session(home)
-            if session_path and session_path.is_file():
-                session_text = session_path.read_text(errors="replace")
-                output_items = parse_openclaw_session(session_text)
-                if observation_collector is not None:
-                    try:
-                        session_events = parse_openclaw_session_events(session_text)
-                        native_session_id = next(
-                            (
-                                event.get("id")
-                                for event in session_events
-                                if event.get("type") == "session" and isinstance(event.get("id"), str)
-                            ),
-                            session_path.stem,
-                        )
-                        session_tree, tree_gaps = discover_openclaw_session_tree(
-                            home / ".openclaw" / "agents",
-                            native_session_id,
-                        )
-                        observation_collector(native_session_id, session_events, session_tree, tree_gaps)
-                    except Exception:
-                        LOG.exception("failed to record OpenClaw session artifact")
-            if not output_items:
-                output_items = fallback_items
+            stdout = await self._run_with_salvage(cmd, cwd=str(work_dir), env=env, timeout=self.config.timeout)
+            output_items, usage = self._collect_session(stdout, home / ".openclaw", observation_collector)
             return output_items, usage, self.config.model
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
+
+    async def _run_with_salvage(
+        self,
+        cmd: list[str],
+        *,
+        cwd: Optional[str],
+        env: dict[str, str],
+        timeout: int,
+        output_log: Optional[Path] = None,
+    ) -> str:
+        """Run OpenClaw and return its stdout, salvaging a partial transcript if the run is cut short.
+
+        It can be cut short two ways: our own timeout (raises TimeoutError), or an outer harness/sandbox
+        timeout that SIGTERMs this whole process during its grace window before SIGKILL. In the SIGTERM case
+        a plain `finally` would not run in time, so we stop waiting on the signal and let the caller read
+        OpenClaw's incrementally-written session off disk. Returning quickly lets the harness still write the
+        response before the SIGKILL, so no harness change is needed.
+        """
+        code, stdout, stderr = None, "", ""
+        self._install_sigterm_handler()
+        sigterm_hit = asyncio.Event()
+        self.sigterm_events.add(sigterm_hit)
+        run_task = asyncio.ensure_future(self._run_exec(cmd, cwd=cwd, env=env, timeout=timeout))
+        try:
+            term_task = asyncio.ensure_future(sigterm_hit.wait())
+            done, _ = await asyncio.wait({run_task, term_task}, return_when=asyncio.FIRST_COMPLETED)
+            term_task.cancel()
+            if run_task in done:
+                code, stdout, stderr = run_task.result()
+            else:
+                LOG.warning("openclaw received SIGTERM; salvaging partial session")
+                run_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await run_task
+        except TimeoutError:
+            LOG.warning("openclaw timed out after %ds; salvaging partial session", timeout)
+        finally:
+            self.sigterm_events.discard(sigterm_hit)
+        if code:
+            LOG.warning("openclaw exited %d: %s", code, stderr)
+        if stdout:
+            LOG.debug("openclaw stdout (%d chars): %s", len(stdout), stdout[:2000])
+        if output_log is not None:
+            output_log.parent.mkdir(parents=True, exist_ok=True)
+            output_log.write_text(stderr + stdout)
+        return stdout
+
+    def _collect_session(
+        self,
+        stdout: str,
+        state_root: Path,
+        observation_collector: Optional[
+            Callable[[str, list[dict[str, Any]], OpenClawSessionTree, list[ObservationGap]], None]
+        ],
+    ) -> tuple[list[Any], dict[str, int]]:
+        fallback_items, usage = parse_openclaw_output(stdout)
+        envelope = _decode_last_json_dict_suffix(stdout)
+
+        # On a normal finish the envelope points at the session file; on a cut-short run there is
+        # no envelope, so fall back to locating the partial session that OpenClaw wrote to disk.
+        output_items: list[Any] = []
+        session_path = self._session_file(envelope) or self._find_partial_session(state_root)
+        if session_path and session_path.is_file():
+            session_text = session_path.read_text(errors="replace")
+            output_items = parse_openclaw_session(session_text)
+            if observation_collector is not None:
+                try:
+                    session_events = parse_openclaw_session_events(session_text)
+                    native_session_id = next(
+                        (
+                            event.get("id")
+                            for event in session_events
+                            if event.get("type") == "session" and isinstance(event.get("id"), str)
+                        ),
+                        session_path.stem,
+                    )
+                    session_tree, tree_gaps = discover_openclaw_session_tree(state_root / "agents", native_session_id)
+                    observation_collector(native_session_id, session_events, session_tree, tree_gaps)
+                except Exception:
+                    LOG.exception("failed to record OpenClaw session artifact")
+        if not output_items:
+            output_items = fallback_items
+        return output_items, usage
+
+    def _agent_timeout(self) -> int:
+        """The OpenClaw run clock: the caller's agent clock less the margin, else the configured timeout."""
+        raw = os.environ.get(self.config.timeout_env) if self.config.timeout_env else None
+        if not raw:
+            return self.config.timeout
+        return max(1, int(float(raw)) - self.config.timeout_margin)
+
+    async def _run_openclaw_gateway(
+        self,
+        prompt: str,
+        rollout_id: Optional[str],
+        observation_collector: Optional[
+            Callable[[str, list[dict[str, Any]], OpenClawSessionTree, list[ObservationGap]], None]
+        ],
+    ) -> tuple[list[Any], dict[str, int], str]:
+        """The LiveClawBench Harbor adapter's gateway launch, in the task's own HOME."""
+        home = Path(self.config.home or os.environ.get("HOME") or Path.home())
+        state_root = Path(self.config.state_dir) if self.config.state_dir else home / ".openclaw"
+        config_path = home / ".openclaw" / "openclaw.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        state_root.mkdir(parents=True, exist_ok=True)
+        base_cfg = json.loads(config_path.read_text()) if config_path.is_file() else {}
+        cfg = merge_harbor_config(base_cfg, self._harbor_config_patch(rollout_id))
+        self._deep_merge(cfg, copy.deepcopy(self.config.openclaw_config))
+        self._merge_headless_tool_denies(cfg)
+        config_path.write_text(json.dumps(cfg, indent=2) + "\n")
+
+        port = _free_loopback_port()
+        url = f"http://127.0.0.1:{port}"
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "OPENCLAW_DIAGNOSTICS": "false",
+            "OPENCLAW_GATEWAY_TOKEN": self.config.gateway_token,
+            "OPENCLAW_GATEWAY_PORT": str(port),
+        }
+        if self.config.state_dir:
+            env["OPENCLAW_STATE_DIR"] = self.config.state_dir
+        if self.config.node_bin_dir:
+            env["PATH"] = f"{self.config.node_bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env.update({k: v for k, v in self.config.env.items() if v})
+        cwd = os.getcwd()
+        timeout = self._agent_timeout()
+
+        gateway_log = open(state_root / "gateway.log", "ab")  # noqa: SIM115
+        gateway = await asyncio.create_subprocess_exec(
+            *self.config.command_parts,
+            "gateway",
+            "run",
+            "--allow-unconfigured",
+            cwd=cwd,
+            env=env,
+            stdout=gateway_log,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            deadline = asyncio.get_running_loop().time() + self.config.gateway_ready_timeout
+            while not await asyncio.to_thread(_gateway_ready, url):
+                if gateway.returncode is not None:
+                    raise RuntimeError(f"openclaw gateway exited {gateway.returncode} before ready")
+                if asyncio.get_running_loop().time() > deadline:
+                    raise RuntimeError(f"openclaw gateway not ready within {self.config.gateway_ready_timeout}s")
+                await asyncio.sleep(1)
+            cmd = [
+                *self.config.command_parts,
+                "agent",
+                "--json",
+                *(["--session-id", self.config.session_id] if self.config.session_id else []),
+                "--thinking",
+                self.config.thinking,
+                "--timeout",
+                str(timeout),
+                "--message",
+                prompt,
+                *self.config.extra_args,
+            ]
+            stdout = await self._run_with_salvage(
+                cmd,
+                cwd=cwd,
+                env={**env, "OPENCLAW_GATEWAY_URL": url},
+                timeout=timeout + self.config.timeout_margin,
+                output_log=Path(self.config.output_log) if self.config.output_log else None,
+            )
+        finally:
+            self._kill_process_tree(gateway.pid)
+            with contextlib.suppress(Exception):
+                await gateway.wait()
+            gateway_log.close()
+        output_items, usage = self._collect_session(stdout, state_root, observation_collector)
+        return output_items, usage, self.config.model
 
     async def _create_response(
         self,
