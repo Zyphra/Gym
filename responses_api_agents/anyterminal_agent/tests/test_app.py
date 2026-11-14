@@ -1245,6 +1245,11 @@ class TestRunAgentEnv:
         assert env["NGTB_MODEL_NAME"] == "my-model"
         assert json.loads(env["NGTB_AGENT_KWARGS"]) == {"model": "my-model"}
 
+    def test_task_agent_clock_forwarded(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        cfg.tb_agent_timeout = 3600
+        assert RunTerminalAgent(config=cfg)._agent_env(cfg)["NGTB_AGENT_TIMEOUT_S"] == "3600"
+
 
 class TestTerminalResponseLabels:
     def test_context_stop_keeps_partial_grade_and_typed_metadata(self, tmp_path: Path) -> None:
