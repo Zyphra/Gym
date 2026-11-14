@@ -334,14 +334,37 @@ class AnthropicConverter:
 
     def _anthropic_messages_to_input_items(self, anthropic_body: Dict[str, Any]) -> List[Any]:
         items: List[Any] = []
+        conversation_started = False
         for message in anthropic_body.get("messages", []):
             role = message["role"]
             content = message.get("content", "")
+            if role != "system":
+                conversation_started = True
+            elif conversation_started:
+                # Claude Code sends some context (e.g. the Agent tool's agent listing) as a "system"
+                # message after the conversation has started. Chat templates such as Qwen's reject a
+                # system message that is not first, so deliver it where it was sent as a user-side
+                # <system-reminder>, the form Claude Code uses for its other mid-conversation context.
+                role = "user"
+                content = self._as_system_reminder(content)
             if isinstance(content, str):
                 items.append(NeMoGymEasyInputMessage(role=role, content=content, type="message"))
                 continue
             self._append_anthropic_blocks_as_items(role, content, items)
         return items
+
+    def _as_system_reminder(self, content: Any) -> Any:
+        def wrap(text: str) -> str:
+            if text.lstrip().startswith("<system-reminder>"):
+                return text
+            return f"<system-reminder>\n{text}\n</system-reminder>"
+
+        if isinstance(content, str):
+            return wrap(content)
+        return [
+            {**block, "text": wrap(block.get("text", ""))} if block.get("type") == "text" else block
+            for block in content
+        ]
 
     def _append_anthropic_blocks_as_items(self, role: str, blocks: List[Dict[str, Any]], items: List[Any]) -> None:
         """Translate one Anthropic message's content blocks into ordered Responses items.
