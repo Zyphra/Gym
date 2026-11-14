@@ -20,6 +20,7 @@ harness install) are bypassed by calling staticmethods/properties directly rathe
 constructing the agent.
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -2140,3 +2141,62 @@ def test_pi_terminal_config_selects_the_pi_agent() -> None:
     )
     assert "working_directory" in PiAgentConfig.model_fields
     assert "working_directory" not in agent["agent_kwargs"]
+
+
+class _LocalShellSandbox:
+    """Runs sandbox commands in a local shell: a real process for the retained-state archive."""
+
+    async def exec(self, command, *, timeout_s=None, user=None, env=None, cwd=None):
+        import subprocess
+
+        proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=timeout_s)
+        return MagicMock(return_code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    async def download(self, remote, local):
+        import shutil
+
+        shutil.copyfile(remote, local)
+
+
+class TestRetainedTaskState:
+    def _cfg(self, tmp_path: Path, paths, **overrides):
+        cfg = _make_instance_config(tmp_path, retain_task_state=True, **overrides)
+        cfg.problem_info["retained_state_paths"] = json.dumps(paths)
+        return cfg
+
+    def test_archives_the_declared_paths_that_exist(self, tmp_path: Path) -> None:
+        import tarfile
+
+        state = tmp_path / "state"
+        (state / "output").mkdir(parents=True)
+        (state / "output" / "report.md").write_text("findings")
+        cfg = self._cfg(tmp_path, [str(state / "output"), str(state / "missing")])
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+
+        receipt = json.loads(cfg.metrics_fpath.read_text())["retained_task_state"]
+        assert receipt["archived"] == [str(state / "output").lstrip("/")]
+        archive = cfg.persistent_dir / "task-state.tgz"
+        assert receipt["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+        with tarfile.open(archive) as tar:
+            member = tar.extractfile(str(state / "output" / "report.md").lstrip("/"))
+            assert member.read() == b"findings"
+
+    def test_oversized_archive_is_recorded_not_kept(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "big").write_bytes(os.urandom(4096))
+        cfg = self._cfg(tmp_path, [str(state)], retained_state_max_bytes=16)
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+        receipt = json.loads(cfg.metrics_fpath.read_text())["retained_task_state"]
+        assert "exceeds 16 bytes" in receipt["skipped"]
+        assert not (cfg.persistent_dir / "task-state.tgz").exists()
+
+    def test_relative_paths_are_refused_without_failing_the_episode(self, tmp_path: Path) -> None:
+        cfg = self._cfg(tmp_path, ["relative/path"])
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+        assert "absolute paths" in json.loads(cfg.metrics_fpath.read_text())["retained_task_state"]["error"]
+
+    def test_rows_without_paths_archive_nothing(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, retain_task_state=True)
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+        assert "retained_task_state" not in json.loads(cfg.metrics_fpath.read_text())
