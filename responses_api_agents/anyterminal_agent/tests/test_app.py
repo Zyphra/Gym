@@ -2140,3 +2140,84 @@ def test_pi_terminal_config_selects_the_pi_agent() -> None:
     )
     assert "working_directory" in PiAgentConfig.model_fields
     assert "working_directory" not in agent["agent_kwargs"]
+
+
+class TestAgentTimeoutGradesWorkspace:
+    """An agent that hits its budget is graded on the workspace it left, never masked."""
+
+    @pytest.fixture(autouse=True)
+    def _no_provider(self):
+        with patch("responses_api_agents.anyterminal_agent.app._build_provider", return_value=None):
+            yield
+
+    async def _run_to_wall(self, cfg, reward_text: str | None):
+        async def exec_(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                if reward_text is not None:
+                    (cfg.verifier_dir / "reward.txt").write_text(reward_text)
+                return _sandbox_result()
+            if "run-the-agent" in command:
+                return _sandbox_result(return_code=-1, error_type="timeout")
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=exec_), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                result = await RunTerminalAgent(config=cfg).process_single_datapoint()
+        response = app._terminal_response(cfg)
+        return result, app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"])
+
+    async def test_graded_pass_stands(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True)
+        result, metrics = await self._run_to_wall(cfg, "1")
+        assert result is True
+        assert metrics.resolved is True and metrics.reward(fractional=False) == 1.0
+        assert metrics.agent_timed_out is False and metrics.agent_budget_exhausted is True
+        assert metrics.mask_sample is False
+
+    async def test_graded_partial_fractional_stands(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(
+            tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True, fractional_reward=True
+        )
+        _, metrics = await self._run_to_wall(cfg, "0.4")
+        assert metrics.verifier_reward == 0.4 and metrics.reward(fractional=True) == 0.4
+        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
+
+    async def test_unreadable_reward_is_flagged_and_scores_zero(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True)
+        result, metrics = await self._run_to_wall(cfg, None)
+        assert result is False
+        assert metrics.verifier_reward_unreadable is True
+        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
+        assert metrics.reward(fractional=True) == 0.0
+
+    @pytest.mark.parametrize("fault", ["container_timed_out", "sandbox_failed"])
+    def test_infrastructure_stays_masked(self, fault) -> None:
+        metrics = app.TerminalBenchMetrics(resolved=True, verifier_reward=1.0, agent_timed_out=True, **{fault: True})
+        metrics.apply_timeout_policy(agent_timeout_is_failure=False, agent_timeout_grades_workspace=True)
+        assert metrics.mask_sample is True and metrics.agent_budget_exhausted is True
+
+    async def test_default_still_masks(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+        _, metrics = await self._run_to_wall(cfg, "1")
+        assert metrics.agent_timed_out is True and metrics.agent_budget_exhausted is False
+        assert metrics.mask_sample is True
+
+    async def test_failure_policy_still_scores_zero(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_is_failure=True)
+        _, metrics = await self._run_to_wall(cfg, "1")
+        assert metrics.agent_timed_out is True and metrics.resolved is False and metrics.mask_sample is False
+
+    def test_policy_is_idempotent(self) -> None:
+        metrics = app.TerminalBenchMetrics(resolved=True, verifier_reward=0.5, agent_timed_out=True)
+        for _ in range(2):
+            metrics.apply_timeout_policy(agent_timeout_is_failure=False, agent_timeout_grades_workspace=True)
+        assert (metrics.agent_timed_out, metrics.agent_budget_exhausted, metrics.mask_sample) == (False, True, False)
+        assert metrics.reward(fractional=True) == 0.5
+
+    def test_flag_is_strict_default_off_and_exclusive(self, tmp_path: Path) -> None:
+        assert _make_instance_config(tmp_path).agent_timeout_grades_workspace is False
+        with pytest.raises(ValidationError, match="agent_timeout_grades_workspace"):
+            _make_instance_config(tmp_path, agent_timeout_grades_workspace="true")
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            _make_instance_config(tmp_path, agent_timeout_grades_workspace=True, agent_timeout_is_failure=True)
