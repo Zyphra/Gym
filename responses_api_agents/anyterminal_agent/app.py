@@ -546,6 +546,12 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
         ),
     )
     checkpoint_interval_s: int = Field(default=1800, gt=0)
+    # Archive the paths a row lists in its `retained_state_paths` metadata (a JSON list of absolute paths) from
+    # the instance after the agent and before grading, as `task-state.tgz` in the episode directory, so a grader
+    # that runs later (a deferred LLM judge) can re-run the task's verifier on the state it would have graded.
+    # A failed or oversized archive is recorded in the metrics and never changes the episode's grade.
+    retain_task_state: bool = Field(default=False, strict=True)
+    retained_state_max_bytes: int = Field(default=1 << 30, gt=0)
     # Report the verifier's reward.txt value (0 to 1) instead of 1.0 for any positive grade.
     # Needed by Harbor verifiers that award partial credit; a value outside [0, 1] is unreadable.
     fractional_reward: bool = Field(default=False, strict=True)
@@ -1012,6 +1018,40 @@ class RunTerminalAgent(BaseModel):
                 raise RuntimeError(result.stderr or "failed to stage verifier tests")
         finally:
             archive.unlink(missing_ok=True)
+
+    async def _retain_task_state(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
+        """Archive the row's declared task-state paths before grading; record the outcome, never raise."""
+        raw = cfg.problem_info.get("retained_state_paths")
+        paths = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        if not paths:
+            return
+        receipt: Dict[str, Any] = {"requested": paths}
+        remote = "/tmp/ng-task-state.tgz"
+        try:
+            if not all(isinstance(p, str) and p.startswith("/") and ".." not in p.split("/") for p in paths):
+                raise ValueError("retained_state_paths must be absolute paths without '..'")
+            present = " ".join(shlex.quote(p.lstrip("/")) for p in paths)
+            result = await sandbox.exec(
+                f'cd / && set -- && for p in {present}; do if [ -e "$p" ] || [ -L "$p" ]; then set -- "$@" "$p"; fi; done'
+                f" && printf '%s\\n' \"$@\" > {remote}.list && tar -czf {remote} --numeric-owner -C / -T {remote}.list"
+                f" && stat -c %s {remote} && cat {remote}.list",
+                timeout_s=setup_timeout_seconds(600),
+                user="root",
+            )
+            if result.return_code != 0:
+                raise RuntimeError((result.stderr or result.stdout or "tar failed")[-500:])
+            size, *archived = result.stdout.split()
+            receipt.update(archived=archived, bytes=int(size))
+            if int(size) > cfg.retained_state_max_bytes:
+                receipt["skipped"] = f"archive exceeds {cfg.retained_state_max_bytes} bytes"
+            else:
+                local = cfg.persistent_dir / "task-state.tgz"
+                await sandbox.download(remote, local)
+                receipt["sha256"] = hashlib.sha256(local.read_bytes()).hexdigest()
+            await sandbox.exec(f"rm -f {remote} {remote}.list", timeout_s=30, user="root")
+        except Exception as e:
+            receipt["error"] = f"{type(e).__name__}: {e}"[:500]
+        update_metrics(cfg.metrics_fpath, {"retained_task_state": receipt}, cfg.task_name)
 
     async def _collect_remote_outputs(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
         for remote, local in (
@@ -1497,6 +1537,8 @@ class RunTerminalAgent(BaseModel):
                 agent_run_time, agent_timed_out, sandbox_failed, agent_return_code = await self._run_agent(
                     sandbox, cfg
                 )
+            if cfg.retain_task_state:
+                await self._retain_task_state(sandbox, cfg)
             await self._stage_tests(cfg)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_tests(sandbox, cfg)
