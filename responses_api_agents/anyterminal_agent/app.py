@@ -180,6 +180,9 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     # `solved_reward_threshold`, a threshold. It is the row reward when `fractional_reward` is selected.
     verifier_reward: Optional[float] = None
     agent_timed_out: bool = False
+    # With `agent_timeout_grades_workspace`: the agent spent its time budget and the verifier
+    # graded the workspace it left. A label, not a mask; `agent_timed_out` is then False.
+    agent_budget_exhausted: bool = False
     container_timed_out: bool = False
     sandbox_failed: bool = False
     mask_sample: bool = False
@@ -226,8 +229,20 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
             return 0.0
         return self.verifier_reward
 
-    def apply_timeout_policy(self, *, agent_timeout_is_failure: bool) -> None:
-        """Keep policy timeouts in the scored population when explicitly enabled."""
+    def apply_timeout_policy(
+        self, *, agent_timeout_is_failure: bool, agent_timeout_grades_workspace: bool = False
+    ) -> None:
+        """Keep policy timeouts in the scored population when explicitly enabled.
+
+        `agent_timeout_is_failure` scores a timed-out agent 0. `agent_timeout_grades_workspace`
+        keeps the verifier's grade of the workspace at the wall, as Harbor does after an
+        AgentTimeoutError: the timeout becomes the `agent_budget_exhausted` label and the row's
+        reward is the verifier's. A missing or unreadable reward still scores 0 with its label;
+        verifier timeouts and sandbox failures stay masked. Idempotent.
+        """
+        if self.agent_timed_out and agent_timeout_grades_workspace:
+            self.agent_timed_out = False
+            self.agent_budget_exhausted = True
         if self.agent_timed_out and agent_timeout_is_failure:
             self.resolved = False
             if self.verifier_reward is not None:
@@ -526,6 +541,12 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     def decode_task_network(cls, value):
         return TaskNetwork.model_validate_json(value) if isinstance(value, str) else value
 
+    @model_validator(mode="after")
+    def validate_agent_timeout_policy(self):
+        if self.agent_timeout_is_failure and self.agent_timeout_grades_workspace:
+            raise ValueError("agent_timeout_is_failure and agent_timeout_grades_workspace are mutually exclusive")
+        return self
+
     # Docker network for the agent container. "host" lets the in-container agent reach a
     # model server on host loopback; None uses the docker default (e.g. for a remote server).
     docker_network: Optional[str] = "host"
@@ -535,6 +556,15 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
         description="auto, an absolute prepared dependency directory for local sandboxes, or a remote runtime archive/URL",
     )
     agent_timeout_is_failure: bool = Field(default=False, strict=True)
+    agent_timeout_grades_workspace: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "When the agent hits its time budget, keep the verifier's grade of the workspace it left (Harbor's "
+            "behaviour) instead of masking the row or forcing it to 0. The row reports agent_timed_out=False and "
+            "agent_budget_exhausted=True. Mutually exclusive with agent_timeout_is_failure."
+        ),
+    )
     continue_until_timeout: bool = Field(
         default=False,
         strict=True,
@@ -1618,14 +1648,20 @@ class RunTerminalAgent(BaseModel):
             else ("agent_harness" if agent_phase_kill else "unknown" if memory_kill or verifier_kill else None),
             **memory_events,
         )
-        metrics.apply_timeout_policy(agent_timeout_is_failure=cfg.agent_timeout_is_failure)
+        metrics.apply_timeout_policy(
+            agent_timeout_is_failure=cfg.agent_timeout_is_failure,
+            agent_timeout_grades_workspace=cfg.agent_timeout_grades_workspace,
+        )
         update_metrics(cfg.metrics_fpath, metrics.model_dump(), cfg.task_name)
         return bool(metrics.resolved)
 
 
 def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
     persisted = TerminalBenchMetrics.model_validate_json(params.metrics_fpath.read_text())
-    persisted.apply_timeout_policy(agent_timeout_is_failure=params.agent_timeout_is_failure)
+    persisted.apply_timeout_policy(
+        agent_timeout_is_failure=params.agent_timeout_is_failure,
+        agent_timeout_grades_workspace=params.agent_timeout_grades_workspace,
+    )
     mask_sample = persisted.mask_sample
     update_metrics(params.metrics_fpath, persisted.model_dump(), params.task_name)
 
