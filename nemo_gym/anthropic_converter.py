@@ -67,6 +67,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseUsage,
     NeMoGymSummary,
 )
+from nemo_gym.pdf_text import PdfTextError, extract_pdf_text
 
 
 SUPPORTED_ANTHROPIC_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -345,8 +346,8 @@ class AnthropicConverter:
     def _append_anthropic_blocks_as_items(self, role: str, blocks: List[Dict[str, Any]], items: List[Any]) -> None:
         """Translate one Anthropic message's content blocks into ordered Responses items.
 
-        Text/image blocks group into a single message item; tool_use, tool_result, and thinking
-        blocks each become their own item, preserving order.
+        Text/image/document blocks group into a single message item (a document as its extracted
+        text); tool_use, tool_result, and thinking blocks each become their own item, preserving order.
         """
         pending_parts: List[Dict[str, Any]] = []
 
@@ -365,6 +366,8 @@ class AnthropicConverter:
                 pending_parts.append({"type": "input_text", "text": block.get("text", "")})
             elif block_type == "image":
                 pending_parts.append(self._anthropic_image_to_input_part(block))
+            elif block_type == "document":
+                pending_parts.append({"type": "input_text", "text": anthropic_document_to_text(block)})
             elif block_type == "tool_use":
                 flush_message()
                 items.append(
@@ -423,6 +426,11 @@ class AnthropicConverter:
         for block in content:
             if block.get("type") == "text":
                 texts.append(block.get("text", ""))
+            elif block.get("type") == "document":
+                texts.append(anthropic_document_to_text(block))
+            elif block.get("type") == "image":
+                # A Responses function_call_output here carries text only, so the image cannot travel with it.
+                texts.append(anthropic_image_placeholder(block))
             else:
                 raise NotImplementedError(
                     f"Unsupported Anthropic tool_result content block for ingress: {block.get('type')}"
@@ -817,3 +825,61 @@ class AnthropicConverter:
             output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=None),
             total_tokens=input_tokens + output_tokens,
         )
+
+
+################################################################################
+# Ingress: Anthropic document / tool-result image blocks -> text
+################################################################################
+DOCUMENT_TEXT_BEGIN = (
+    "[PDF document{named} ({size}): text layer extracted by NeMo Gym; images and layout are not included]"
+)
+DOCUMENT_TEXT_END = "[end of PDF document]"
+
+
+def anthropic_document_to_text(block: Dict[str, Any]) -> str:
+    """Render an Anthropic ``document`` block as text a text-only policy can read.
+
+    Claude Code's Read tool sends a PDF as a ``document`` block with a base64 ``source``; an
+    Anthropic model reads it natively. The downstream Responses input has no document part, so the
+    PDF's text layer is extracted deterministically (``nemo_gym.pdf_text``) between clear markers.
+    Plain-text and content-block sources are passed through. A document whose text cannot be
+    recovered (a scan, an encrypted file, a URL source) becomes a one-line notice, never an error.
+    """
+    source = block.get("source") or {}
+    source_type = source.get("type")
+    title = block.get("title")
+    named = f' "{title}"' if isinstance(title, str) and title.strip() else ""
+    if source_type == "text":
+        return f"[Document{named}]\n{source.get('data', '')}\n[end of document]"
+    if source_type == "content":
+        content = source.get("content")
+        if isinstance(content, str):
+            body = content
+        else:
+            body = "\n".join(part.get("text", "") for part in content or [] if part.get("type") == "text")
+        return f"[Document{named}]\n{body}\n[end of document]"
+    media_type = source.get("media_type")
+    if source_type != "base64" or media_type != "application/pdf":
+        where = source.get("url") or source.get("file_id") or media_type or source_type
+        return f"[Document{named} omitted: NeMo Gym cannot read a {source_type} document source ({where}).]"
+    try:
+        data = base64.b64decode(source.get("data") or "", validate=False)
+        text, pages = extract_pdf_text(data)
+    except (PdfTextError, binascii.Error, ValueError) as exc:
+        return f"[PDF document{named} omitted: NeMo Gym could not extract its text ({exc}).]"
+    size = f"{pages} page{'s' if pages != 1 else ''}"
+    if not text.strip():
+        return f"[PDF document{named} ({size}) has no text layer (e.g. scanned pages); its content is not included.]"
+    return f"{DOCUMENT_TEXT_BEGIN.format(named=named, size=size)}\n{text}\n{DOCUMENT_TEXT_END}"
+
+
+def anthropic_image_placeholder(block: Dict[str, Any]) -> str:
+    """One line stating that an image in a tool result was left out (the policy reads text only)."""
+    source = block.get("source") or {}
+    if source.get("type") == "base64":
+        raw = source.get("data") or ""
+        size = len(raw) * 3 // 4 - raw[-2:].count("=")
+        detail = f"{source.get('media_type', 'image')}, {size} bytes"
+    else:
+        detail = source.get("url") or source.get("type") or "image"
+    return f"[Image omitted ({detail}): this model reads text only.]"

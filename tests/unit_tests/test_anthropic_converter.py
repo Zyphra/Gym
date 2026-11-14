@@ -20,6 +20,7 @@ inverse direction used by an Anthropic Messages ingress proxy, plus round-trips 
 two directions against drift.
 """
 
+import base64
 import json
 
 from anthropic.types import Message
@@ -29,6 +30,32 @@ from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 
 
 PNG_DATA_URL = "data:image/png;base64,aGVsbG8="  # "hello"
+
+
+def _pdf(content: bytes) -> bytes:
+    """A one-page PDF with a Helvetica text layer (the shape of the WorkBuddy mail-export PDFs)."""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for num, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % num + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 6\n0000000000 65535 f \n" + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % xref
+    return bytes(out)
+
+
+TEXT_PDF = _pdf(
+    b"BT /F1 10 Tf 72 742 Td (Document number: CBS-2604-12) Tj 0 -14 Td (Amount printed: 2,310.40 USD) Tj ET"
+)
+IMAGE_ONLY_PDF = _pdf(b"q 612 0 0 792 0 0 cm 0 0 m 1 1 l S Q")
 
 
 def _converter() -> AnthropicConverter:
@@ -261,7 +288,96 @@ class TestAnthropicRequestToResponses:
         import pytest
 
         with pytest.raises(NotImplementedError):
-            _converter()._anthropic_tool_result_content_to_text([{"type": "image", "source": {}}])
+            _converter()._anthropic_tool_result_content_to_text([{"type": "video", "source": {}}])
+
+    def test_claude_code_pdf_read_becomes_extracted_text(self) -> None:
+        # Claude Code's Read on a PDF: a tool_result naming the file, then the PDF as a document block.
+        params = _converter().anthropic_request_to_responses(
+            {
+                "max_tokens": 10,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "PDF file read: /w/a.pdf"},
+                            {
+                                "type": "document",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": base64.b64encode(TEXT_PDF).decode(),
+                                },
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        assert params.input[0].type == "function_call_output" and params.input[0].output == "PDF file read: /w/a.pdf"
+        assert params.input[1].role == "user"
+        assert params.input[1].content == (
+            "[PDF document (1 page): text layer extracted by NeMo Gym; images and layout are not included]\n"
+            "Document number: CBS-2604-12\nAmount printed: 2,310.40 USD\n[end of PDF document]"
+        )
+
+    def test_document_sources_without_pdf_text_never_raise(self) -> None:
+        def text(source, **extra):
+            return (
+                _converter()
+                .anthropic_request_to_responses(
+                    {
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": [{"type": "document", "source": source, **extra}]}],
+                    }
+                )
+                .input[0]
+                .content
+            )
+
+        assert text({"type": "text", "media_type": "text/plain", "data": "plain"}, title="notes") == (
+            '[Document "notes"]\nplain\n[end of document]'
+        )
+        assert text(
+            {"type": "content", "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        ) == ("[Document]\na\nb\n[end of document]")
+        assert text({"type": "url", "url": "https://x/a.pdf"}) == (
+            "[Document omitted: NeMo Gym cannot read a url document source (https://x/a.pdf).]"
+        )
+        broken = text({"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(b"junk").decode()})
+        assert broken.startswith("[PDF document omitted: NeMo Gym could not extract its text (not a PDF")
+        scanned = text(
+            {"type": "base64", "media_type": "application/pdf", "data": base64.b64encode(IMAGE_ONLY_PDF).decode()}
+        )
+        assert (
+            scanned == "[PDF document (1 page) has no text layer (e.g. scanned pages); its content is not included.]"
+        )
+
+    def test_tool_result_image_becomes_a_text_placeholder(self) -> None:
+        params = _converter().anthropic_request_to_responses(
+            {
+                "max_tokens": 10,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [
+                                    {"type": "text", "text": "chart.png"},
+                                    {
+                                        "type": "image",
+                                        "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+        assert params.input[0].output == "chart.png\n[Image omitted (image/png, 5 bytes): this model reads text only.]"
 
 
 class TestResponsesToAnthropicResponse:
