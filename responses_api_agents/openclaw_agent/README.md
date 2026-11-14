@@ -61,5 +61,24 @@ provider configuration is unchanged.
 - `env`: extra env vars for the subprocess (e.g. provider API keys)
 - `openclaw_config`: deep-merged into the generated `openclaw.json`
 - `openclaw_version`: npm version to pin on install (null means latest)
+- `provider`: provider id of the generated model entry (default `nemo`); OpenClaw keys its request wrappers on it
+- `denied_tools`: tools denied to the agent (default `["message"]`, the interactive channel)
+- `launch`: `local` (default) or `gateway`, below
+- `home`, `state_dir`, `session_id`, `gateway_token`, `gateway_ready_timeout`, `output_log`: the `gateway` launch
+- `timeout_env`, `timeout_margin`: in `gateway`, the run clock is this environment variable's seconds (AnyTerminal
+  sets `NGTB_AGENT_TIMEOUT_S` to the task's agent clock) less the margin, else `timeout`
+
+## Gateway launch
+
+`launch: gateway` runs OpenClaw the way the LiveClawBench Harbor adapter does (claw-harbor v0.2.0
+`agents/installed/openclaw.py`, its default mode), in the task's own `home`:
+
+1. no `openclaw onboard`; the provider, model, `env.shellEnv` and headless-browser patch is merged into the existing
+   `<home>/.openclaw/openclaw.json` with the adapter's merge rules;
+2. `openclaw gateway run --allow-unconfigured` starts on a free loopback port and is polled for `/ready`;
+3. `openclaw agent --json --session-id <session_id> --thinking <thinking> --timeout <clock> --message <prompt>`
+   runs through it with `OPENCLAW_STATE_DIR=<state_dir>`; no `--local`, `--agent` or `--model`;
+4. the gateway is stopped; the run's output is written to `output_log` (Harbor's `/logs/agent/openclaw.txt`);
+   HOME and the state directory are task state a grader reads, so nothing is deleted.
 
 See `configs/openclaw_agent.yaml`.

@@ -932,3 +932,176 @@ class TestConfigYaml:
         assert inner["entrypoint"] == "app.py"
         assert inner["concurrency"] == 32
         assert inner["command"] == "openclaw"
+
+
+_FAKE_OPENCLAW = r'''#!PYTHON
+"""A stand-in OpenClaw CLI: `gateway run` serves /ready; `agent` records its call and writes a session."""
+import http.server, json, os, sys
+from pathlib import Path
+
+args = sys.argv[1:]
+record = Path(os.environ["FAKE_OPENCLAW_RECORD"])
+if args[:2] == ["gateway", "run"]:
+    class Ready(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({"ready": self.path == "/ready"}).encode()
+            self.send_response(200); self.send_header("content-length", str(len(body))); self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *a):
+            pass
+    with record.open("a") as f:
+        f.write(json.dumps({"gateway": args, "port": os.environ["OPENCLAW_GATEWAY_PORT"]}) + "\n")
+    http.server.HTTPServer(("127.0.0.1", int(os.environ["OPENCLAW_GATEWAY_PORT"])), Ready).serve_forever()
+assert args[0] == "agent", args
+config = json.loads((Path(os.environ["HOME"]) / ".openclaw" / "openclaw.json").read_text())
+sessions = Path(os.environ["OPENCLAW_STATE_DIR"]) / "agents" / "main" / "sessions"
+sessions.mkdir(parents=True, exist_ok=True)
+session = sessions / (args[args.index("--session-id") + 1] + ".jsonl")
+session.write_text(
+    json.dumps({"type": "session", "id": "s-1"}) + "\n"
+    + json.dumps({"type": "message", "id": "m-1", "message": {"role": "assistant",
+                  "content": [{"type": "text", "text": "done"}]}}) + "\n"
+)
+with record.open("a") as f:
+    f.write(json.dumps({"agent": args, "config": config, "cwd": os.getcwd(),
+                        "env": {k: os.environ.get(k) for k in ("OPENCLAW_GATEWAY_URL", "OPENCLAW_GATEWAY_TOKEN",
+                                                                "OPENCLAW_STATE_DIR", "OPENCLAW_DIAGNOSTICS", "HOME")}}) + "\n")
+print(json.dumps({"payloads": [{"text": "done"}],
+                  "meta": {"agentMeta": {"sessionFile": str(session), "usage": {"input": 7, "output": 3}}}}))
+'''
+
+
+class TestGatewayLaunch:
+    """The LiveClawBench Harbor adapter's launch, against a stand-in CLI run as a real process."""
+
+    def _agent(self, tmp_path: Path, monkeypatch, **kwargs) -> tuple[OpenClawAgent, Path]:
+        fake = tmp_path / "openclaw"
+        fake.write_text(_FAKE_OPENCLAW.replace("PYTHON", sys.executable))
+        fake.chmod(0o755)
+        record = tmp_path / "calls.jsonl"
+        monkeypatch.setenv("FAKE_OPENCLAW_RECORD", str(record))
+        agent = _make_agent(
+            command=str(fake),
+            launch="gateway",
+            home=str(tmp_path / "root"),
+            state_dir=str(tmp_path / "logs" / "openclaw-state"),
+            session_id="harbor",
+            thinking="medium",
+            provider="custom",
+            model="policy",
+            model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+            context_window=131072,
+            max_output_tokens=32768,
+            denied_tools=[],
+            timeout_env="NGTB_AGENT_TIMEOUT_S",
+            output_log=str(tmp_path / "logs" / "openclaw.txt"),
+            **kwargs,
+        )
+        agent._resolve_model_base_url = lambda *_a, **_k: "http://model.invalid/v1"
+        return agent, record
+
+    def test_runs_the_harbor_invocation_and_keeps_task_state(self, tmp_path: Path, monkeypatch) -> None:
+        agent, record = self._agent(tmp_path, monkeypatch)
+        existing = tmp_path / "root" / ".openclaw" / "openclaw.json"
+        existing.parent.mkdir(parents=True)
+        existing.write_text(json.dumps({"tools": {"profile": "full"}, "models": {"providers": {"custom": {"x": 1}}}}))
+        monkeypatch.setenv("NGTB_AGENT_TIMEOUT_S", "1800")
+        monkeypatch.chdir(tmp_path)
+
+        output, usage, model = asyncio.run(agent._run_openclaw("fix it", None))
+
+        calls = [json.loads(line) for line in record.read_text().splitlines()]
+        gateway = next(c for c in calls if "gateway" in c)
+        run = next(c for c in calls if "agent" in c)
+        assert gateway["gateway"] == ["gateway", "run", "--allow-unconfigured"]
+        # No onboarding, no --local, no --agent/--model: the model comes from the merged config.
+        assert run["agent"] == [
+            "agent",
+            "--json",
+            "--session-id",
+            "harbor",
+            "--thinking",
+            "medium",
+            "--timeout",
+            "1740",
+            "--message",
+            "fix it",
+        ]
+        assert run["env"] == {
+            "OPENCLAW_GATEWAY_URL": f"http://127.0.0.1:{gateway['port']}",
+            "OPENCLAW_GATEWAY_TOKEN": "harbor-bench-token",
+            "OPENCLAW_STATE_DIR": str(tmp_path / "logs" / "openclaw-state"),
+            "OPENCLAW_DIAGNOSTICS": "false",
+            "HOME": str(tmp_path / "root"),
+        }
+        assert run["cwd"] == str(tmp_path)
+        cfg = run["config"]
+        assert cfg["tools"] == {"profile": "full"}  # untouched: no tool profile or deny is added
+        assert cfg["agents"]["defaults"]["model"] == "custom/policy"
+        assert cfg["env"] == {"shellEnv": {"enabled": True}, "OPENCLAW_GATEWAY_TOKEN": "harbor-bench-token"}
+        assert cfg["browser"] == {
+            "headless": True,
+            "noSandbox": True,
+            "ssrfPolicy": {"dangerouslyAllowPrivateNetwork": True},
+        }
+        provider = cfg["models"]["providers"]["custom"]
+        assert provider["x"] == 1 and provider["baseUrl"] == "http://model.invalid/v1"
+        assert provider["models"] == [
+            {
+                "id": "policy",
+                "name": "policy",
+                "api": "openai-completions",
+                "reasoning": True,
+                "input": ["text"],
+                "contextWindow": 131072,
+                "maxTokens": 32768,
+            }
+        ]
+        # The session the grader reads stays where Harbor's state directory puts it.
+        assert (tmp_path / "logs" / "openclaw-state" / "agents" / "main" / "sessions" / "harbor.jsonl").is_file()
+        assert output[0].content[0].text == "done"
+        assert usage["input_tokens"] == 7 and model == "policy"
+        assert '"sessionFile"' in (tmp_path / "logs" / "openclaw.txt").read_text()  # Harbor's tee of the output
+
+    def test_gateway_is_stopped_after_the_run(self, tmp_path: Path, monkeypatch) -> None:
+        agent, record = self._agent(tmp_path, monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        asyncio.run(agent._run_openclaw("fix it", None))
+        port = next(json.loads(line)["port"] for line in record.read_text().splitlines() if "gateway" in line)
+        from responses_api_agents.openclaw_agent.app import _gateway_ready
+
+        assert not _gateway_ready(f"http://127.0.0.1:{port}")
+
+    def test_without_a_caller_clock_the_configured_timeout_is_used(self, tmp_path: Path, monkeypatch) -> None:
+        agent, _ = self._agent(tmp_path, monkeypatch, timeout=900)
+        monkeypatch.delenv("NGTB_AGENT_TIMEOUT_S", raising=False)
+        assert agent._agent_timeout() == 900
+
+
+class TestHarborMerge:
+    def test_merges_like_the_harbor_node_script(self) -> None:
+        from responses_api_agents.openclaw_agent.app import merge_harbor_config
+
+        base = {
+            "agents": {"defaults": {"workspace": "/w", "model": "old"}},
+            "models": {"providers": {"custom": {"apiKey": "k", "baseUrl": "old"}}},
+            "browser": {"executablePath": "/c", "ssrfPolicy": {"a": 1}},
+            "gateway": {"mode": "local"},
+        }
+        merged = merge_harbor_config(
+            base,
+            {
+                "agents": {"defaults": {"model": "custom/m"}},
+                "env": {"X": "1"},
+                "models": {"providers": {"custom": {"baseUrl": "new"}}},
+                "browser": {"headless": True, "ssrfPolicy": {"b": 2}},
+            },
+        )
+        assert merged == {
+            "agents": {"defaults": {"workspace": "/w", "model": "custom/m"}},
+            "models": {"providers": {"custom": {"apiKey": "k", "baseUrl": "new"}}},
+            "browser": {"executablePath": "/c", "headless": True, "ssrfPolicy": {"a": 1, "b": 2}},
+            "gateway": {"mode": "local"},
+            "env": {"X": "1"},
+        }
+        assert base["agents"]["defaults"]["model"] == "old"  # the input is not mutated
