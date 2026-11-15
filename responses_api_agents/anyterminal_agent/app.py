@@ -327,7 +327,11 @@ def _file_lock(file_path: Path, label: str, max_wait: float = 7200.0, poll_inter
 
 
 TERMINUS_2_AGENT_MODULE = "responses_api_agents.terminus_2_agent.app"
+CLAUDE_CODE_AGENT_MODULE = "responses_api_agents.claude_code_agent.app"
 TERMINUS_TIMER_GRACE_S = 600
+# Harnesses whose own run timer (agent_kwargs.timeout) is raised to the row's work clock plus the grace: Terminus-2's
+# fallback timer and Claude Code's CLI subprocess timeout. The row's clock then ends the run, not a flat harness timer.
+_BUDGET_TIMER_AGENT_MODULES = frozenset({TERMINUS_2_AGENT_MODULE, CLAUDE_CODE_AGENT_MODULE})
 # Harness stop labels carried to done_reason. A harness turn cap is "max_turns" whatever the harness
 # calls it (Terminus "max_turns", Hermes/OpenHands "max_iterations"), the wrapper's turn-cap label.
 _NAMED_AGENT_STOPS = {
@@ -1949,9 +1953,10 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         # Terminus-2's own fallback timer must outlive this row's host work clock, or a row whose
         # clock exceeds the configured timer (TB2.1 build-pov-ray: 12,000 s) is cut by the harness
         # before the clock it is graded under. Only ever raised, with the native 600 s grace.
+        # Claude Code's subprocess timeout likewise (a flat 3,600 s cut WorkBuddy rows with 4,200-10,800 s budgets).
         timer = self.config.agent_kwargs.get("timeout")
         if (
-            self.config.agent_server_module == TERMINUS_2_AGENT_MODULE
+            self.config.agent_server_module in _BUDGET_TIMER_AGENT_MODULES
             and isinstance(timer, (int, float))
             and timer < effective_agent_timeout + TERMINUS_TIMER_GRACE_S
         ):

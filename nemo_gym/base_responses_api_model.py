@@ -46,6 +46,7 @@ from typing import Any, Mapping, Optional
 from uuid import uuid4
 
 import orjson
+from aiohttp import ClientResponseError
 from fastapi import Body, FastAPI, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
@@ -159,6 +160,81 @@ def drop_client_identity(body: dict[str, Any]) -> tuple[dict[str, Any], int]:
     return ({**body, "system": kept}, len(system) - len(kept)) if len(kept) != len(system) else (body, 0)
 
 
+# Claude Code 2.1.x's compaction prompts, in the last user message of a summary request (the same strings as
+# responses_api_agents/claude_code_agent/observability.py, which the in-sandbox runtime copies on its own).
+CLAUDE_CODE_COMPACTION_PROMPT_MARKERS = (
+    "Your task is to create a detailed summary of this conversation.",
+    "Your task is to create a detailed summary of the conversation so far",
+    "Your task is to create a detailed summary of the RECENT portion of the conversation",
+)
+
+
+def is_claude_code_compaction_request(body: dict[str, Any]) -> bool:
+    """Whether the last message is a user turn whose text carries a Claude Code compaction prompt."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages or not isinstance(messages[-1], dict):
+        return False
+    last = messages[-1]
+    if last.get("role") != "user":
+        return False
+    content = last.get("content")
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [b.get("text") for b in content if isinstance(b, dict) and isinstance(b.get("text"), str)]
+    else:
+        texts = []
+    return any(marker in text for text in texts for marker in CLAUDE_CODE_COMPACTION_PROMPT_MARKERS)
+
+
+def withhold_compaction_tools(body: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Return a Claude Code compaction request without ``tools`` and ``tool_choice``, and the tool count.
+
+    The CLI sends its summary request with every tool offered and ``tool_choice`` unset; it counts a reply with no
+    text as a failed compaction and stops compacting after three. Without tools the backend sees a side request
+    for a text answer, as it does for Hermes' and Pi's summaries. Any other request is returned unchanged.
+    """
+    tools = body.get("tools")
+    if not tools or not is_claude_code_compaction_request(body):
+        return body, 0
+    return {key: value for key, value in body.items() if key not in ("tools", "tool_choice")}, len(tools)
+
+
+_CONTEXT_LENGTH_RE = re.compile(r"maximum context length is (\d+)")
+_REQUESTED_TOKENS_RES = (
+    re.compile(r"you requested (\d+) tokens"),
+    re.compile(r"your messages resulted in (\d+)"),
+    re.compile(r"your request has (\d+) input tokens"),
+)
+
+
+def anthropic_prompt_too_long(error: BaseException) -> Optional[Response]:
+    """Return the Anthropic form of a backend's OpenAI context-overflow 400, or None for any other error.
+
+    An OpenAI-compatible backend (vLLM, the wrapper's episode endpoint) reports an overflow as "This model's
+    maximum context length is L tokens. However, you requested R tokens ...". The Claude Code CLI compacts
+    reactively only on Anthropic's 400 ``invalid_request_error`` "prompt is too long: R tokens > L maximum"
+    (its matcher reads both numbers), so on /v1/messages the overflow is re-emitted in that form.
+    """
+    if getattr(error, "status", None) != 400:
+        return None
+    raw = getattr(error, "response_content", None)
+    text = raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw or "")
+    limit = _CONTEXT_LENGTH_RE.search(text)
+    if limit is None:
+        return None
+    maximum = int(limit.group(1))
+    requested = next((int(m.group(1)) for r in _REQUESTED_TOKENS_RES if (m := r.search(text))), maximum + 1)
+    body = {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": f"prompt is too long: {requested} tokens > {maximum} maximum",
+        },
+    }
+    return Response(content=orjson.dumps(body), status_code=400, media_type="application/json")
+
+
 def _request_messages(body: Any) -> list[dict]:
     """Return the conversation carried by any supported dialect.
 
@@ -244,6 +320,10 @@ class BaseResponsesAPIModelConfig(BaseRunServerInstanceConfig):
     # tool only in case renamed to that tool (the policy wrote ``bash``, the request offers
     # ``Bash``). The served name is recorded, so the client's echo is restored to it.
     anthropic_tool_name_case_repair: bool = False
+    # Send a Claude Code compaction (summary) request on /v1/messages to the backend without its tools, so the
+    # policy answers it with text (``withhold_compaction_tools``). A deliberate deviation from the stock CLI for a
+    # policy that answers "summarise" with a tool call: the CLI counts that compaction failed and stops after three.
+    anthropic_compaction_without_tools: bool = False
 
 
 class BaseResponsesAPIModel(BaseServer):
@@ -414,13 +494,20 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         CLI's fixed identity system block is dropped first (``drop_client_identity``). With
         ``anthropic_tool_name_case_repair``, the client gets a tool name that differs from one
         offered tool only in case as that tool's name (``repair_tool_name_case``); the record
-        keeps the served name.
+        keeps the served name. With ``anthropic_compaction_without_tools``, a Claude Code
+        compaction request reaches the backend without its tools (``withhold_compaction_tools``).
+        A backend context-overflow 400 is returned in Anthropic's "prompt is too long" form
+        (``anthropic_prompt_too_long``), the one the CLI compacts on.
         """
         _reject_external_capture_streaming(body)
         if getattr(self.config, "anthropic_drop_client_identity", False):
             body, dropped = drop_client_identity(body)
             if dropped:
                 logger.debug("dropped %d Claude Code identity system block(s)", dropped)
+        if getattr(self.config, "anthropic_compaction_without_tools", False):
+            body, withheld = withhold_compaction_tools(body)
+            if withheld:
+                logger.info("claude code compaction request: %d offered tools withheld", withheld)
         rollout_id = current_rollout_id()
         served_turns = store_for(self.config.name, self.config.host, self.config.port)
         # Empty served turns are recorded with the client's own last user message (before any restore), and
@@ -428,7 +515,13 @@ class SimpleResponsesAPIModel(BaseResponsesAPIModel, SimpleServer):
         anchor = request_anchor(body.get("messages")) if served_turns.scoped(rollout_id) else None
         body, _ = restore_served_turns(body, served_turns, rollout_id)
         params = _ANTHROPIC_CONVERTER.anthropic_request_to_responses(body)
-        response = await self._invoke_responses(request, params)
+        try:
+            response = await self._invoke_responses(request, params)
+        except ClientResponseError as error:
+            overflow = anthropic_prompt_too_long(error)
+            if overflow is None:
+                raise
+            return overflow
         model_name = body.get("model") or response.model
         anthropic_response = _ANTHROPIC_CONVERTER.responses_to_anthropic_response(response, model=model_name)
         record_served_turn(anthropic_response, served_turns, rollout_id, anchor=anchor)
