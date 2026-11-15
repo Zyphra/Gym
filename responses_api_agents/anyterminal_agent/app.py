@@ -585,6 +585,15 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     tb_agent_timeout: int = 1800
     # When set, overrides the per-task agent_timeout_sec from the dataset for every task.
     global_agent_timeout: Optional[int] = Field(default=None, gt=0)
+    episode_worker_module: str = Field(
+        default="responses_api_agents.anyterminal_agent.app",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$",
+        description=(
+            "Module whose run_terminal_episode(params_dict) runs one episode in the sandbox worker. A plugin root's "
+            "module can run a RunTerminalAgent subclass (e.g. a Harbor multi-step task's step loop) for the rows it "
+            "recognises and the stock run for the rest; the request, sandbox and response contract are unchanged."
+        ),
+    )
     tb_eval_timeout: int = 300
     tb_sandbox_ttl: int = 7200
     agent_overhead_mb: int = 2048  # extra container memory on top of the task's memory_mb for the
@@ -1975,7 +1984,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
 
     async def _inner_responses(self, params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
         payload = params.model_dump(mode="json")
-        worker = importlib.import_module("responses_api_agents.anyterminal_agent.app").run_terminal_episode
+        worker = importlib.import_module(self.config.episode_worker_module).run_terminal_episode
         update_metrics(params.metrics_fpath, {"submitted_at": time.time()}, params.task_name)
         result = await run_sandbox_episode(
             worker,
