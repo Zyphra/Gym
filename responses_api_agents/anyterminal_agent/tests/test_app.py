@@ -173,6 +173,55 @@ class TestRunnerTemplate:
         assert "HermesAgentConfig.model_fields" in rendered
 
 
+class TestRuntimeOverlay:
+    def test_runner_puts_overlay_first_and_fills_a_null_workspace(self) -> None:
+        rendered = TestRunnerTemplate()._render()
+        compile(rendered, "<runner>", "exec")
+        assert rendered.index('sys.path.insert(0, "/nemo_gym_mount")') < rendered.index(
+            'sys.path.insert(0, "/trajectories_mount/agent_overlay")'
+        )
+        assert 'AGENT_KWARGS.get("workspace") is None' in rendered
+        assert 'AGENT_KWARGS["workspace"] = TASK_WORKDIR' in rendered
+
+    def test_run_command_ships_overlay_sources(self, tmp_path: Path) -> None:
+        source = tmp_path / "src" / "my_agent"
+        (source / "__pycache__").mkdir(parents=True)
+        (source / "__init__.py").write_text("")
+        (source / "app.py").write_text("VALUE = 1\n")
+        (source / "__pycache__" / "app.pyc").write_text("stale")
+        persistent = tmp_path / "episode"
+        persistent.mkdir()
+        cfg = SimpleNamespace(
+            body=NeMoGymResponseCreateParamsNonStreaming(input="do it"),
+            persistent_dir=persistent,
+            agent_server_module="my_agent.app",
+            agent_server_class="MyAgent",
+            agent_config_class="MyAgentConfig",
+            agent_runtime_overlay={"my_agent": str(source)},
+        )
+        command = GymAgentHarnessProcessor(config=cfg).get_run_command()
+        assert command == "/agent_deps_mount/bin/python /trajectories_mount/agent_runner.py"
+        shipped = sorted(str(path.relative_to(persistent)) for path in (persistent / "agent_overlay").rglob("*.py"))
+        assert shipped == ["agent_overlay/my_agent/__init__.py", "agent_overlay/my_agent/app.py"]
+        assert (persistent / "agent_overlay" / "my_agent" / "app.py").read_text() == "VALUE = 1\n"
+        assert not (persistent / "agent_overlay" / "my_agent" / "__pycache__").exists()
+
+    def test_no_overlay_ships_nothing(self, tmp_path: Path) -> None:
+        cfg = SimpleNamespace(
+            body=NeMoGymResponseCreateParamsNonStreaming(input="do it"),
+            persistent_dir=tmp_path,
+            agent_server_module="my_agent.app",
+            agent_server_class="MyAgent",
+            agent_config_class="MyAgentConfig",
+            agent_runtime_overlay={},
+        )
+        GymAgentHarnessProcessor(config=cfg).get_run_command()
+        assert not (tmp_path / "agent_overlay").exists()
+
+    def test_config_defaults_to_no_overlay(self) -> None:
+        assert _config().agent_runtime_overlay == {}
+
+
 class TestAgentKey:
     def test_key_from_module(self) -> None:
         proc = GymAgentHarnessProcessor(config=_config())

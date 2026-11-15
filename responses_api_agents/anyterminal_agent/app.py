@@ -377,6 +377,9 @@ from pathlib import Path
 from fastapi import Request
 
 sys.path.insert(0, "/nemo_gym_mount")
+# Source packages selected by agent_runtime_overlay shadow the runtime's installed copies.
+if Path("/trajectories_mount/agent_overlay").is_dir():
+    sys.path.insert(0, "/trajectories_mount/agent_overlay")
 # Append (not prepend) agent-deps bin so the task's own python/pip win — else the agent's
 # builds/installs land in a Python the verifier can't see. Harness CLIs stay findable as a fallback.
 os.environ["PATH"] = os.environ.get("PATH", os.defpath) + os.pathsep + "/agent_deps_mount/bin"
@@ -406,6 +409,8 @@ _cfg_sampling = {{k: v for k, v in SAMPLING.items() if k in {agent_cfg_class}.mo
 # Agents that declare a working directory run their tools in the task's, as under anyswe_agent.
 if "working_directory" in {agent_cfg_class}.model_fields:
     AGENT_KWARGS.setdefault("working_directory", TASK_WORKDIR)
+if "workspace" in {agent_cfg_class}.model_fields and AGENT_KWARGS.get("workspace") is None:
+    AGENT_KWARGS["workspace"] = TASK_WORKDIR
 
 _model_server = ModelServerRef(name="policy_model", type="responses_api_models") if MODEL_URL else None
 config = {agent_cfg_class}(
@@ -505,6 +510,21 @@ class GymAgentHarnessProcessor(BaseModel):
             agent_class_lower=cfg.agent_server_class.lower(),
         )
         (cfg.persistent_dir / "agent_runner.py").write_text(runner)
+        overlay = getattr(cfg, "agent_runtime_overlay", None)
+        if overlay:
+            # AnySWE's overlay contract: import path -> host source, shipped under /trajectories_mount/agent_overlay.
+            from responses_api_agents.anyswe_agent.app import _overlay_files, _overlay_sha256
+
+            files = _overlay_files(overlay)
+            for remote, text in files.items():
+                local = cfg.persistent_dir / Path(remote).relative_to("/trajectories_mount")
+                local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_text(text)
+            print(
+                f"[anyterminal_agent] agent_runtime_overlay packages={sorted(overlay)} "
+                f"files={len(files)} sha256={_overlay_sha256(files)}",
+                flush=True,
+            )
         return "/agent_deps_mount/bin/python /trajectories_mount/agent_runner.py"
 
 
@@ -554,6 +574,13 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     agent_runtime_source: str = Field(
         default="auto",
         description="auto, an absolute prepared dependency directory for local sandboxes, or a remote runtime archive/URL",
+    )
+    agent_runtime_overlay: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Python import path -> host source directory or module that shadows the runtime's installed copy "
+            "(AnySWE's agent_runtime_overlay). Shipped under /trajectories_mount/agent_overlay, first on sys.path."
+        ),
     )
     agent_timeout_is_failure: bool = Field(default=False, strict=True)
     agent_timeout_grades_workspace: bool = Field(
@@ -999,6 +1026,18 @@ class RunTerminalAgent(BaseModel):
             raise RuntimeError(result.stderr or "failed to create sandbox runtime directories")
         await sandbox.upload(cfg.persistent_dir / "instruction.txt", "/trajectories_mount/instruction.txt")
         await sandbox.upload(cfg.persistent_dir / "agent_runner.py", "/trajectories_mount/agent_runner.py")
+        overlay_dir = cfg.persistent_dir / "agent_overlay"
+        if overlay_dir.is_dir():
+            for local in sorted(path for path in overlay_dir.rglob("*") if path.is_file()):
+                remote = f"/trajectories_mount/{local.relative_to(cfg.persistent_dir)}"
+                result = await sandbox.exec(
+                    f"mkdir -p {shlex.quote(str(Path(remote).parent))}",
+                    timeout_s=setup_timeout_seconds(30),
+                    user="root",
+                )
+                if result.return_code != 0:
+                    raise RuntimeError(result.stderr or "failed to create agent overlay directory")
+                await sandbox.upload(local, remote)
         external_runtime = cfg.agent_deps_archive is not None or cfg.agent_deps_url is not None
         if cfg.agent_deps_archive is not None:
             await sandbox.upload(cfg.agent_deps_archive, "/tmp/anyterminal-agent-deps.tar.gz")
