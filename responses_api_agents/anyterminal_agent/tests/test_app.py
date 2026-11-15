@@ -2221,3 +2221,39 @@ class TestAgentTimeoutGradesWorkspace:
             _make_instance_config(tmp_path, agent_timeout_grades_workspace="true")
         with pytest.raises(ValidationError, match="mutually exclusive"):
             _make_instance_config(tmp_path, agent_timeout_grades_workspace=True, agent_timeout_is_failure=True)
+
+
+# ── episode_worker_module ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [None, "anyterminal_episode_worker_probe"])
+async def test_episode_worker_module_selects_the_sandbox_worker(tmp_path, monkeypatch, module):
+    import sys
+    import types
+
+    probe = types.ModuleType("anyterminal_episode_worker_probe")
+
+    async def run_terminal_episode(params_dict):  # pragma: no cover - never executed here
+        raise AssertionError
+
+    probe.run_terminal_episode = run_terminal_episode
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+    overrides = {} if module is None else {"episode_worker_module": module}
+    agent = _make_setup_agent(tmp_path, **overrides)
+    submitted = []
+
+    async def capture(worker, payload, resources, **kwargs):
+        submitted.append(worker)
+        raise RuntimeError("captured")
+
+    monkeypatch.setattr(app, "run_sandbox_episode", capture)
+    with pytest.raises(RuntimeError, match="captured"):
+        await agent._inner_responses(_make_instance_config(tmp_path))
+    expected = app.run_terminal_episode if module is None else probe.run_terminal_episode
+    assert submitted == [expected]
+
+
+def test_episode_worker_module_must_be_a_dotted_module_name():
+    with pytest.raises(ValidationError):
+        _config(episode_worker_module="not a module; rm -rf /")
