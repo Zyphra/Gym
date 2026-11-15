@@ -808,7 +808,7 @@ class TestEmptyTurnNudge:
             assert later[: len(earlier)] == earlier
         assert self._shape(server) == [
             ("user", TASK["content"]),
-            ("system", "Today's date is 2026-10-23."),
+            ("user", "<system-reminder>\nToday's date is 2026-10-23.\n</system-reminder>"),
             *[("reasoning", None), ("user", tool_echo.OUTPUT_LIMIT_NUDGE)] * 2,
         ]
         assert _kinds(_restore_log(private_store)) == {"output_limit_nudge": 2}
