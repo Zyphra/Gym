@@ -831,6 +831,34 @@ class TestSetupParams:
 
         assert agent._setup_params(body).agent_kwargs["timeout"] == timer
 
+    @staticmethod
+    def _claude_code(tmp_path: Path, timer: float) -> AnyTerminalAgent:
+        return _make_setup_agent(
+            tmp_path,
+            agent_server_module="responses_api_agents.claude_code_agent.app",
+            agent_server_class="ClaudeCodeAgent",
+            agent_config_class="ClaudeCodeAgentConfig",
+            agent_kwargs={"timeout": timer, "max_turns": 256},
+        )
+
+    @pytest.mark.parametrize("row_clock", ["4200", "10800"])
+    def test_claude_code_timeout_outlives_a_longer_row_clock(self, tmp_path: Path, row_clock: str) -> None:
+        # WorkBuddy Security/Web rows: x2.0 task budgets of 4,200-10,800 s against the binding's flat 3,600 s.
+        agent = self._claude_code(tmp_path, 3600)
+        body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": row_clock})
+
+        params = agent._setup_params(body)
+
+        assert params.tb_agent_timeout == int(row_clock)
+        assert params.agent_kwargs == {"timeout": int(row_clock) + 600, "max_turns": 256}
+        assert agent.config.agent_kwargs["timeout"] == 3600
+
+    def test_claude_code_timeout_kept_when_it_already_outlives_the_clock(self, tmp_path: Path) -> None:
+        agent = self._claude_code(tmp_path, 3600)
+        body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": "1800"})
+
+        assert agent._setup_params(body).agent_kwargs == {"timeout": 3600, "max_turns": 256}
+
     def test_other_harness_timeout_kwarg_is_not_a_terminus_timer(self, tmp_path: Path) -> None:
         agent = _make_setup_agent(tmp_path, agent_kwargs={"timeout": 60})
         body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": "12000"})
