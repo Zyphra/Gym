@@ -1629,6 +1629,96 @@ async def test_expected_budget_stop_keeps_graded_patch(
 
 
 @pytest.mark.parametrize(
+    "grades_workspace,wall,patch,expected_reward,expected_mask",
+    [
+        (True, "exec", "diff --git a/fixed.txt b/fixed.txt\n+fixed\n", 1.0, False),
+        (True, "runner", "diff --git a/fixed.txt b/fixed.txt\n+fixed\n", 1.0, False),
+        (True, "exec", "", 0.0, False),
+        (False, "exec", "diff --git a/fixed.txt b/fixed.txt\n+fixed\n", 1.0, True),
+    ],
+)
+async def test_agent_wall_grades_the_patch_it_left(
+    tmp_path, monkeypatch, episode_submissions, grades_workspace, wall, patch, expected_reward, expected_mask
+):
+    from omegaconf import OmegaConf
+
+    from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+    from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
+
+    head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
+    config = _config(
+        model_server=None,
+        agent_runtime_source="baked",
+        sandbox_model_base_url="http://127.0.0.1:19002/v1",
+        sandbox_spec={"resources": {"cpu": 2, "memory_mib": 4096, "pids": 128}},
+        agent_timeout_grades_workspace=grades_workspace,
+    )
+    client = ServerClient(head_server_config=head, global_config_dict=OmegaConf.create({"results_dir": str(tmp_path)}))
+    agent = AnySweAgent(config=config, server_client=client)
+    body = NeMoGymResponseCreateParamsNonStreaming(
+        model="test-model", input="Fix it", metadata={"instance_id": "test__test-1", "problem_statement": "Fix it"}
+    )
+    saved = NeMoGymResponse(
+        id="wall-response",
+        created_at=1,
+        model="test-model",
+        object="response",
+        output=[],
+        parallel_tool_calls=False,
+        tool_choice="auto",
+        tools=[],
+        metadata={"agent_wall_timeout": "true"} if wall == "runner" else None,
+    )
+
+    class WallSandbox:
+        def __init__(self, provider, spec):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def exec(self, command, **kwargs):
+            if command.startswith("test -f"):
+                missing = command.endswith("patch.diff") and not patch
+                return SandboxExecResult("", "", 1 if missing else 0, None)
+            # Only the agent command runs on the agent budget; setup probes succeed.
+            if wall == "exec" and kwargs.get("timeout_s") == config.swebench_agent_timeout:
+                return SandboxExecResult("", "", -1, "timeout")
+            return SandboxExecResult("", "", 0, None)
+
+        async def download(self, source, destination):
+            destination.write_text(saved.model_dump_json() if source.endswith("response.json") else patch)
+
+    graded = []
+
+    async def grade(self, params, received):
+        graded.append(received)
+        return True, None, None
+
+    monkeypatch.setattr(app_module, "AsyncSandbox", WallSandbox)
+    monkeypatch.setattr(AnySweSandboxRunner, "_grade_sandbox_patch", grade)
+    result = await agent.run(AnySweRunRequest(responses_create_params=body))
+    assert graded == ([patch] if patch else [])
+    assert result.reward == expected_reward
+    assert result.mask_sample is expected_mask
+    assert result.agent_timed_out is (not grades_workspace)
+    assert result.agent_budget_exhausted is grades_workspace
+    assert result.patch_exists is bool(patch)
+
+
+def test_agent_timeout_grades_workspace_is_strict_and_off_by_default() -> None:
+    from pydantic import ValidationError
+
+    assert _config().agent_timeout_grades_workspace is False
+    with pytest.raises(ValidationError):
+        _config(agent_timeout_grades_workspace="true")
+
+
+@pytest.mark.parametrize(
     "text,process_failed,declared_error,stop_reason,expected_kind,expected_mask",
     [
         ("maximum iterations reached", False, False, None, None, False),
