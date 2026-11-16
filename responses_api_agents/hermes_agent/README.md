@@ -105,6 +105,21 @@ hermes_agent:
 | `terminal_timeout` | `60` | sets `TERMINAL_TIMEOUT` (process-global); per-command wall-clock seconds |
 | `system_prompt` | `null` | passed as `system_message` to `run_conversation`; falls back to any system item in `body.input` |
 | `finish_tool` | `false` | offers OpenHands' `finish(message)` tool; every call in the turn that calls it executes, then the run ends as completed without another model request |
+| `request_tools` | `false` | offers the request's function tools (a row's `responses_create_params.tools`); each call is `POST /<tool name>` on the resources server in the episode's session, as `simple_agent` makes it. With `enabled_toolsets: []` they are the only tools |
+| `hermes_runtime` | `null` | a prepared Hermes runtime (`scripts/hermes_agent_deps.sh`); each episode runs in one process of its `bin/python` (`runtime_runner.py`), for a server whose own Python has no Hermes |
+| `agent_environment` | `{}` | environment for Hermes, e.g. `HERMES_REDACT_SECRETS` |
+
+The serving endpoint ends an episode with an empty assistant message, `finish_reason: stop` and the
+stop's name as `stop_reason`, before sampling (turn cap, exhausted context) or on the turn it just
+sampled (a guard). After that stop the agent answers Hermes' own retries with the same stop instead of
+sending them to the ended episode, and the run's outcome is the endpoint's stop, not a Hermes failure.
+
+Hermes replays every stored assistant turn on each request, and a rollout endpoint continues an
+episode only on the turns it served. The agent therefore stores each turn's tool calls as the policy
+sampled them: Hermes' repair of an unknown tool name to the closest offered one and its drop of a
+repeated (name, arguments) call in one turn are off. An unknown name gets Hermes' unknown-tool
+result; a repeated call runs again. Tools Gym offers outside Hermes' toolsets (`finish`, the
+request's tools) stay offered across Hermes' tool refresh at a compaction.
 
 The model-server url is resolved at request time and passed to `AIAgent(base_url=..., api_key="gym")`. <!-- pragma: allowlist secret -->
 
