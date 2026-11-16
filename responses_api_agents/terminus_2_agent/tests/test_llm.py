@@ -583,7 +583,10 @@ async def test_endpoint_guard_stop_on_a_sampled_turn_ends_the_episode(guard):
         ({"message": {"content": "done"}, "finish_reason": "stop", "stop_reason": "eos"}, False),
         ({"message": {"content": ""}, "finish_reason": "stop", "stop_reason": 151645}, False),
         ({"message": {"content": ""}, "finish_reason": "length", "stop_reason": "token_budget"}, False),
-        ({"message": {"content": "", "tool_calls": [{"id": "c"}]}, "finish_reason": "stop", "stop_reason": "x"}, False),
+        (
+            {"message": {"content": "", "tool_calls": [{"id": "c"}]}, "finish_reason": "stop", "stop_reason": "x"},
+            False,
+        ),
     ],
 )
 def test_endpoint_stop_is_the_empty_named_stop(choice, stopped):
