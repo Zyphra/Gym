@@ -38,8 +38,9 @@ Runs [hermes-agent](https://github.com/NousResearch/hermes-agent) in a nemo gym 
 
 ## Setup
 
-Hermes runs unmodified: `scripts/hermes_agent_deps.sh` pins a NousResearch/hermes-agent
-commit, places that source tree in the agent runtime and installs Hermes' own `uv.lock`
+`scripts/hermes_agent_deps.sh` pins a NousResearch/hermes-agent commit, places that source
+tree in the agent runtime, applies the defect fixes in `patches/` (listed in `patches/README.md`;
+the runtime records them in `hermes-agent/.hermes_patches`) and installs Hermes' own `uv.lock`
 (Python 3.14), then Gym's dependencies. Hermes refuses wheel builds, so it is not listed in
 `requirements.txt`. Where the two lock files pin different versions, Gym's pin wins (the OpenAI
 SDK: Gym mirrors its audited version's Responses types).
