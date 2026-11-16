@@ -302,14 +302,22 @@ def _keep_sampled_turns(agent: Any) -> None:
     """Store each policy turn's tool calls as the policy sampled them.
 
     Hermes replays its stored assistant turns on every request, and a rollout endpoint
-    continues an episode only on the turns it served. Two Hermes edits rewrite a sampled
-    turn before it is stored: an unknown tool name is repaired to the closest offered one
-    (``agent/agent_runtime_helpers.py`` ``repair_tool_call``: ``bash`` -> ``Bash``,
-    ``mcp__x`` -> ``mcp_x``) and a repeated (name, arguments) call in one turn is dropped
-    (``run_agent.py`` ``_deduplicate_tool_calls``). Neither runs: an unknown name gets
-    Hermes' own unknown-tool result, as on any unrepairable name, and a repeated call
-    runs again, as the policy asked.
+    continues an episode only on the turns it served. Three Hermes edits rewrite a sampled
+    turn: an unknown tool name is repaired to the closest offered one before the turn is
+    stored (``agent/agent_runtime_helpers.py`` ``repair_tool_call``: ``bash`` -> ``Bash``),
+    a repeated (name, arguments) call in one turn is dropped (``run_agent.py``
+    ``_deduplicate_tool_calls``), and every request's copy of the history has each call
+    name outside ``^[A-Za-z0-9_-]{1,64}$`` coerced into it (``agent/agent_runtime_helpers.py``
+    ``_repair_invalid_tool_call_names``: an offered 83-character
+    ``mcp__<server>__<function>`` becomes a different 64-character name). None runs: an
+    unknown name gets Hermes' own unknown-tool result, as on any unrepairable name, a
+    repeated call runs again, as the policy asked, and every name goes out as sampled (the
+    rollout endpoint takes any name). The coercion is module-level, so it is off for the
+    whole process, which runs only Hermes agents.
     """
+    import agent.agent_runtime_helpers as runtime_helpers  # pyright: ignore[reportMissingImports]
+
+    runtime_helpers._repair_invalid_tool_call_names = lambda _messages: None
     agent._repair_tool_call = lambda _name: None
     agent._deduplicate_tool_calls = lambda tool_calls: tool_calls
 

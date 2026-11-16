@@ -21,6 +21,8 @@ from responses_api_agents.hermes_agent.tests.test_stock_compaction import (
 )
 
 
+# An MCP tool name over the 64 characters some providers allow, as MiMo rows offer them.
+LONG = "mcp__consumer_compliance_data_quality_control_register__run_response_timestamp_test"
 REQUEST_TOOLS = [
     {
         "type": "function",
@@ -29,7 +31,7 @@ REQUEST_TOOLS = [
         "description": f"The row's {name} tool.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
     }
-    for name in ("Bash", "Read")
+    for name in ("Bash", "Read", LONG)
 ]
 
 
@@ -95,7 +97,12 @@ def test_sampled_turns_are_replayed_as_sampled_and_request_tools_run_in_the_sess
         "role": "assistant",
         "content": "",
         "reasoning_content": "Look at the file twice.\n",
-        "tool_calls": [_call("call_a", "bash", "x"), _call("call_b", "Read", "y"), _call("call_c", "Read", "y")],
+        "tool_calls": [
+            _call("call_a", "bash", "x"),
+            _call("call_b", "Read", "y"),
+            _call("call_c", "Read", "y"),
+            _call("call_d", LONG, "z"),
+        ],
     }
     resources = _Resources()
     with _PolicyFixture(_SUMMARY_OK, main_turns=[sampled]) as policy:
@@ -106,7 +113,7 @@ def test_sampled_turns_are_replayed_as_sampled_and_request_tools_run_in_the_sess
     assert response.status == "completed"
     assert len(mains) == 2
     # The row's tools are the only tools offered.
-    assert all(_offered(body) == ["Bash", "Read"] for _, body in mains)
+    assert all(_offered(body) == sorted(["Bash", "Read", LONG]) for _, body in mains)
     replayed = [message for message in mains[1][1]["messages"] if message["role"] == "assistant"]
     assert len(replayed) == 1
     # Names, call count and arguments as sampled: no name repair, no duplicate dropped.
@@ -116,7 +123,9 @@ def test_sampled_turns_are_replayed_as_sampled_and_request_tools_run_in_the_sess
     assert replayed[0]["reasoning_content"] == sampled["reasoning_content"]
     # Both Read calls ran on the resources server in the episode's session; `bash` got Hermes'
     # unknown-tool result and never reached it.
-    assert resources.calls == [("/Read", {"path": "y"}, "session=s-1")] * 2
+    assert sorted(resources.calls) == sorted(
+        [("/Read", {"path": "y"}, "session=s-1")] * 2 + [(f"/{LONG}", {"path": "z"}, "session=s-1")]
+    )
     results = {m["tool_call_id"]: m["content"] for m in mains[1][1]["messages"] if m["role"] == "tool"}
     assert "does not exist" in results["call_a"]
     assert "ran Read" in results["call_b"] and "ran Read" in results["call_c"]
@@ -136,7 +145,7 @@ def test_request_tools_survive_the_compaction_tool_refresh(monkeypatch, tmp_path
     assert response.status in ("completed", "incomplete")
     assert summaries, "the long history compacts"
     # Hermes rebuilds its tool surface from its toolsets after compacting; the row's tools stay.
-    assert mains and all(_offered(body) == ["Bash", "Read"] for _, body in mains)
+    assert mains and all(_offered(body) == sorted(["Bash", "Read", LONG]) for _, body in mains)
     assert [path for path, _, _ in resources.calls] == ["/Read"] * len(resources.calls) and resources.calls
 
 
