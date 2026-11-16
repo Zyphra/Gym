@@ -69,6 +69,7 @@ from responses_api_agents.pi_agent.setup_pi import ensure_pi
 LOG = logging.getLogger(__name__)
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
 TURN_LIMIT_EXTENSION = Path(__file__).with_name("turn_limit.ts")
+REQUEST_TOOLS_EXTENSION = Path(__file__).with_name("request_tools.ts")
 TURN_LIMIT_MARKER = "pi_gym_turn_limit"
 # The model endpoint's context-overflow errors, as Pi's own overflow detection reads them.
 _CONTEXT_OVERFLOW = re.compile(
@@ -546,6 +547,10 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     # shellPath setting; an extension that spawns its own shell reads PI_HIDE_HARNESS_MOUNTS=1.
     hide_harness_mounts: bool = False
     pi_version: Optional[str] = None
+    # Offer the request's function tools (a row's `responses_create_params.tools`, request_tools.ts) and
+    # run each call as simple_agent does: POST /<tool name> on the resources server in the episode's
+    # session. `extra_args: [--no-builtin-tools, ...]` makes them Pi's only tools.
+    request_tools: bool = False
 
     @property
     def command_parts(self) -> list[str]:
@@ -574,7 +579,9 @@ class PiAgent(SimpleResponsesAPIAgent):
 
     def model_post_init(self, __context: Any) -> None:
         self.sem = Semaphore(self.config.concurrency)
-        ensure_pi(self.config.pi_version)
+        if os.sep not in (self.config.command_parts or [""])[0]:
+            # A command that names a prepared runtime's Pi is used as it is; never install over it.
+            ensure_pi(self.config.pi_version)
         command = self.config.command_parts[0] if self.config.command_parts else ""
         if not command or shutil.which(command) is None:
             LOG.warning("pi command %r is not on PATH yet", self.config.command)
@@ -647,6 +654,35 @@ class PiAgent(SimpleResponsesAPIAgent):
             (agent_dir / "models.json").write_text(json.dumps(models_config, indent=2))
         (agent_dir / "settings.json").write_text(json.dumps(self._build_settings_config(home), indent=2))
 
+    def _write_request_tools(self, home: Path, tools: Any, cookies: Mapping[str, Any]) -> Path:
+        """The request's function tools, the resources server URL and the session cookie (request_tools.ts)."""
+        forwarded = []
+        for tool in tools or []:
+            field = (
+                (lambda key: tool.get(key)) if isinstance(tool, Mapping) else (lambda key: getattr(tool, key, None))
+            )
+            if field("type") != "function":
+                raise ValueError(f"Pi request tools must be function tools, got {field('type')!r}")
+            forwarded.append(
+                {
+                    "name": field("name"),
+                    "description": field("description") or "",
+                    "parameters": dict(field("parameters") or {"type": "object", "properties": {}}),
+                }
+            )
+        path = home / "gym-request-tools.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "url": self.server_client._resolve_base_url(self.config.resources_server.name),
+                    "cookie": "; ".join(f"{k}={getattr(v, 'value', v)}" for k, v in cookies.items()),
+                    "tools": forwarded,
+                }
+            )
+        )
+        path.chmod(0o600)  # The session cookie authorizes calls into the episode.
+        return path
+
     async def _run_pi(
         self,
         instruction: str,
@@ -654,6 +690,8 @@ class PiAgent(SimpleResponsesAPIAgent):
         *,
         rollout_id: Optional[str] = None,
         collect_observations: bool = True,
+        request_tools: Any = None,
+        cookies: Optional[Mapping[str, Any]] = None,
     ) -> _PiRunResult:
         effective_model = self._effective_model()
         provider, _, model_id = effective_model.partition("/")
@@ -676,6 +714,9 @@ class PiAgent(SimpleResponsesAPIAgent):
         if self.config.max_turns is not None:
             cmd += ["--extension", str(TURN_LIMIT_EXTENSION)]
             env["PI_GYM_MAX_TURNS"] = str(self.config.max_turns)
+        if self.config.request_tools:
+            cmd += ["--extension", str(REQUEST_TOOLS_EXTENSION)]
+            env["PI_GYM_REQUEST_TOOLS"] = str(self._write_request_tools(home, request_tools, cookies or {}))
         cmd += self.config.extra_args
         # Pi's argument parser has no end-of-options marker: a positional starting with "-" is an option and one
         # starting with "@" a file reference, whatever the task text says. Such an instruction arrives on stdin.
@@ -768,6 +809,7 @@ class PiAgent(SimpleResponsesAPIAgent):
         *,
         rollout_id: Optional[str] = None,
         collect_observations: bool = True,
+        cookies: Optional[Mapping[str, Any]] = None,
     ) -> AgentEpisode:
         body = body.model_copy(deep=True)
         if isinstance(body.input, str):
@@ -786,6 +828,8 @@ class PiAgent(SimpleResponsesAPIAgent):
             system_prompt,
             rollout_id=rollout_id,
             collect_observations=collect_observations,
+            request_tools=body.tools,
+            cookies=cookies,
         )
         output_items, usage, model_name, events = result.output, result.usage, result.model, result.events
         # A budget stop ends `pi --print` with exit 1 like a failure; it is the expected end of the run.
@@ -826,7 +870,12 @@ class PiAgent(SimpleResponsesAPIAgent):
             model=model_name,
             object="response",
             output=output_items,
-            status="incomplete" if result.timed_out else ("failed" if process_error else None),
+            # A run that ended on its own (no failure, no budget stop) completed, as Hermes reports it.
+            status=(
+                "incomplete"
+                if result.timed_out
+                else ("failed" if process_error else (None if result.budget_stop else "completed"))
+            ),
             error=(ResponseError(code="server_error", message=f"Pi {process_error}") if process_error else None),
             metadata=(
                 {"agent_error": process_error, "pi_return_code": str(result.return_code)}
@@ -888,6 +937,8 @@ class PiAgent(SimpleResponsesAPIAgent):
             body,
             rollout_id=rollout_id,
             collect_observations=isinstance(rollout_id, str),
+            # A runner's synthetic request (anyterminal's agent_runner.py) carries no headers.
+            cookies=request.cookies if "headers" in getattr(request, "scope", {}) else {},
         )
         if not isinstance(rollout_id, str) and not episode.observations.records:
             return episode.response
@@ -915,7 +966,8 @@ class PiAgent(SimpleResponsesAPIAgent):
                 cookies=cookies,
             )
             await raise_for_status(agent_resp)
-            cookies = agent_resp.cookies
+            # Verify in the seeded session: the agent's reply sets no session cookie of its own.
+            cookies = {**cookies, **agent_resp.cookies}
             agent_resp_json = await get_response_json(agent_resp)
             raw_observations = agent_resp_json.pop(_INTERNAL_OBSERVATIONS_KEY, None)
             observations = (

@@ -14,19 +14,24 @@
 # limitations under the License.
 import asyncio
 import atexit
+import contextlib
 import json
 import logging
 import os
 import shutil
+import signal
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 from asyncio import Semaphore
 from collections.abc import Mapping
+from pathlib import Path
 from time import time
 from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
-import model_tools  # noqa: F401  # fail-fast if hermes-agent isn't installed  # pyright: ignore[reportMissingImports]
 from fastapi import Request
 from pydantic import ConfigDict, Field
 
@@ -274,6 +279,129 @@ def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
     return lambda: stopped
 
 
+def _keep_sampled_turns(agent: Any) -> None:
+    """Store each policy turn's tool calls as the policy sampled them.
+
+    Hermes replays its stored assistant turns on every request, and a rollout endpoint
+    continues an episode only on the turns it served. Two Hermes edits rewrite a sampled
+    turn before it is stored: an unknown tool name is repaired to the closest offered one
+    (``agent/agent_runtime_helpers.py`` ``repair_tool_call``: ``bash`` -> ``Bash``,
+    ``mcp__x`` -> ``mcp_x``) and a repeated (name, arguments) call in one turn is dropped
+    (``run_agent.py`` ``_deduplicate_tool_calls``). Neither runs: an unknown name gets
+    Hermes' own unknown-tool result, as on any unrepairable name, and a repeated call
+    runs again, as the policy asked.
+    """
+    agent._repair_tool_call = lambda _name: None
+    agent._deduplicate_tool_calls = lambda tool_calls: tool_calls
+
+
+def _pin_offered_tools(agent: Any, offered: list[dict]) -> None:
+    """Keep the tools Gym offers outside Hermes' toolsets across Hermes' tool refreshes.
+
+    Hermes re-derives ``tools`` and ``valid_tool_names`` from its toolsets at a compaction
+    boundary (``agent/conversation_compression.py`` ``_refresh_agent_tool_definitions``),
+    which drops a tool Gym appended (``finish``, a request's tools). The agent's class is
+    swapped for a subclass whose two attributes always carry the offered tools.
+    """
+    if not offered:
+        return
+    names = {tool["function"]["name"] for tool in offered}
+    base = type(agent)
+    state = agent.__dict__
+    state["_gym_tools"] = [t for t in (state.pop("tools", None) or []) if t["function"]["name"] not in names]
+    state["_gym_valid_tool_names"] = set(state.pop("valid_tool_names", None) or ()) - names
+
+    def tools(self):
+        return [*self.__dict__["_gym_tools"], *offered]
+
+    def set_tools(self, value):
+        self.__dict__["_gym_tools"] = [t for t in (value or []) if t["function"]["name"] not in names]
+
+    def valid_tool_names(self):
+        return {*self.__dict__["_gym_valid_tool_names"], *names}
+
+    def set_valid_tool_names(self, value):
+        self.__dict__["_gym_valid_tool_names"] = set(value or ()) - names
+
+    agent.__class__ = type(
+        base.__name__,
+        (base,),
+        {
+            "tools": property(tools, set_tools),
+            "valid_tool_names": property(valid_tool_names, set_valid_tool_names),
+        },
+    )
+
+
+# Request tools of the episodes this process is running: Hermes task id -> (resources server URL, cookie header).
+_REQUEST_TOOL_EPISODES: dict[str, tuple[str, str]] = {}
+_REQUEST_TOOL_LOCK = threading.Lock()
+
+
+def _request_tool_result(name: str, args: Any, task_id: Optional[str] = None, **_: Any) -> str:
+    """Run one request tool as simple_agent does: POST /<name> on the resources server, in the episode's session."""
+    url, cookie = _REQUEST_TOOL_EPISODES[task_id]
+    request = urllib.request.Request(
+        f"{url}/{urllib.request.quote(name, safe='')}",
+        data=json.dumps(args if isinstance(args, dict) else {}, ensure_ascii=False).encode(),
+        headers={"content-type": "application/json", "cookie": cookie},
+        method="POST",
+    )
+    try:
+        # The resources server owns each tool's deadline.
+        with urllib.request.urlopen(request) as reply:  # noqa: S310 - the episode's own resources server
+            return reply.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        # As in simple_agent, the resources server's error reply is the tool output.
+        return error.read().decode("utf-8", errors="replace")
+
+
+def _request_function_tools(tools: Any) -> list[dict]:
+    """The request's function tools as Hermes (chat completions) tool definitions."""
+    offered = []
+    for tool in tools or []:
+        field = (lambda key: tool.get(key)) if isinstance(tool, Mapping) else (lambda key: getattr(tool, key, None))
+        if field("type") != "function":
+            raise ValueError(f"Hermes request tools must be function tools, got {field('type')!r}")
+        offered.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": field("name"),
+                    "description": field("description") or "",
+                    "parameters": dict(field("parameters") or {"type": "object", "properties": {}}),
+                },
+            }
+        )
+    names = [tool["function"]["name"] for tool in offered]
+    if len(set(names)) != len(names):
+        raise ValueError("Hermes request tools must name each tool once")
+    return offered
+
+
+def _offer_request_tools(offered: list[dict], task_id: str, url: str, cookie: str) -> None:
+    """Register the request's tools for this episode; each call runs on the resources server."""
+    from functools import partial
+
+    from tools.registry import registry  # pyright: ignore[reportMissingImports]
+
+    with _REQUEST_TOOL_LOCK:
+        _REQUEST_TOOL_EPISODES[task_id] = (url, cookie)
+        for tool in offered:
+            name = tool["function"]["name"]
+            registry.register(
+                name=name,
+                toolset="gym_request_tools",
+                schema=tool["function"],
+                handler=partial(_request_tool_result, name),
+                override=True,
+            )
+
+
+def _cookie_header(cookies: Mapping[str, Any]) -> str:
+    return "; ".join(f"{key}={getattr(value, 'value', value)}" for key, value in cookies.items())
+
+
 def _finished_naturally(
     result: dict,
     *,
@@ -341,6 +469,16 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # Run every shell command (terminal and file tools) without the runner, Gym and harness-runtime
     # mounts, as a benchmark's task container shows them (nemo_gym/hidden_mounts.py).
     hide_harness_mounts: bool = False
+    # Offer the request's function tools (a row's `responses_create_params.tools`) and run each call
+    # as simple_agent does: POST /<tool name> on the resources server in the episode's session. With
+    # `enabled_toolsets: []` they are the only tools.
+    request_tools: bool = False
+    # A prepared Hermes runtime (scripts/hermes_agent_deps.sh: bin/python with hermes-agent and Gym's
+    # dependency closure). Each episode then runs in one process of that runtime
+    # (runtime_runner.py), for a server whose own Python has no Hermes.
+    hermes_runtime: Optional[str] = None
+    # Environment for Hermes, e.g. HERMES_REDACT_SECRETS.
+    agent_environment: dict[str, str] = Field(default_factory=dict)
 
 
 class HermesAgentRunRequest(BaseRunRequest):
@@ -477,6 +615,14 @@ class HermesAgent(SimpleResponsesAPIAgent):
         self.sem = Semaphore(self.config.concurrency)
         self.active_agents = set()
         self.interrupted_agents = set()
+        os.environ.update(self.config.agent_environment)
+        if self.config.hermes_runtime is not None:
+            if not os.access(self._runtime_python, os.X_OK):
+                raise ValueError(f"Hermes runtime has no executable bin/python: {self.config.hermes_runtime}")
+            # Episodes run in runtime processes, which build their own configuration.
+            return
+        import model_tools  # noqa: F401  # fail-fast if hermes-agent isn't installed  # pyright: ignore[reportMissingImports]
+
         # hermes-agent reads these from env (cli.py / batch_runner.py); env vars are
         # process-global, so multiple HermesAgent instances in one process share them
         os.environ["TERMINAL_ENV"] = self.config.terminal_backend
@@ -500,12 +646,115 @@ class HermesAgent(SimpleResponsesAPIAgent):
     def _model_name(self) -> str:
         return self.config.model or str(self.config.model_server.name)
 
+    @property
+    def _runtime_python(self) -> Path:
+        return Path(self.config.hermes_runtime) / "bin" / "python"
+
     async def _create_response(
         self,
         body: NeMoGymResponseCreateParamsNonStreaming,
         *,
         rollout_id: Optional[str] = None,
         observation_collector: Optional[Callable[[AgentObservationBundle], None]] = None,
+        cookies: Optional[Mapping[str, Any]] = None,
+    ) -> NeMoGymResponse:
+        resources_url = (
+            self.server_client._resolve_base_url(self.config.resources_server.name)
+            if self.config.request_tools
+            else None
+        )
+        if self.config.hermes_runtime is not None:
+            return await self._create_response_in_runtime(
+                body,
+                rollout_id=rollout_id,
+                observation_collector=observation_collector,
+                cookie=_cookie_header(cookies or {}),
+                resources_url=resources_url,
+            )
+        return await self._run_hermes(
+            body,
+            model_base_url=self.resolve_model_base_url(self.config.model_server.name, rollout_id),
+            observation_collector=observation_collector,
+            cookie=_cookie_header(cookies or {}),
+            resources_url=resources_url,
+        )
+
+    async def _create_response_in_runtime(
+        self,
+        body: NeMoGymResponseCreateParamsNonStreaming,
+        *,
+        rollout_id: Optional[str],
+        observation_collector: Optional[Callable[[AgentObservationBundle], None]],
+        cookie: str,
+        resources_url: Optional[str],
+    ) -> NeMoGymResponse:
+        """Run this episode's Hermes in one process of the configured runtime (runtime_runner.py)."""
+        import nemo_gym
+
+        job_dir = Path(tempfile.mkdtemp(prefix="hermes_episode_"))
+        try:
+            request = {
+                "config": self.config.model_dump(mode="json", exclude={"hermes_runtime"}),
+                "body": body.model_dump(mode="json", exclude_unset=True),
+                "model_base_url": self.resolve_model_base_url(self.config.model_server.name, rollout_id),
+                "resources_url": resources_url,
+                "cookie": cookie,
+                "observe": observation_collector is not None,
+            }
+            path = job_dir / "request.json"
+            path.write_text(json.dumps(request), encoding="utf-8")
+            path.chmod(0o600)  # The session cookie authorizes calls into the episode.
+            gym_root = Path(nemo_gym.__file__).resolve().parents[1]
+            env = {
+                **os.environ,
+                "PYTHONPATH": os.pathsep.join([str(gym_root), *filter(None, [os.environ.get("PYTHONPATH")])]),
+                "PYTHONNOUSERSITE": "1",
+            }
+            log_path = job_dir / "runner.log"
+            with open(log_path, "wb") as log:
+                process = await asyncio.create_subprocess_exec(
+                    str(self._runtime_python),
+                    "-m",
+                    "responses_api_agents.hermes_agent.runtime_runner",
+                    str(job_dir),
+                    cwd=job_dir,
+                    env=env,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
+                )
+                try:
+                    await process.wait()
+                except asyncio.CancelledError:
+                    # Hermes' SIGTERM handling interrupts the run, which then returns its partial turn.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(process.wait(), 30)
+                    except asyncio.TimeoutError:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(process.pid, signal.SIGKILL)
+                    raise
+            reply_path = job_dir / "response.json"
+            if process.returncode != 0 or not reply_path.is_file():
+                tail = log_path.read_text(errors="replace")[-3000:]
+                raise RuntimeError(f"Hermes runtime process exited {process.returncode}: {tail}")
+            reply = json.loads(reply_path.read_text(encoding="utf-8"))
+        finally:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        if observation_collector is not None and reply.get("observations") is not None:
+            observation_collector(AgentObservationBundle.model_validate(reply["observations"]))
+        return NeMoGymResponse.model_validate(reply["response"])
+
+    async def _run_hermes(
+        self,
+        body: NeMoGymResponseCreateParamsNonStreaming,
+        *,
+        model_base_url: str,
+        observation_collector: Optional[Callable[[AgentObservationBundle], None]] = None,
+        cookie: str = "",
+        resources_url: Optional[str] = None,
     ) -> NeMoGymResponse:
         from run_agent import AIAgent  # from hermes-agent on path  # pyright: ignore[reportMissingImports]
 
@@ -516,7 +765,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
         user_message, history, input_system = _split_input_to_user_and_history(body.input)
         system_message = self.config.system_prompt or input_system
 
-        base_url = self.resolve_model_base_url(self.config.model_server.name, rollout_id)
+        base_url = model_base_url
         model_name = self._model_name()
 
         agent = AIAgent(
@@ -538,8 +787,19 @@ class HermesAgent(SimpleResponsesAPIAgent):
         )
         if self.config.hide_harness_mounts:
             _hide_harness_mounts_from_shell()
+        _keep_sampled_turns(agent)
+        task_id = f"gym-{uuid4().hex}"
+        offered = []
+        if self.config.request_tools:
+            offered = _request_function_tools(body.tools)
+            if offered and resources_url is None:
+                raise ValueError("Hermes request tools need the resources server")
+            _offer_request_tools(offered, task_id, resources_url, cookie)
         ended_by_endpoint = _observe_endpoint_stop(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
+        if self.config.finish_tool:
+            offered = [*offered, {"type": "function", "function": FINISH_TOOL_SCHEMA}]
+        _pin_offered_tools(agent, offered)
         observer = None
         if observation_collector is not None:
             try:
@@ -563,6 +823,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 user_message,
                 system_message,
                 history,
+                task_id,
             )
             if finished_by_tool is not None and finished_by_tool() and agent_id not in self.interrupted_agents:
                 # The policy ended the run itself; the loop's interrupt check was only the stop point.
@@ -574,6 +835,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
             agent_error = exc
             raise
         finally:
+            with _REQUEST_TOOL_LOCK:
+                _REQUEST_TOOL_EPISODES.pop(task_id, None)
             self.active_agents.discard(agent)
             interrupted_by_dispatch = agent_id in self.interrupted_agents
             self.interrupted_agents.discard(agent_id)
@@ -727,9 +990,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
     ) -> NeMoGymResponse:
         path_params = getattr(request, "path_params", None)
         rollout_id = path_params.get("rollout_id") if isinstance(path_params, Mapping) else None
+        # A runner's synthetic request (anyterminal's agent_runner.py) carries no headers.
+        cookies = request.cookies if "headers" in getattr(request, "scope", {}) else {}
         if not isinstance(rollout_id, str):
-            return await self._create_response(body)
-        episode = await self._create_episode(body, rollout_id=rollout_id)
+            return await self._create_response(body, cookies=cookies)
+        episode = await self._create_episode(body, rollout_id=rollout_id, cookies=cookies)
         return episode.response.model_copy(
             update={_INTERNAL_OBSERVATIONS_KEY: episode.observations.model_dump(mode="json")}
         )
@@ -739,6 +1004,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
         body: NeMoGymResponseCreateParamsNonStreaming,
         *,
         rollout_id: str,
+        cookies: Optional[Mapping[str, Any]] = None,
     ) -> AgentEpisode:
         observations: Optional[AgentObservationBundle] = None
 
@@ -750,6 +1016,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             body,
             rollout_id=rollout_id,
             observation_collector=collect,
+            cookies=cookies,
         )
         if observations is None:
             observations = AgentObservationBundle(
@@ -793,7 +1060,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 cookies=cookies,
             )
             await raise_for_status(agent_resp)
-            cookies = agent_resp.cookies
+            # Verify in the seeded session: the agent's reply sets no session cookie of its own.
+            cookies = {**cookies, **agent_resp.cookies}
             agent_resp_json = await get_response_json(agent_resp)
             raw_observations = (
                 agent_resp_json.pop(_INTERNAL_OBSERVATIONS_KEY, None) if rollout_id is not None else None
