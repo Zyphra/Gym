@@ -1302,6 +1302,35 @@ def test_verifier_memory_kill_needs_a_sigkill_exit_and_an_oom_kill_in_its_sandbo
 
 
 class TestRunAgentEnv:
+    def test_shipped_overlay_is_on_the_harness_children_python_path(self, tmp_path: Path, monkeypatch) -> None:
+        """Pi's bash tool runs `python3 -m core.sandbox.command_process` as a child of the harness: with an
+        agent_runtime_overlay shipped, the agent environment must make the overlay importable to it."""
+        import subprocess
+        import sys
+
+        from responses_api_agents.anyterminal_agent import app as anyterminal
+
+        cfg = _make_instance_config(tmp_path)
+        assert "PYTHONPATH" not in RunTerminalAgent(config=cfg)._agent_env(cfg)  # nothing shipped: nothing set
+        overlay = cfg.persistent_dir / "agent_overlay"
+        (overlay / "core" / "sandbox").mkdir(parents=True)
+        for package in ("core", "core/sandbox"):
+            (overlay / package / "__init__.py").write_text("")
+        (overlay / "core" / "sandbox" / "command_process.py").write_text("import sys\nsys.exit(0)\n")
+        env = RunTerminalAgent(config=cfg)._agent_env(cfg)
+        assert env["PYTHONPATH"] == anyterminal.AGENT_OVERLAY_DIR == "/trajectories_mount/agent_overlay"
+        # The instance sees the overlay at AGENT_OVERLAY_DIR; here it is the episode's own copy.
+        child = {"PATH": "/usr/bin:/bin", **env, "PYTHONPATH": str(overlay)}
+        spawn = [sys.executable, "-m", "core.sandbox.command_process", "--timeout", "180", "--", "/bin/true"]
+        assert subprocess.run(spawn, env=child, cwd=tmp_path).returncode == 0
+        without = {key: value for key, value in child.items() if key != "PYTHONPATH"}
+        assert subprocess.run(spawn, env=without, cwd=tmp_path, capture_output=True).returncode != 0
+
+    def test_binding_environment_still_wins_over_the_overlay_path(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_environment={"PYTHONPATH": "/opt/extra"})
+        (cfg.persistent_dir / "agent_overlay").mkdir()
+        assert RunTerminalAgent(config=cfg)._agent_env(cfg)["PYTHONPATH"] == "/opt/extra"
+
     def test_model_url_included_when_set(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path, model_server_url="http://model:8000")
         env = RunTerminalAgent(config=cfg)._agent_env(cfg)
