@@ -8,6 +8,7 @@ each sampled assistant turn exactly: names, calls and arguments as the policy wr
 
 import asyncio
 import json
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Thread
@@ -150,7 +151,13 @@ def test_request_tools_survive_the_compaction_tool_refresh(monkeypatch, tmp_path
 
 
 def test_runtime_process_runs_the_same_episode(monkeypatch, tmp_path):
-    # This interpreter is a Hermes runtime: run the episode in one process of it.
+    # This interpreter is a Hermes runtime: run the episode in one process of it. The server's own
+    # import path carries a top-level ``tools`` package (as a wrapper or task root does), which must
+    # not shadow hermes-agent's.
+    shadow = tmp_path / "server-root"
+    (shadow / "tools").mkdir(parents=True)
+    (shadow / "tools" / "__init__.py").write_text("")
+    monkeypatch.setenv("PYTHONPATH", f"{shadow}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
     sampled = {"role": "assistant", "content": "", "tool_calls": [_call("call_a", "Read", "z")]}
     resources = _Resources()
     with _PolicyFixture(_SUMMARY_OK, main_turns=[sampled]) as policy:

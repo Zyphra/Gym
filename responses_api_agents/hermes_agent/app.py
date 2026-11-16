@@ -734,11 +734,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             path.write_text(json.dumps(request), encoding="utf-8")
             path.chmod(0o600)  # The session cookie authorizes calls into the episode.
             gym_root = Path(nemo_gym.__file__).resolve().parents[1]
-            env = {
-                **os.environ,
-                "PYTHONPATH": os.pathsep.join([str(gym_root), *filter(None, [os.environ.get("PYTHONPATH")])]),
-                "PYTHONNOUSERSITE": "1",
-            }
+            # Only Gym beside the runtime's own packages: the server's import path can carry a
+            # top-level ``tools`` package (a task or wrapper root) that shadows hermes-agent's.
+            env = {**os.environ, "PYTHONPATH": str(gym_root), "PYTHONNOUSERSITE": "1"}
             log_path = job_dir / "runner.log"
             with open(log_path, "wb") as log:
                 process = await asyncio.create_subprocess_exec(
