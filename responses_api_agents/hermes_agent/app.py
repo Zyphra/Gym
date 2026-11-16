@@ -124,6 +124,8 @@ def _trajectory_to_output_items(messages, n_input):
 
 LOG = logging.getLogger(__name__)
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
+# The final response of Hermes' stop after three turns of only unknown tool names.
+_INVALID_TOOL_CALL_STOP = "Model generated invalid tool call:"
 
 
 # if ray close sys.stderr mid-request, write to the original fd
@@ -950,13 +952,19 @@ class HermesAgent(SimpleResponsesAPIAgent):
         # Hermes' own verdict that the conversation no longer fits and cannot be compressed
         # (agent/turn_overflow.py fail_turn); its error text is display copy.
         context_exhausted = result.get("failure_reason") == "context_overflow"
-        agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not context_exhausted
+        # Hermes' own stop after the policy's third turn in a row with only unknown tool names
+        # (agent/turn_tool_validation.py ``_partial_exit``): the policy's outcome, not a harness failure.
+        invalid_tool_calls = bool(result.get("partial")) and str(harness_error or "").startswith(
+            _INVALID_TOOL_CALL_STOP
+        )
+        policy_stop = context_exhausted or invalid_tool_calls
+        agent_failed = (bool(harness_error) or bool(result.get("failed"))) and not policy_stop
         finished_naturally = _finished_naturally(
             result,
             finished_by_tool=finished_by_tool is not None and finished_by_tool(),
             ended_by_endpoint=ended_by_endpoint(),
             interrupted=was_interrupted,
-            failed=agent_failed or context_exhausted,
+            failed=agent_failed or policy_stop,
         )
         metadata: dict[str, str] = {
             "interrupted": "true" if was_interrupted else "false",
@@ -975,6 +983,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
             metadata["hermes_error"] = str(harness_error)[:2000]
         if context_exhausted:
             metadata["stop_reason"] = "context_exhausted"
+        elif invalid_tool_calls:
+            metadata["stop_reason"] = "invalid_tool_calls"
         elif (
             not agent_completed
             and not finished_naturally
@@ -991,7 +1001,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
         # Populate the structured error field too. `code` must be one of OpenAI's Literals, so we
         # use the generic "server_error"; the real text lives in `message`.
         response_error = None
-        if harness_error and not context_exhausted:
+        if harness_error and not policy_stop:
             from openai.types.responses import ResponseError  # pyright: ignore[reportMissingImports]
 
             response_error = ResponseError(code="server_error", message=str(harness_error)[:2000])
@@ -1003,7 +1013,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             object="response",
             output=output_items,
             status="incomplete"
-            if context_exhausted
+            if policy_stop
             else ("failed" if agent_failed else ("completed" if agent_completed else "incomplete")),
             error=response_error,
             metadata=metadata,

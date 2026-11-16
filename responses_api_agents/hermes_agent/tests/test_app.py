@@ -816,6 +816,23 @@ class TestFinishedNaturally:
         assert episode.response.metadata["failed"] == "false"
         assert episode.response.metadata["finished_naturally"] == "false"
 
+    def test_three_turns_of_unknown_tool_names_are_a_scored_policy_stop(self, monkeypatch, tmp_path) -> None:
+        # With name repair off, a misspelled tool gets Hermes' unknown-tool result; after three such
+        # turns in a row Hermes stops the run. That is the policy's outcome: incomplete, not a failure.
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [_tool_turn(("Terminal", {"command": "ls"})) for _ in range(3)],
+        )
+        assert len(requests) == 3
+        # The replayed turns keep the sampled name.
+        replayed = [m for m in requests[-1]["messages"] if m.get("role") == "assistant"]
+        assert [c["function"]["name"] for m in replayed for c in m["tool_calls"]] == ["Terminal", "Terminal"]
+        assert episode.response.status == "incomplete"
+        assert episode.response.error is None
+        assert episode.response.metadata["stop_reason"] == "invalid_tool_calls"
+        assert episode.response.metadata["finished_naturally"] == "false"
+
     def test_turn_cap_summary_is_not_the_agents_completion(self, monkeypatch, tmp_path) -> None:
         episode, requests = self._run(
             monkeypatch,
