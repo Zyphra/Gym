@@ -109,6 +109,11 @@ hermes_agent:
 | `hermes_runtime` | `null` | a prepared Hermes runtime (`scripts/hermes_agent_deps.sh`); each episode runs in one process of its `bin/python` (`runtime_runner.py`), for a server whose own Python has no Hermes |
 | `agent_environment` | `{}` | environment for Hermes, e.g. `HERMES_REDACT_SECRETS` |
 
+The serving endpoint ends an episode with an empty assistant message, `finish_reason: stop` and the
+stop's name as `stop_reason`, before sampling (turn cap, exhausted context) or on the turn it just
+sampled (a guard). After that stop the agent answers Hermes' own retries with the same stop instead of
+sending them to the ended episode, and the run's outcome is the endpoint's stop, not a Hermes failure.
+
 Hermes replays every stored assistant turn on each request, and a rollout endpoint continues an
 episode only on the turns it served. The agent therefore stores each turn's tool calls as the policy
 sampled them: Hermes' repair of an unknown tool name to the closest offered one and its drop of a

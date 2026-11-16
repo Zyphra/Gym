@@ -242,41 +242,60 @@ def _offer_finish_tool(agent: Any) -> Callable[[], bool]:
 
 
 def _endpoint_stop(response: Any) -> bool:
-    """The serving endpoint's episode stop: a stop reason with no sampled tokens.
+    """The serving endpoint's episode stop: an empty assistant message with a named stop reason.
 
-    The endpoint answers its turn cap, an episode guard or an exhausted context
-    with an empty assistant message, which Hermes takes as a final answer.
-    Terminus-2 reads the same contract (``terminus_2_agent/llm.py``).
+    The endpoint answers its turn cap or an exhausted context before sampling, and an
+    episode guard (an empty turn, a reopened think block, a token budget, a call limit)
+    on the turn it just sampled, with an empty message, ``finish_reason: stop`` and the
+    stop's name as ``stop_reason``. A guard stop on a sampled turn reports that turn's
+    tokens in its usage, so the sampled-token count does not decide it. A model server's
+    own ``stop_reason`` (a stop token id, or a stop string ending a turn with output) is
+    not the endpoint's.
     """
     choices = getattr(response, "choices", None) or []
-    stop_reason = getattr(choices[0], "stop_reason", None) if choices else None
-    return bool(stop_reason) and getattr(getattr(response, "usage", None), "completion_tokens", None) == 0
+    if not choices:
+        return False
+    choice = choices[0]
+    stop_reason = getattr(choice, "stop_reason", None)
+    message = getattr(choice, "message", None)
+    return (
+        isinstance(stop_reason, str)
+        and bool(stop_reason)
+        and getattr(choice, "finish_reason", None) == "stop"
+        and not getattr(message, "content", None)
+        and not getattr(message, "tool_calls", None)
+    )
 
 
 def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
-    """Record whether the latest main-loop model response was the endpoint's episode stop.
+    """Record whether the endpoint stopped the episode, and answer every later request with that stop.
 
     The stop ends the episode: Hermes would otherwise answer the empty message with its
-    empty-response nudge or retry and send another request to a finished episode. The run
-    stops at Hermes' own between-turn interrupt check, as the `finish` tool does.
+    empty-response nudge or retry and send another request to a finished episode, which
+    the endpoint refuses (``This episode has ended``) and Hermes then reports as its own
+    failure. Once stopped, Hermes' further requests get the same stop without reaching the
+    endpoint, and the run stops at Hermes' own between-turn interrupt check, as the
+    `finish` tool does.
     """
     api_call = getattr(agent, "_interruptible_api_call", None)
     if api_call is None:
         # An unobservable stop counts as the endpoint's, so completion is never claimed.
         return lambda: True
-    stopped = False
+    stop = None
 
     def call_then_observe(*args, **kwargs):
-        nonlocal stopped
-        stopped = False
+        nonlocal stop
+        if stop is not None:
+            agent._interrupt_requested = True
+            return stop
         response = api_call(*args, **kwargs)
-        stopped = _endpoint_stop(response)
-        if stopped:
+        if _endpoint_stop(response):
+            stop = response
             agent._interrupt_requested = True
         return response
 
     agent._interruptible_api_call = call_then_observe
-    return lambda: stopped
+    return lambda: stop is not None
 
 
 def _keep_sampled_turns(agent: Any) -> None:
@@ -830,7 +849,16 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 result = {**result, "completed": True, "interrupted": False}
             elif ended_by_endpoint() and agent_id not in self.interrupted_agents:
                 # The endpoint ended the episode; the interrupt only kept Hermes from asking again.
-                result = {**result, "completed": True, "interrupted": False}
+                # What Hermes made of the stop afterwards (an empty-response retry it gave up on)
+                # is not a harness failure: the episode's outcome is the endpoint's stop.
+                result = {
+                    **result,
+                    "completed": True,
+                    "interrupted": False,
+                    "failed": False,
+                    "partial": False,
+                    "error": None,
+                }
         except BaseException as exc:
             agent_error = exc
             raise

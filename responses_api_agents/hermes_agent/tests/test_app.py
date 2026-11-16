@@ -619,15 +619,17 @@ class _ScriptedChatServer:
                 }
                 usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
                 if isinstance(message.get("stop_reason"), str):
-                    # The serving endpoint's episode stop: an empty message, a stop
-                    # reason and no sampled tokens.
+                    # The serving endpoint's episode stop: an empty message and a stop reason.
+                    # A stop before sampling reports no sampled tokens; a guard stop on the turn
+                    # it just sampled reports that turn's tokens.
                     choice = {
                         "index": 0,
                         "message": {"role": "assistant", "content": ""},
                         "finish_reason": "stop",
                         "stop_reason": message["stop_reason"],
                     }
-                    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                    sampled = message.get("sampled_tokens", 0)
+                    usage = {"prompt_tokens": 10, "completion_tokens": sampled, "total_tokens": 10 + sampled}
                 payload = json.dumps(
                     {
                         "id": f"chatcmpl-{len(server.requests)}",
@@ -793,6 +795,26 @@ class TestFinishedNaturally:
         assert episode.response.status == "completed"
         assert episode.response.metadata["finished_naturally"] == "false"
         assert episode.response.metadata.get("stop_reason") != "max_iterations"
+
+    @pytest.mark.parametrize(
+        "reason", ["empty_policy_turn", "think_reopen_stop", "token_budget", "non_offered_tool_limit"]
+    )
+    def test_guard_stop_on_a_sampled_turn_ends_the_episode(self, monkeypatch, tmp_path, reason) -> None:
+        # The endpoint stops the episode on the turn it sampled and refuses any later request
+        # ("This episode has ended"). Hermes sends none, and the run is the endpoint's stop.
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [
+                _tool_turn(("terminal", {"command": "echo ok > out.txt"})),
+                {"stop_reason": reason, "sampled_tokens": 41},
+            ],
+        )
+        assert len(requests) == 2
+        assert episode.response.status == "completed"
+        assert episode.response.error is None
+        assert episode.response.metadata["failed"] == "false"
+        assert episode.response.metadata["finished_naturally"] == "false"
 
     def test_turn_cap_summary_is_not_the_agents_completion(self, monkeypatch, tmp_path) -> None:
         episode, requests = self._run(
