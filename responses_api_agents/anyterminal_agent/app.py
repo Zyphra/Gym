@@ -372,6 +372,9 @@ def _safe_config_json(params: "AnyTerminalInstanceConfig", indent: Optional[int]
 
 
 ### Agent runner template
+# Where agent_runtime_overlay sources are shipped in the task instance (as AnySWE's).
+AGENT_OVERLAY_DIR = "/trajectories_mount/agent_overlay"
+
 # Injected into the task container; imports any agent class and calls responses().
 
 _RUNNER_TEMPLATE = """\
@@ -1123,6 +1126,11 @@ class RunTerminalAgent(BaseModel):
             env["NGTB_TASK_WORKDIR"] = str(cfg.problem_info["workdir"])
         if cfg.rollout_id:
             env["NGTB_ROLLOUT_ID"] = cfg.rollout_id
+        if (cfg.persistent_dir / "agent_overlay").is_dir():
+            # The runner puts the shipped overlay first on its own sys.path; the harness's own Python
+            # children (Pi's bash tool runs `python3 -m core.sandbox.command_process`) need it too,
+            # as AnySWE's runner gives them (anyswe_agent AGENT_OVERLAY_DIR).
+            env["PYTHONPATH"] = AGENT_OVERLAY_DIR
         env.update(cfg.agent_environment)
         return env
 
