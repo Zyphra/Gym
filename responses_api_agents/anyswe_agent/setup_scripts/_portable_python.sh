@@ -24,41 +24,69 @@ install_portable_python() {
     fi
 }
 
-# Task images without glibc (Alpine/musl) cannot exec the glibc CPython. Bundle the
-# build host's glibc loader and core libraries under $DEPS_DIR/glibc and replace the
-# interpreter entry points with a launcher that uses them only when the image has no
-# real glibc loader. Alpine images with gcompat ship a glibc-named loader shim over musl,
-# so a musl loader (/lib/ld-musl-x86_64.so.1) also selects the bundled glibc. On musl images --argv0 keeps sys.executable on the launcher, so child
-# interpreters come back through it; glibc images exec the interpreter directly. A
-# build host without these libraries fails the install instead of shipping a
-# glibc-only runtime.
+# A runtime's glibc executables must run in every task image. Bundle the build host's
+# glibc loader and core libraries under $DEPS_DIR/glibc and replace each named entry point
+# (default python3; Pi adds node) with a launcher. The launcher runs the executable on the
+# image's glibc only when the image's loader reports a glibc at least as new as the bundled
+# one; otherwise it uses the bundled loader. That covers images without glibc
+# (Alpine/musl), Alpine images whose gcompat ships a glibc-named loader shim over musl, and
+# images whose older glibc lacks symbols the runtime's native wheels need (cryptography's
+# Rust bindings need GLIBC_2.33; Debian 11 and Ubuntu 20.04 ship 2.31, whose loader also
+# predates `--version`). Under the bundled loader --argv0 keeps sys.executable on the
+# launcher, so child interpreters come back through it. A build host without these
+# libraries fails the install instead of shipping a glibc-only runtime.
+#
+# An existing relocatable runtime directory gains the launchers in place:
+#   DEPS_DIR=<runtime> bash -c 'source _portable_python.sh && install_glibc_launcher python3 node'
 GLIBC_LOADER="${GLIBC_LOADER:-/lib64/ld-linux-x86-64.so.2}"
 GLIBC_LIBS="libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1 libutil.so.1 libresolv.so.2 libnss_dns.so.2 libnss_files.so.2 libcrypt.so.1 libgcc_s.so.1 libstdc++.so.6 libz.so.1"
 
 install_glibc_launcher() {
-    local real
-    real="$(readlink -f "$DEPS_DIR/bin/python3")"
-    local name
-    name="$(basename "$real")"
-    [ -e "$DEPS_DIR/bin/$name.real" ] && return 0
-    mkdir -p "$DEPS_DIR/glibc"
-    cp -L "$GLIBC_LOADER" "$DEPS_DIR/glibc/ld-linux-x86-64.so.2"
-    local lib path
-    for lib in $GLIBC_LIBS; do
-        path="$(ldconfig -p | awk -v l="$lib" '$1 == l && /x86-64/ && !f {print $NF; f = 1}')"
-        [ -n "$path" ] || { echo "glibc launcher: host lacks $lib" >&2; return 1; }
-        cp -L "$path" "$DEPS_DIR/glibc/$lib"
-    done
-    mv "$real" "$DEPS_DIR/bin/$name.real"
-    cat > "$DEPS_DIR/bin/$name" <<LAUNCHER
+    local entries=("$@")
+    [ "${#entries[@]}" -gt 0 ] || entries=(python3)
+    if [ ! -e "$DEPS_DIR/glibc/ld-linux-x86-64.so.2" ]; then
+        mkdir -p "$DEPS_DIR/glibc"
+        cp -L "$GLIBC_LOADER" "$DEPS_DIR/glibc/ld-linux-x86-64.so.2"
+        local lib path
+        for lib in $GLIBC_LIBS; do
+            path="$(ldconfig -p | awk -v l="$lib" '$1 == l && /x86-64/ && !f {print $NF; f = 1}')"
+            [ -n "$path" ] || { echo "glibc launcher: host lacks $lib" >&2; return 1; }
+            cp -L "$path" "$DEPS_DIR/glibc/$lib"
+        done
+    fi
+    # The bundled loader's own version is the bar an image glibc must meet.
+    local minor
+    minor="$("$DEPS_DIR/glibc/ld-linux-x86-64.so.2" --version 2>/dev/null | sed -n '1s/.*release version 2\.\([0-9][0-9]*\).*/\1/p')"
+    [ -n "$minor" ] || { echo "glibc launcher: bundled loader does not report a glibc >= 2.33" >&2; return 1; }
+    local entry real name
+    for entry in "${entries[@]}"; do
+        [ -e "$DEPS_DIR/bin/$entry" ] || { echo "glibc launcher: $DEPS_DIR/bin/$entry not found" >&2; return 1; }
+        real="$(readlink -f "$DEPS_DIR/bin/$entry")"
+        name="$(basename "$real")"
+        [ "$(dirname "$real")" = "$(readlink -f "$DEPS_DIR/bin")" ] || {
+            echo "glibc launcher: $entry resolves outside $DEPS_DIR/bin" >&2
+            return 1
+        }
+        # A runtime that already has a launcher keeps its interpreter and gets the current launcher.
+        [ -e "$DEPS_DIR/bin/$name.real" ] || mv "$real" "$DEPS_DIR/bin/$name.real"
+        rm -f "$DEPS_DIR/bin/$name"
+        cat > "$DEPS_DIR/bin/$name" <<LAUNCHER
 #!/bin/sh
 R="\${0%/bin/*}"
-if [ -e "\${NGSWE_SYSROOT:-}/lib64/ld-linux-x86-64.so.2" ] && [ ! -e "\${NGSWE_SYSROOT:-}/lib/ld-musl-x86_64.so.1" ]; then exec "\$R/bin/$name.real" "\$@"; fi
+L="\${NGSWE_SYSROOT:-}/lib64/ld-linux-x86-64.so.2"
+if [ -e "\$L" ] && [ ! -e "\${NGSWE_SYSROOT:-}/lib/ld-musl-x86_64.so.1" ]; then
+  V="\$("\$L" --version 2>/dev/null)"
+  case "\$V" in *"release version 2."[0-9]*) V="\${V#*release version 2.}"; V="\${V%%[!0-9]*}" ;; *) V= ;; esac
+  if [ -n "\$V" ] && [ "\$V" -ge $minor ]; then exec "\$R/bin/$name.real" "\$@"; fi
+fi
 exec "\$R/glibc/ld-linux-x86-64.so.2" --library-path "\$R/glibc:\$R/lib" --argv0 "\$R/bin/$name" "\$R/bin/$name.real" "\$@"
 LAUNCHER
-    chmod 755 "$DEPS_DIR/bin/$name"
-    ln -sf "$name" "$DEPS_DIR/bin/python3"
-    ln -sf "$name" "$DEPS_DIR/bin/python"
+        chmod 755 "$DEPS_DIR/bin/$name"
+        if [ "$entry" = python3 ]; then
+            ln -sf "$name" "$DEPS_DIR/bin/python3"
+            ln -sf "$name" "$DEPS_DIR/bin/python"
+        fi
+    done
 }
 
 portable_python_can_run() {
