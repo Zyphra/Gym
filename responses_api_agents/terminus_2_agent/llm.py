@@ -50,6 +50,30 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
 
+def _endpoint_stop(choice: Any) -> bool:
+    """The serving endpoint's episode stop: an empty assistant message with a named stop reason.
+
+    The endpoint answers its turn cap or an exhausted context before sampling, and an episode
+    guard (an empty turn, a reopened think block, a token budget, a call limit) on the turn it
+    just sampled, with an empty message, ``finish_reason: stop`` and the stop's name as
+    ``stop_reason``. A guard stop on a sampled turn reports that turn's tokens in its usage, so
+    the sampled-token count does not decide it. A model server's own ``stop_reason`` (a stop
+    token id, or a stop string ending a turn with output) is not the endpoint's. Gym's Hermes
+    agent reads the same contract.
+    """
+    if not isinstance(choice, dict):
+        return False
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    stop_reason = choice.get("stop_reason")
+    return (
+        isinstance(stop_reason, str)
+        and bool(stop_reason)
+        and choice.get("finish_reason") == "stop"
+        and not message.get("content")
+        and not message.get("tool_calls")
+    )
+
+
 class EpisodeTerminatedError(RuntimeError):
     """The policy episode ended; compaction cannot reopen it."""
 
@@ -161,11 +185,7 @@ class NemoGymLLM(BaseLLM):
 
         choices = response_dict.get("choices", [])
         choice = choices[0] if isinstance(choices, list) and choices else {}
-        if (
-            isinstance(choice, dict)
-            and choice.get("stop_reason")
-            and (response_dict.get("usage") or {}).get("completion_tokens") == 0
-        ):
+        if _endpoint_stop(choice):
             self.terminal_stop_reason = str(choice["stop_reason"])
             self.context_length_exceeded = self.terminal_stop_reason == "context_exhausted"
             raise EpisodeTerminatedError(self.terminal_stop_reason)
