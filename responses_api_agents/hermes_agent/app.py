@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import sys
@@ -269,8 +270,11 @@ def _endpoint_stop(response: Any) -> bool:
     )
 
 
-def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
+def _observe_endpoint_stop(agent: Any) -> tuple[Callable[[], bool], Callable[[], bool]]:
     """Record whether the endpoint stopped the episode, and answer every later request with that stop.
+
+    Returns two readers: whether the run counts as ended by the endpoint (true too when the
+    agent's requests cannot be observed), and whether a stop was actually seen.
 
     The stop ends the episode: Hermes would otherwise answer the empty message with its
     empty-response nudge or retry and send another request to a finished episode, which
@@ -282,7 +286,7 @@ def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
     api_call = getattr(agent, "_interruptible_api_call", None)
     if api_call is None:
         # An unobservable stop counts as the endpoint's, so completion is never claimed.
-        return lambda: True
+        return lambda: True, lambda: False
     stop = None
 
     def call_then_observe(*args, **kwargs):
@@ -297,31 +301,113 @@ def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
         return response
 
     agent._interruptible_api_call = call_then_observe
-    return lambda: stop is not None
+    return (lambda: stop is not None), (lambda: stop is not None)
 
 
 def _keep_sampled_turns(agent: Any) -> None:
-    """Store each policy turn's tool calls as the policy sampled them.
+    """Replay each policy turn as the policy sampled it.
 
     Hermes replays its stored assistant turns on every request, and a rollout endpoint
-    continues an episode only on the turns it served. Three Hermes edits rewrite a sampled
-    turn: an unknown tool name is repaired to the closest offered one before the turn is
-    stored (``agent/agent_runtime_helpers.py`` ``repair_tool_call``: ``bash`` -> ``Bash``),
+    continues an episode only on the turns it served. Hermes edits a sampled turn in three
+    places, and none of the edits runs here.
+
+    Tool calls. An unknown tool name is repaired to the closest offered one before the turn
+    is stored (``agent/agent_runtime_helpers.py`` ``repair_tool_call``: ``bash`` -> ``Bash``),
     a repeated (name, arguments) call in one turn is dropped (``run_agent.py``
     ``_deduplicate_tool_calls``), and every request's copy of the history has each call
-    name outside ``^[A-Za-z0-9_-]{1,64}$`` coerced into it (``agent/agent_runtime_helpers.py``
-    ``_repair_invalid_tool_call_names``: an offered 83-character
-    ``mcp__<server>__<function>`` becomes a different 64-character name). None runs: an
-    unknown name gets Hermes' own unknown-tool result, as on any unrepairable name, a
-    repeated call runs again, as the policy asked, and every name goes out as sampled (the
-    rollout endpoint takes any name). The coercion is module-level, so it is off for the
-    whole process, which runs only Hermes agents.
+    name outside ``^[A-Za-z0-9_-]{1,64}$`` coerced into it (``_repair_invalid_tool_call_names``:
+    an offered 83-character ``mcp__<server>__<function>`` becomes a different 64-character
+    name). Instead an unknown name gets Hermes' own unknown-tool result, a repeated call runs
+    again, as the policy asked, and every name goes out as sampled.
+
+    Text. The stored text has reasoning tags and tool-call markup removed, is trimmed, and has
+    secret-looking strings masked (``agent/chat_completion_helpers.py``
+    ``_assistant_content_for_storage``: ``<tool_call>`` -> empty, ``a</think>b`` -> ``ab``,
+    ``KEY=sk-...`` -> ``KEY=***``), and a bare bracketed word beside a call is dropped
+    (``agent/turn_tool_round.py``: ``[OUTPUT]`` -> empty). The stored text is the sampled
+    text.
+
+    Empty and reasoning-only turns. Hermes writes ``(empty)`` into an empty turn it nudges
+    past or ends on (``agent/turn_empty_response.py``), pads an empty message before a
+    request (``repair_empty_non_final_messages``, ``fill_empty_non_final_wire_payload``),
+    drops a reasoning-only turn from each request and merges the user messages around it
+    (``drop_thinking_only_and_merge_users``), removes a reasoning-only turn it marked once
+    the next turn lands (``agent/turn_tool_round.py``, ``agent/turn_final_response.py``), and
+    does not replay reasoning that is only whitespace (``agent/message_sanitization.py``
+    ``_replayable_reasoning_text``). Each such turn stays in the history as it was served.
+
+    The module-level edits are off for the whole process, which runs only Hermes agents.
     """
     import agent.agent_runtime_helpers as runtime_helpers  # pyright: ignore[reportMissingImports]
+    import agent.conversation_loop as conversation_loop  # pyright: ignore[reportMissingImports]
+    import agent.message_sanitization as message_sanitization  # pyright: ignore[reportMissingImports]
+    import agent.turn_empty_response as empty_response  # pyright: ignore[reportMissingImports]
 
     runtime_helpers._repair_invalid_tool_call_names = lambda _messages: None
+    runtime_helpers.repair_empty_non_final_messages = lambda messages: messages
+    runtime_helpers.fill_empty_non_final_wire_payload = lambda _message, **_kwargs: False
+    conversation_loop._STALE_MARKER_RE = _NO_MATCH
+    message_sanitization._replayable_reasoning_text = _sampled_reasoning
+    agent._drop_thinking_only_and_merge_users = lambda messages, **_kwargs: messages
+    if not getattr(empty_response.append_message, "keeps_sampled_empty_turns", False):
+        append_message = empty_response.append_message
+
+        def append_sampled(messages, message, *args, **kwargs):
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                if message.get("content") == "(empty)" and (
+                    message.get("_empty_recovery_synthetic") or message.get("_empty_terminal_sentinel")
+                ):
+                    message = {**message, "content": message.get(_SAMPLED_CONTENT, "")}
+                if message.get("_thinking_prefill"):
+                    message = {key: value for key, value in message.items() if key != "_thinking_prefill"}
+            return append_message(messages, message, *args, **kwargs)
+
+        append_sampled.keeps_sampled_empty_turns = True
+        empty_response.append_message = append_sampled
+    build_assistant_message = agent._build_assistant_message
+
+    def build_as_sampled(assistant_message, finish_reason):
+        message = build_assistant_message(assistant_message, finish_reason)
+        content = getattr(assistant_message, "content", None)
+        if isinstance(content, str) and isinstance(message.get("content"), str):
+            # Kept beside the text too: the empty-turn paths overwrite it with ``(empty)``.
+            message["content"] = message[_SAMPLED_CONTENT] = content
+        if isinstance(content, str) and not any(
+            getattr(assistant_message, key, None) for key in ("reasoning_content", "reasoning", "reasoning_details")
+        ):
+            # Hermes lifts reasoning out of the text's own ``<think>`` blocks; none was served as
+            # reasoning, and the text still holds it.
+            message["reasoning"] = None
+            message.pop("reasoning_content", None)
+        return message
+
+    agent._build_assistant_message = build_as_sampled
+    # Hermes re-arms its think-only budget when it removes a marked turn after a tool round; the
+    # turns now stay, so each tool round re-arms it here.
+    execute_tool_calls = agent._execute_tool_calls
+
+    def execute_then_rearm(*args, **kwargs):
+        agent._thinking_prefill_retries = 0
+        agent._empty_content_retries = 0
+        return execute_tool_calls(*args, **kwargs)
+
+    agent._execute_tool_calls = execute_then_rearm
     agent._repair_tool_call = lambda _name: None
     agent._deduplicate_tool_calls = lambda tool_calls: tool_calls
+
+
+# A stored turn's sampled text. Hermes keeps underscore keys out of its requests.
+_SAMPLED_CONTENT = "_sampled_content"
+_NO_MATCH = re.compile(r"(?!)")
+
+
+def _sampled_reasoning(message: dict) -> Optional[str]:
+    """A stored turn's reasoning as served, whitespace included."""
+    for key in ("reasoning_content", "reasoning"):
+        value = message.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _pin_offered_tools(agent: Any, offered: list[dict]) -> None:
@@ -822,7 +908,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             if offered and resources_url is None:
                 raise ValueError("Hermes request tools need the resources server")
             _offer_request_tools(offered, task_id, resources_url, cookie)
-        ended_by_endpoint = _observe_endpoint_stop(agent)
+        ended_by_endpoint, endpoint_stop_seen = _observe_endpoint_stop(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         if self.config.finish_tool:
             offered = [*offered, {"type": "function", "function": FINISH_TOOL_SCHEMA}]
@@ -857,16 +943,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 result = {**result, "completed": True, "interrupted": False}
             elif ended_by_endpoint() and agent_id not in self.interrupted_agents:
                 # The endpoint ended the episode; the interrupt only kept Hermes from asking again.
-                # What Hermes made of the stop afterwards (an empty-response retry it gave up on)
-                # is not a harness failure: the episode's outcome is the endpoint's stop.
-                result = {
-                    **result,
-                    "completed": True,
-                    "interrupted": False,
-                    "failed": False,
-                    "partial": False,
-                    "error": None,
-                }
+                result = {**result, "completed": True, "interrupted": False}
+                if endpoint_stop_seen():
+                    # What Hermes made of a stop it was served (an empty-response retry it gave
+                    # up on) is not a harness failure: the episode's outcome is the endpoint's stop.
+                    result = {**result, "failed": False, "partial": False, "error": None}
         except BaseException as exc:
             agent_error = exc
             raise

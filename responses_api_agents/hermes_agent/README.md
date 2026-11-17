@@ -115,11 +115,21 @@ sampled (a guard). After that stop the agent answers Hermes' own retries with th
 sending them to the ended episode, and the run's outcome is the endpoint's stop, not a Hermes failure.
 
 Hermes replays every stored assistant turn on each request, and a rollout endpoint continues an
-episode only on the turns it served. The agent therefore stores each turn's tool calls as the policy
-sampled them: Hermes' repair of an unknown tool name to the closest offered one and its drop of a
-repeated (name, arguments) call in one turn are off. An unknown name gets Hermes' unknown-tool
-result; a repeated call runs again. Tools Gym offers outside Hermes' toolsets (`finish`, the
-request's tools) stay offered across Hermes' tool refresh at a compaction.
+episode only on the turns it served. The agent therefore replays each turn as the policy sampled
+it, and Hermes' edits of a sampled turn are off:
+
+- Tool calls: the repair of an unknown tool name to the closest offered one, the drop of a repeated
+  (name, arguments) call in one turn, and the coercion of a name into 64 characters. An unknown
+  name gets Hermes' unknown-tool result; a repeated call runs again.
+- Text: the removal of reasoning tags and tool-call markup, the masking of secret-looking strings
+  and the drop of a bare bracketed word beside a call. Only outer whitespace is trimmed, which a
+  chat template trims too.
+- Empty and reasoning-only turns: the `(empty)` placeholder, the padding of an empty message, the
+  drop of a reasoning-only turn, and the loss of whitespace-only reasoning. Such a turn stays in
+  the history as served.
+
+Tools Gym offers outside Hermes' toolsets (`finish`, the request's tools) stay offered across
+Hermes' tool refresh at a compaction.
 
 The model-server url is resolved at request time and passed to `AIAgent(base_url=..., api_key="gym")`. <!-- pragma: allowlist secret -->
 
