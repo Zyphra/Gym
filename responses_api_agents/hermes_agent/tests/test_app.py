@@ -191,6 +191,7 @@ class TestSigtermHandler:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self._build_assistant_message = lambda *_args, **_kwargs: {}
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 hermes.interrupted_agents.add(id(self))
@@ -355,6 +356,7 @@ class TestRolloutCorrelation:
                 seen["base_url"] = kwargs.get("base_url")
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self._build_assistant_message = lambda *_args, **_kwargs: {}
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
@@ -399,6 +401,7 @@ class TestMaxTokens:
                 seen["max_tokens"] = kwargs.get("max_tokens")
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self._build_assistant_message = lambda *_args, **_kwargs: {}
                 self.compression_enabled = True
 
             def run_conversation(self, *args, **kwargs) -> dict:
@@ -474,6 +477,7 @@ class TestObservability:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self._build_assistant_message = lambda *_args, **_kwargs: {}
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 return {
@@ -567,6 +571,7 @@ class TestObservability:
             def __init__(self, **kwargs) -> None:
                 self._build_api_kwargs = lambda _messages: {}
                 self._execute_tool_calls = lambda *_args, **_kwargs: None
+                self._build_assistant_message = lambda *_args, **_kwargs: {}
 
             def run_conversation(self, *args, **kwargs) -> dict:
                 raise ValueError("agent failed")
@@ -876,6 +881,55 @@ class TestFinishedNaturally:
         replayed = [m for m in requests[-1]["messages"] if m.get("role") == "assistant"]
         assert [m.get("reasoning_content") for m in replayed] == [None, "Still thinking 1.", "Still thinking 2.", None]
         assert [bool(m.get("tool_calls")) for m in replayed] == [True, False, False, True]
+        assert "(empty)" not in json.dumps(requests[-1]["messages"])
+        assert episode.response.status == "completed"
+
+    @pytest.mark.parametrize(
+        "content, reasoning, called",
+        [
+            # Malformed call text the endpoint serves as text: Hermes reads the turn as empty.
+            ("<tool_call>", "Now produce final.", False),
+            ("Plan.\n</think>\nOkay let's go", "r", True),
+            ("<think>plan</think>Answer follows.", None, True),
+            ("Make tool.\n</parameter>\n</function>\n</zyphra_tool_call>", "r", True),
+            ("cases to try.\n\n<tool_call>tool_call\n{}", "r", True),
+            ("[OUTPUT]", "be safe.", True),
+            ("export OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD", "r", True),
+            ("", "\n", True),
+            ("", "\n\n", True),
+            ("", "\n\n", False),
+            ("", "\nGood. So perhaps.\n\n", True),
+        ],
+    )
+    def test_text_and_reasoning_are_replayed_as_served(
+        self, monkeypatch, tmp_path, content, reasoning, called
+    ) -> None:
+        # Hermes cleans the text it stores (reasoning tags, tool-call markup, a bare bracketed
+        # word beside a call, secret-looking strings) and does not replay whitespace-only
+        # reasoning; a rollout endpoint continues only on the turn it served.
+        served = {"role": "assistant", "content": content}
+        if reasoning is not None:
+            served["reasoning_content"] = reasoning
+        if called:
+            served["tool_calls"] = _tool_turn(("terminal", {"command": "echo a > a.txt"}))["tool_calls"]
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [
+                _tool_turn(("terminal", {"command": "echo ok > out.txt"})),
+                served,
+                {"role": "assistant", "content": "Done."},
+            ],
+        )
+        assert len(requests) == 3
+        replayed = [m for m in requests[-1]["messages"] if m.get("role") == "assistant"]
+        assert len(replayed) == 2
+        assert (replayed[1].get("content") or "") == content
+        assert replayed[1].get("reasoning_content") == reasoning
+        assert bool(replayed[1].get("tool_calls")) == called
+        assert not [
+            key for request in requests for message in request["messages"] for key in message if key[:1] == "_"
+        ]
         assert "(empty)" not in json.dumps(requests[-1]["messages"])
         assert episode.response.status == "completed"
 
