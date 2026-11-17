@@ -328,6 +328,10 @@ def _keep_sampled_turns(agent: Any) -> None:
     # sampled empty turn it nudges past or ends on (``agent/turn_empty_response.py``), and its
     # pre-request pass pads an empty non-final message (``repair_empty_non_final_messages``).
     runtime_helpers.repair_empty_non_final_messages = lambda messages: messages
+    # A think-only turn stays in the replayed history: Hermes drops such turns from each
+    # request's copy and merges the user messages around them
+    # (``drop_thinking_only_and_merge_users``), which is why it writes ``(empty)`` into them.
+    agent._drop_thinking_only_and_merge_users = lambda messages, **_kwargs: messages
     if not getattr(empty_response.append_message, "keeps_sampled_empty_turns", False):
         append_message = empty_response.append_message
 

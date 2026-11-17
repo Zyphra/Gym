@@ -847,7 +847,11 @@ class TestFinishedNaturally:
         )
         assert len(requests) == 3
         replayed = [m for m in requests[-1]["messages"] if m.get("role") == "assistant"]
-        assert replayed[-1].get("content") in ("", None)
+        # Both sampled turns are replayed, the think-only one with its reasoning and no text.
+        assert len(replayed) == 2
+        assert replayed[0]["tool_calls"][0]["function"]["name"] == "terminal"
+        assert replayed[1].get("content") in ("", None)
+        assert replayed[1]["reasoning_content"] == "Still thinking."
         assert "(empty)" not in json.dumps(requests[-1]["messages"])
         assert episode.response.status == "completed"
 
