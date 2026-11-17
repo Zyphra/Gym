@@ -27,6 +27,7 @@ from anthropic.types import Message
 
 from nemo_gym.anthropic_converter import AnthropicConverter
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.responses_converter import ResponsesConverter
 
 
 PNG_DATA_URL = "data:image/png;base64,aGVsbG8="  # "hello"
@@ -128,6 +129,36 @@ class TestAnthropicRequestToResponses:
         assert params.input[0].role == "system"
         assert params.input[0].content == "stay terse"
         assert params.input[1].role == "user"
+
+    def test_mid_conversation_system_message_becomes_user_system_reminder(self) -> None:
+        # Claude Code sends the Agent tool's agent listing (and later reminders) as "system"
+        # messages after the user turn. They stay in place as user-side <system-reminder> text, so
+        # the downconverted chat request has a single leading system message.
+        listing = "Available agent types for the Agent tool:\n- Explore: read-only search."
+        params = _converter().anthropic_request_to_responses(
+            {
+                "system": [{"type": "text", "text": "You are Claude Code."}],
+                "max_tokens": 10,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "do the task"}]},
+                    {"role": "system", "content": listing},
+                    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                    {"role": "user", "content": [{"type": "text", "text": "next"}]},
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "<system-reminder>\nuse tasks\n</system-reminder>"}],
+                    },
+                ],
+            }
+        )
+        assert [item.role for item in params.input] == ["user", "user", "assistant", "user", "user"]
+        assert params.input[1].content == f"<system-reminder>\n{listing}\n</system-reminder>"
+        assert params.input[4].content == "<system-reminder>\nuse tasks\n</system-reminder>"
+
+        chat = ResponsesConverter(return_token_id_information=False).responses_to_chat_completion_create_params(params)
+        roles = [message["role"] for message in chat.model_dump()["messages"]]
+        assert roles[0] == "system"
+        assert "system" not in roles[1:] and "developer" not in roles[1:]
 
     def test_user_text_and_image_blocks(self) -> None:
         params = _converter().anthropic_request_to_responses(
