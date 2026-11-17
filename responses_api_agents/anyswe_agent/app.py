@@ -108,6 +108,9 @@ class SWEBenchMetrics(SandboxMemoryEvents):
     model_patch_bytes: Optional[int] = None
 
     agent_timed_out: Optional[bool] = None
+    # With `agent_timeout_grades_workspace`: the agent spent its time budget and the patch it
+    # left was graded. A label, not a mask; `agent_timed_out` is then False.
+    agent_budget_exhausted: Optional[bool] = None
     agent_error_kind: Optional[str] = None
     agent_stop_reason: Optional[str] = None
     eval_timed_out: Optional[bool] = None
@@ -365,6 +368,15 @@ class AnySweAgentConfig(BaseResponsesAPIAgentConfig):
     )
     swebench_tests_timeout: int = 1800
     swebench_agent_timeout: int = 2700
+    agent_timeout_grades_workspace: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "When the agent hits its time budget, grade the patch it left (as SWE-bench and Harbor do after an "
+            "agent timeout) instead of masking the row. The row reports agent_timed_out=False and "
+            "agent_budget_exhausted=True; no patch scores 0."
+        ),
+    )
     concurrency: Optional[int] = Field(default=256, gt=0)
     private_grader: Optional[PrivateGraderConfig] = None
     swe_grader: Optional[str] = Field(
@@ -1147,6 +1159,10 @@ class AnySweSandboxRunner:
             agent_timed_out = True
         elif saved is not None and (saved.metadata or {}).get("runner_exception") == "true" and harness_error is None:
             error_kind = error_kind or "agent"
+        agent_budget_exhausted = bool(agent_timed_out and params.agent_timeout_grades_workspace)
+        if agent_budget_exhausted:
+            # The wall is the task's budget, not an infrastructure failure: the patch is graded below.
+            agent_timed_out = False
         if patch.strip() and error_kind is None:
             grading_started_at = time.time()
             update_metrics(params.metrics_fpath, {"grading_started_at": grading_started_at})
@@ -1188,6 +1204,7 @@ class AnySweSandboxRunner:
                 "model_patch": _recorded_patch(patch),
                 "model_patch_bytes": patch_path.stat().st_size if patch_path.exists() else 0,
                 "agent_timed_out": agent_timed_out,
+                "agent_budget_exhausted": agent_budget_exhausted,
                 "agent_error_kind": agent_error_kind,
                 "agent_stop_reason": agent_stop_reason,
                 "eval_timed_out": eval_timed_out,

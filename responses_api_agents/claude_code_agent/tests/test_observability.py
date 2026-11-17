@@ -522,3 +522,11 @@ def test_compaction_call_correlation_rejects_inexact_matches(case: str) -> None:
     [compaction] = _records(associated, ContextCompactionObservation)
     assert compaction.model_calls == []
     assert "compaction_model_call_reference_unavailable" in {gap.code for gap in associated.gaps}
+
+
+def test_ingress_compaction_markers_match_the_observer() -> None:
+    # The model ingress withholds tools from the same compaction requests the observer counts.
+    from nemo_gym.base_responses_api_model import CLAUDE_CODE_COMPACTION_PROMPT_MARKERS
+    from responses_api_agents.claude_code_agent.observability import _COMPACTION_PROMPT_MARKERS
+
+    assert CLAUDE_CODE_COMPACTION_PROMPT_MARKERS == _COMPACTION_PROMPT_MARKERS

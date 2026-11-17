@@ -525,3 +525,71 @@ async def test_terminal_policy_stop_does_not_reenter_native_compaction(tmp_path)
     finally:
         await llm.aclose()
         await runner.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["think_reopen_stop", "token_budget", "empty_policy_turn"])
+async def test_endpoint_guard_stop_on_a_sampled_turn_ends_the_episode(guard):
+    """The endpoint stops a guarded turn with an empty message and that turn's sampled tokens in its usage;
+    Terminus ends the episode on it and sends nothing more to the finished episode."""
+    from aiohttp import web
+
+    from responses_api_agents.terminus_2_agent.llm import EpisodeTerminatedError
+
+    requests = []
+
+    async def complete(request):
+        requests.append(await request.json())
+        return web.json_response(
+            {
+                "id": "guarded-session",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": ""},
+                        "finish_reason": "stop",
+                        "stop_reason": guard,
+                    }
+                ],
+                "usage": {"prompt_tokens": 812, "completion_tokens": 37, "total_tokens": 849},
+            }
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", complete)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    llm = _make_llm(api_base=f"http://127.0.0.1:{port}/v1")
+    try:
+        with pytest.raises(EpisodeTerminatedError, match=guard):
+            await llm.call("next command")
+        with pytest.raises(EpisodeTerminatedError, match=guard):
+            await llm.call("retry")
+        assert len(requests) == 1
+        assert llm.terminal_stop_reason == guard and not llm.context_length_exceeded
+    finally:
+        await llm.aclose()
+        await runner.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("choice", "stopped"),
+    [
+        ({"message": {"content": "", "tool_calls": None}, "finish_reason": "stop", "stop_reason": "turn_limit"}, True),
+        # A model's own stop: a stop string ending output, or a stop token id.
+        ({"message": {"content": "done"}, "finish_reason": "stop", "stop_reason": "eos"}, False),
+        ({"message": {"content": ""}, "finish_reason": "stop", "stop_reason": 151645}, False),
+        ({"message": {"content": ""}, "finish_reason": "length", "stop_reason": "token_budget"}, False),
+        (
+            {"message": {"content": "", "tool_calls": [{"id": "c"}]}, "finish_reason": "stop", "stop_reason": "x"},
+            False,
+        ),
+    ],
+)
+def test_endpoint_stop_is_the_empty_named_stop(choice, stopped):
+    from responses_api_agents.terminus_2_agent.llm import _endpoint_stop
+
+    assert _endpoint_stop(choice) is stopped

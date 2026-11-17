@@ -81,6 +81,10 @@ model call. Model rollout and multi-segment training qualification are separate.
   an extension that spawns its own shell reads `PI_HIDE_HARNESS_MOUNTS=1`.
 - `max_turns`: assistant requests per run (Pi has none of its own). When set, the agent loads
   `turn_limit.ts`, which aborts the request after the last allowed turn, once that turn's tools have run.
+- `request_tools`: offer the request's function tools (a row's `responses_create_params.tools`). The agent
+  loads `request_tools.ts`, and each call is `POST /<tool name>` on the resources server in the episode's
+  session, as `simple_agent` makes it. `extra_args: [--no-builtin-tools, --no-extensions, ...]` makes them
+  Pi's only tools.
 - `extra_args`: extra flags appended to the `pi` command
 - `models_config`: written to `~/.pi/agent/models.json`
 - `pi_version`: npm version to pin on install (null means latest)

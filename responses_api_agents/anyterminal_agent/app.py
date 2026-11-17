@@ -180,6 +180,9 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     # `solved_reward_threshold`, a threshold. It is the row reward when `fractional_reward` is selected.
     verifier_reward: Optional[float] = None
     agent_timed_out: bool = False
+    # With `agent_timeout_grades_workspace`: the agent spent its time budget and the verifier
+    # graded the workspace it left. A label, not a mask; `agent_timed_out` is then False.
+    agent_budget_exhausted: bool = False
     container_timed_out: bool = False
     sandbox_failed: bool = False
     mask_sample: bool = False
@@ -226,8 +229,20 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
             return 0.0
         return self.verifier_reward
 
-    def apply_timeout_policy(self, *, agent_timeout_is_failure: bool) -> None:
-        """Keep policy timeouts in the scored population when explicitly enabled."""
+    def apply_timeout_policy(
+        self, *, agent_timeout_is_failure: bool, agent_timeout_grades_workspace: bool = False
+    ) -> None:
+        """Keep policy timeouts in the scored population when explicitly enabled.
+
+        `agent_timeout_is_failure` scores a timed-out agent 0. `agent_timeout_grades_workspace`
+        keeps the verifier's grade of the workspace at the wall, as Harbor does after an
+        AgentTimeoutError: the timeout becomes the `agent_budget_exhausted` label and the row's
+        reward is the verifier's. A missing or unreadable reward still scores 0 with its label;
+        verifier timeouts and sandbox failures stay masked. Idempotent.
+        """
+        if self.agent_timed_out and agent_timeout_grades_workspace:
+            self.agent_timed_out = False
+            self.agent_budget_exhausted = True
         if self.agent_timed_out and agent_timeout_is_failure:
             self.resolved = False
             if self.verifier_reward is not None:
@@ -312,7 +327,11 @@ def _file_lock(file_path: Path, label: str, max_wait: float = 7200.0, poll_inter
 
 
 TERMINUS_2_AGENT_MODULE = "responses_api_agents.terminus_2_agent.app"
+CLAUDE_CODE_AGENT_MODULE = "responses_api_agents.claude_code_agent.app"
 TERMINUS_TIMER_GRACE_S = 600
+# Harnesses whose own run timer (agent_kwargs.timeout) is raised to the row's work clock plus the grace: Terminus-2's
+# fallback timer and Claude Code's CLI subprocess timeout. The row's clock then ends the run, not a flat harness timer.
+_BUDGET_TIMER_AGENT_MODULES = frozenset({TERMINUS_2_AGENT_MODULE, CLAUDE_CODE_AGENT_MODULE})
 # Harness stop labels carried to done_reason. A harness turn cap is "max_turns" whatever the harness
 # calls it (Terminus "max_turns", Hermes/OpenHands "max_iterations"), the wrapper's turn-cap label.
 _NAMED_AGENT_STOPS = {
@@ -353,6 +372,9 @@ def _safe_config_json(params: "AnyTerminalInstanceConfig", indent: Optional[int]
 
 
 ### Agent runner template
+# Where agent_runtime_overlay sources are shipped in the task instance (as AnySWE's).
+AGENT_OVERLAY_DIR = "/trajectories_mount/agent_overlay"
+
 # Injected into the task container; imports any agent class and calls responses().
 
 _RUNNER_TEMPLATE = """\
@@ -362,6 +384,9 @@ from pathlib import Path
 from fastapi import Request
 
 sys.path.insert(0, "/nemo_gym_mount")
+# Source packages selected by agent_runtime_overlay shadow the runtime's installed copies.
+if Path("/trajectories_mount/agent_overlay").is_dir():
+    sys.path.insert(0, "/trajectories_mount/agent_overlay")
 # Append (not prepend) agent-deps bin so the task's own python/pip win — else the agent's
 # builds/installs land in a Python the verifier can't see. Harness CLIs stay findable as a fallback.
 os.environ["PATH"] = os.environ.get("PATH", os.defpath) + os.pathsep + "/agent_deps_mount/bin"
@@ -391,6 +416,8 @@ _cfg_sampling = {{k: v for k, v in SAMPLING.items() if k in {agent_cfg_class}.mo
 # Agents that declare a working directory run their tools in the task's, as under anyswe_agent.
 if "working_directory" in {agent_cfg_class}.model_fields:
     AGENT_KWARGS.setdefault("working_directory", TASK_WORKDIR)
+if "workspace" in {agent_cfg_class}.model_fields and AGENT_KWARGS.get("workspace") is None:
+    AGENT_KWARGS["workspace"] = TASK_WORKDIR
 
 _model_server = ModelServerRef(name="policy_model", type="responses_api_models") if MODEL_URL else None
 config = {agent_cfg_class}(
@@ -490,6 +517,21 @@ class GymAgentHarnessProcessor(BaseModel):
             agent_class_lower=cfg.agent_server_class.lower(),
         )
         (cfg.persistent_dir / "agent_runner.py").write_text(runner)
+        overlay = getattr(cfg, "agent_runtime_overlay", None)
+        if overlay:
+            # AnySWE's overlay contract: import path -> host source, shipped under /trajectories_mount/agent_overlay.
+            from responses_api_agents.anyswe_agent.app import _overlay_files, _overlay_sha256
+
+            files = _overlay_files(overlay)
+            for remote, text in files.items():
+                local = cfg.persistent_dir / Path(remote).relative_to("/trajectories_mount")
+                local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_text(text)
+            print(
+                f"[anyterminal_agent] agent_runtime_overlay packages={sorted(overlay)} "
+                f"files={len(files)} sha256={_overlay_sha256(files)}",
+                flush=True,
+            )
         return "/agent_deps_mount/bin/python /trajectories_mount/agent_runner.py"
 
 
@@ -526,6 +568,12 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     def decode_task_network(cls, value):
         return TaskNetwork.model_validate_json(value) if isinstance(value, str) else value
 
+    @model_validator(mode="after")
+    def validate_agent_timeout_policy(self):
+        if self.agent_timeout_is_failure and self.agent_timeout_grades_workspace:
+            raise ValueError("agent_timeout_is_failure and agent_timeout_grades_workspace are mutually exclusive")
+        return self
+
     # Docker network for the agent container. "host" lets the in-container agent reach a
     # model server on host loopback; None uses the docker default (e.g. for a remote server).
     docker_network: Optional[str] = "host"
@@ -534,7 +582,23 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
         default="auto",
         description="auto, an absolute prepared dependency directory for local sandboxes, or a remote runtime archive/URL",
     )
+    agent_runtime_overlay: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Python import path -> host source directory or module that shadows the runtime's installed copy "
+            "(AnySWE's agent_runtime_overlay). Shipped under /trajectories_mount/agent_overlay, first on sys.path."
+        ),
+    )
     agent_timeout_is_failure: bool = Field(default=False, strict=True)
+    agent_timeout_grades_workspace: bool = Field(
+        default=False,
+        strict=True,
+        description=(
+            "When the agent hits its time budget, keep the verifier's grade of the workspace it left (Harbor's "
+            "behaviour) instead of masking the row or forcing it to 0. The row reports agent_timed_out=False and "
+            "agent_budget_exhausted=True. Mutually exclusive with agent_timeout_is_failure."
+        ),
+    )
     continue_until_timeout: bool = Field(
         default=False,
         strict=True,
@@ -555,6 +619,15 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
     tb_agent_timeout: int = 1800
     # When set, overrides the per-task agent_timeout_sec from the dataset for every task.
     global_agent_timeout: Optional[int] = Field(default=None, gt=0)
+    episode_worker_module: str = Field(
+        default="responses_api_agents.anyterminal_agent.app",
+        pattern=r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$",
+        description=(
+            "Module whose run_terminal_episode(params_dict) runs one episode in the sandbox worker. A plugin root's "
+            "module can run a RunTerminalAgent subclass (e.g. a Harbor multi-step task's step loop) for the rows it "
+            "recognises and the stock run for the rest; the request, sandbox and response contract are unchanged."
+        ),
+    )
     tb_eval_timeout: int = 300
     tb_sandbox_ttl: int = 7200
     agent_overhead_mb: int = 2048  # extra container memory on top of the task's memory_mb for the
@@ -960,6 +1033,18 @@ class RunTerminalAgent(BaseModel):
             raise RuntimeError(result.stderr or "failed to create sandbox runtime directories")
         await sandbox.upload(cfg.persistent_dir / "instruction.txt", "/trajectories_mount/instruction.txt")
         await sandbox.upload(cfg.persistent_dir / "agent_runner.py", "/trajectories_mount/agent_runner.py")
+        overlay_dir = cfg.persistent_dir / "agent_overlay"
+        if overlay_dir.is_dir():
+            for local in sorted(path for path in overlay_dir.rglob("*") if path.is_file()):
+                remote = f"/trajectories_mount/{local.relative_to(cfg.persistent_dir)}"
+                result = await sandbox.exec(
+                    f"mkdir -p {shlex.quote(str(Path(remote).parent))}",
+                    timeout_s=setup_timeout_seconds(30),
+                    user="root",
+                )
+                if result.return_code != 0:
+                    raise RuntimeError(result.stderr or "failed to create agent overlay directory")
+                await sandbox.upload(local, remote)
         external_runtime = cfg.agent_deps_archive is not None or cfg.agent_deps_url is not None
         if cfg.agent_deps_archive is not None:
             await sandbox.upload(cfg.agent_deps_archive, "/tmp/anyterminal-agent-deps.tar.gz")
@@ -1043,6 +1128,11 @@ class RunTerminalAgent(BaseModel):
             env["NGTB_ROLLOUT_ID"] = cfg.rollout_id
         # The task's agent clock, for a harness that bounds its own run inside it (OpenClaw --timeout).
         env["NGTB_AGENT_TIMEOUT_S"] = str(cfg.tb_agent_timeout)
+        if (cfg.persistent_dir / "agent_overlay").is_dir():
+            # The runner puts the shipped overlay first on its own sys.path; the harness's own Python
+            # children (Pi's bash tool runs `python3 -m core.sandbox.command_process`) need it too,
+            # as AnySWE's runner gives them (anyswe_agent AGENT_OVERLAY_DIR).
+            env["PYTHONPATH"] = AGENT_OVERLAY_DIR
         env.update(cfg.agent_environment)
         return env
 
@@ -1620,14 +1710,20 @@ class RunTerminalAgent(BaseModel):
             else ("agent_harness" if agent_phase_kill else "unknown" if memory_kill or verifier_kill else None),
             **memory_events,
         )
-        metrics.apply_timeout_policy(agent_timeout_is_failure=cfg.agent_timeout_is_failure)
+        metrics.apply_timeout_policy(
+            agent_timeout_is_failure=cfg.agent_timeout_is_failure,
+            agent_timeout_grades_workspace=cfg.agent_timeout_grades_workspace,
+        )
         update_metrics(cfg.metrics_fpath, metrics.model_dump(), cfg.task_name)
         return bool(metrics.resolved)
 
 
 def _terminal_response(params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
     persisted = TerminalBenchMetrics.model_validate_json(params.metrics_fpath.read_text())
-    persisted.apply_timeout_policy(agent_timeout_is_failure=params.agent_timeout_is_failure)
+    persisted.apply_timeout_policy(
+        agent_timeout_is_failure=params.agent_timeout_is_failure,
+        agent_timeout_grades_workspace=params.agent_timeout_grades_workspace,
+    )
     mask_sample = persisted.mask_sample
     update_metrics(params.metrics_fpath, persisted.model_dump(), params.task_name)
 
@@ -1867,9 +1963,10 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
         # Terminus-2's own fallback timer must outlive this row's host work clock, or a row whose
         # clock exceeds the configured timer (TB2.1 build-pov-ray: 12,000 s) is cut by the harness
         # before the clock it is graded under. Only ever raised, with the native 600 s grace.
+        # Claude Code's subprocess timeout likewise (a flat 3,600 s cut WorkBuddy rows with 4,200-10,800 s budgets).
         timer = self.config.agent_kwargs.get("timeout")
         if (
-            self.config.agent_server_module == TERMINUS_2_AGENT_MODULE
+            self.config.agent_server_module in _BUDGET_TIMER_AGENT_MODULES
             and isinstance(timer, (int, float))
             and timer < effective_agent_timeout + TERMINUS_TIMER_GRACE_S
         ):
@@ -1941,7 +2038,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
 
     async def _inner_responses(self, params: AnyTerminalInstanceConfig) -> NeMoGymResponse:
         payload = params.model_dump(mode="json")
-        worker = importlib.import_module("responses_api_agents.anyterminal_agent.app").run_terminal_episode
+        worker = importlib.import_module(self.config.episode_worker_module).run_terminal_episode
         update_metrics(params.metrics_fpath, {"submitted_at": time.time()}, params.task_name)
         result = await run_sandbox_episode(
             worker,

@@ -173,6 +173,55 @@ class TestRunnerTemplate:
         assert "HermesAgentConfig.model_fields" in rendered
 
 
+class TestRuntimeOverlay:
+    def test_runner_puts_overlay_first_and_fills_a_null_workspace(self) -> None:
+        rendered = TestRunnerTemplate()._render()
+        compile(rendered, "<runner>", "exec")
+        assert rendered.index('sys.path.insert(0, "/nemo_gym_mount")') < rendered.index(
+            'sys.path.insert(0, "/trajectories_mount/agent_overlay")'
+        )
+        assert 'AGENT_KWARGS.get("workspace") is None' in rendered
+        assert 'AGENT_KWARGS["workspace"] = TASK_WORKDIR' in rendered
+
+    def test_run_command_ships_overlay_sources(self, tmp_path: Path) -> None:
+        source = tmp_path / "src" / "my_agent"
+        (source / "__pycache__").mkdir(parents=True)
+        (source / "__init__.py").write_text("")
+        (source / "app.py").write_text("VALUE = 1\n")
+        (source / "__pycache__" / "app.pyc").write_text("stale")
+        persistent = tmp_path / "episode"
+        persistent.mkdir()
+        cfg = SimpleNamespace(
+            body=NeMoGymResponseCreateParamsNonStreaming(input="do it"),
+            persistent_dir=persistent,
+            agent_server_module="my_agent.app",
+            agent_server_class="MyAgent",
+            agent_config_class="MyAgentConfig",
+            agent_runtime_overlay={"my_agent": str(source)},
+        )
+        command = GymAgentHarnessProcessor(config=cfg).get_run_command()
+        assert command == "/agent_deps_mount/bin/python /trajectories_mount/agent_runner.py"
+        shipped = sorted(str(path.relative_to(persistent)) for path in (persistent / "agent_overlay").rglob("*.py"))
+        assert shipped == ["agent_overlay/my_agent/__init__.py", "agent_overlay/my_agent/app.py"]
+        assert (persistent / "agent_overlay" / "my_agent" / "app.py").read_text() == "VALUE = 1\n"
+        assert not (persistent / "agent_overlay" / "my_agent" / "__pycache__").exists()
+
+    def test_no_overlay_ships_nothing(self, tmp_path: Path) -> None:
+        cfg = SimpleNamespace(
+            body=NeMoGymResponseCreateParamsNonStreaming(input="do it"),
+            persistent_dir=tmp_path,
+            agent_server_module="my_agent.app",
+            agent_server_class="MyAgent",
+            agent_config_class="MyAgentConfig",
+            agent_runtime_overlay={},
+        )
+        GymAgentHarnessProcessor(config=cfg).get_run_command()
+        assert not (tmp_path / "agent_overlay").exists()
+
+    def test_config_defaults_to_no_overlay(self) -> None:
+        assert _config().agent_runtime_overlay == {}
+
+
 class TestAgentKey:
     def test_key_from_module(self) -> None:
         proc = GymAgentHarnessProcessor(config=_config())
@@ -782,6 +831,34 @@ class TestSetupParams:
 
         assert agent._setup_params(body).agent_kwargs["timeout"] == timer
 
+    @staticmethod
+    def _claude_code(tmp_path: Path, timer: float) -> AnyTerminalAgent:
+        return _make_setup_agent(
+            tmp_path,
+            agent_server_module="responses_api_agents.claude_code_agent.app",
+            agent_server_class="ClaudeCodeAgent",
+            agent_config_class="ClaudeCodeAgentConfig",
+            agent_kwargs={"timeout": timer, "max_turns": 256},
+        )
+
+    @pytest.mark.parametrize("row_clock", ["4200", "10800"])
+    def test_claude_code_timeout_outlives_a_longer_row_clock(self, tmp_path: Path, row_clock: str) -> None:
+        # WorkBuddy Security/Web rows: x2.0 task budgets of 4,200-10,800 s against the binding's flat 3,600 s.
+        agent = self._claude_code(tmp_path, 3600)
+        body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": row_clock})
+
+        params = agent._setup_params(body)
+
+        assert params.tb_agent_timeout == int(row_clock)
+        assert params.agent_kwargs == {"timeout": int(row_clock) + 600, "max_turns": 256}
+        assert agent.config.agent_kwargs["timeout"] == 3600
+
+    def test_claude_code_timeout_kept_when_it_already_outlives_the_clock(self, tmp_path: Path) -> None:
+        agent = self._claude_code(tmp_path, 3600)
+        body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": "1800"})
+
+        assert agent._setup_params(body).agent_kwargs == {"timeout": 3600, "max_turns": 256}
+
     def test_other_harness_timeout_kwarg_is_not_a_terminus_timer(self, tmp_path: Path) -> None:
         agent = _make_setup_agent(tmp_path, agent_kwargs={"timeout": 60})
         body = _make_body(metadata={"task_name": "t", "task_dir": str(tmp_path), "agent_timeout_sec": "12000"})
@@ -1225,6 +1302,35 @@ def test_verifier_memory_kill_needs_a_sigkill_exit_and_an_oom_kill_in_its_sandbo
 
 
 class TestRunAgentEnv:
+    def test_shipped_overlay_is_on_the_harness_children_python_path(self, tmp_path: Path, monkeypatch) -> None:
+        """Pi's bash tool runs `python3 -m core.sandbox.command_process` as a child of the harness: with an
+        agent_runtime_overlay shipped, the agent environment must make the overlay importable to it."""
+        import subprocess
+        import sys
+
+        from responses_api_agents.anyterminal_agent import app as anyterminal
+
+        cfg = _make_instance_config(tmp_path)
+        assert "PYTHONPATH" not in RunTerminalAgent(config=cfg)._agent_env(cfg)  # nothing shipped: nothing set
+        overlay = cfg.persistent_dir / "agent_overlay"
+        (overlay / "core" / "sandbox").mkdir(parents=True)
+        for package in ("core", "core/sandbox"):
+            (overlay / package / "__init__.py").write_text("")
+        (overlay / "core" / "sandbox" / "command_process.py").write_text("import sys\nsys.exit(0)\n")
+        env = RunTerminalAgent(config=cfg)._agent_env(cfg)
+        assert env["PYTHONPATH"] == anyterminal.AGENT_OVERLAY_DIR == "/trajectories_mount/agent_overlay"
+        # The instance sees the overlay at AGENT_OVERLAY_DIR; here it is the episode's own copy.
+        child = {"PATH": "/usr/bin:/bin", **env, "PYTHONPATH": str(overlay)}
+        spawn = [sys.executable, "-m", "core.sandbox.command_process", "--timeout", "180", "--", "/bin/true"]
+        assert subprocess.run(spawn, env=child, cwd=tmp_path).returncode == 0
+        without = {key: value for key, value in child.items() if key != "PYTHONPATH"}
+        assert subprocess.run(spawn, env=without, cwd=tmp_path, capture_output=True).returncode != 0
+
+    def test_binding_environment_still_wins_over_the_overlay_path(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_environment={"PYTHONPATH": "/opt/extra"})
+        (cfg.persistent_dir / "agent_overlay").mkdir()
+        assert RunTerminalAgent(config=cfg)._agent_env(cfg)["PYTHONPATH"] == "/opt/extra"
+
     def test_model_url_included_when_set(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path, model_server_url="http://model:8000")
         env = RunTerminalAgent(config=cfg)._agent_env(cfg)
@@ -2145,3 +2251,120 @@ def test_pi_terminal_config_selects_the_pi_agent() -> None:
     )
     assert "working_directory" in PiAgentConfig.model_fields
     assert "working_directory" not in agent["agent_kwargs"]
+
+
+class TestAgentTimeoutGradesWorkspace:
+    """An agent that hits its budget is graded on the workspace it left, never masked."""
+
+    @pytest.fixture(autouse=True)
+    def _no_provider(self):
+        with patch("responses_api_agents.anyterminal_agent.app._build_provider", return_value=None):
+            yield
+
+    async def _run_to_wall(self, cfg, reward_text: str | None):
+        async def exec_(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                if reward_text is not None:
+                    (cfg.verifier_dir / "reward.txt").write_text(reward_text)
+                return _sandbox_result()
+            if "run-the-agent" in command:
+                return _sandbox_result(return_code=-1, error_type="timeout")
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=exec_), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                result = await RunTerminalAgent(config=cfg).process_single_datapoint()
+        response = app._terminal_response(cfg)
+        return result, app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"])
+
+    async def test_graded_pass_stands(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True)
+        result, metrics = await self._run_to_wall(cfg, "1")
+        assert result is True
+        assert metrics.resolved is True and metrics.reward(fractional=False) == 1.0
+        assert metrics.agent_timed_out is False and metrics.agent_budget_exhausted is True
+        assert metrics.mask_sample is False
+
+    async def test_graded_partial_fractional_stands(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(
+            tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True, fractional_reward=True
+        )
+        _, metrics = await self._run_to_wall(cfg, "0.4")
+        assert metrics.verifier_reward == 0.4 and metrics.reward(fractional=True) == 0.4
+        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
+
+    async def test_unreadable_reward_is_flagged_and_scores_zero(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True)
+        result, metrics = await self._run_to_wall(cfg, None)
+        assert result is False
+        assert metrics.verifier_reward_unreadable is True
+        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
+        assert metrics.reward(fractional=True) == 0.0
+
+    @pytest.mark.parametrize("fault", ["container_timed_out", "sandbox_failed"])
+    def test_infrastructure_stays_masked(self, fault) -> None:
+        metrics = app.TerminalBenchMetrics(resolved=True, verifier_reward=1.0, agent_timed_out=True, **{fault: True})
+        metrics.apply_timeout_policy(agent_timeout_is_failure=False, agent_timeout_grades_workspace=True)
+        assert metrics.mask_sample is True and metrics.agent_budget_exhausted is True
+
+    async def test_default_still_masks(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent")
+        _, metrics = await self._run_to_wall(cfg, "1")
+        assert metrics.agent_timed_out is True and metrics.agent_budget_exhausted is False
+        assert metrics.mask_sample is True
+
+    async def test_failure_policy_still_scores_zero(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_is_failure=True)
+        _, metrics = await self._run_to_wall(cfg, "1")
+        assert metrics.agent_timed_out is True and metrics.resolved is False and metrics.mask_sample is False
+
+    def test_policy_is_idempotent(self) -> None:
+        metrics = app.TerminalBenchMetrics(resolved=True, verifier_reward=0.5, agent_timed_out=True)
+        for _ in range(2):
+            metrics.apply_timeout_policy(agent_timeout_is_failure=False, agent_timeout_grades_workspace=True)
+        assert (metrics.agent_timed_out, metrics.agent_budget_exhausted, metrics.mask_sample) == (False, True, False)
+        assert metrics.reward(fractional=True) == 0.5
+
+    def test_flag_is_strict_default_off_and_exclusive(self, tmp_path: Path) -> None:
+        assert _make_instance_config(tmp_path).agent_timeout_grades_workspace is False
+        with pytest.raises(ValidationError, match="agent_timeout_grades_workspace"):
+            _make_instance_config(tmp_path, agent_timeout_grades_workspace="true")
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            _make_instance_config(tmp_path, agent_timeout_grades_workspace=True, agent_timeout_is_failure=True)
+
+
+# ── episode_worker_module ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [None, "anyterminal_episode_worker_probe"])
+async def test_episode_worker_module_selects_the_sandbox_worker(tmp_path, monkeypatch, module):
+    import sys
+    import types
+
+    probe = types.ModuleType("anyterminal_episode_worker_probe")
+
+    async def run_terminal_episode(params_dict):  # pragma: no cover - never executed here
+        raise AssertionError
+
+    probe.run_terminal_episode = run_terminal_episode
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+    overrides = {} if module is None else {"episode_worker_module": module}
+    agent = _make_setup_agent(tmp_path, **overrides)
+    submitted = []
+
+    async def capture(worker, payload, resources, **kwargs):
+        submitted.append(worker)
+        raise RuntimeError("captured")
+
+    monkeypatch.setattr(app, "run_sandbox_episode", capture)
+    with pytest.raises(RuntimeError, match="captured"):
+        await agent._inner_responses(_make_instance_config(tmp_path))
+    expected = app.run_terminal_episode if module is None else probe.run_terminal_episode
+    assert submitted == [expected]
+
+
+def test_episode_worker_module_must_be_a_dotted_module_name():
+    with pytest.raises(ValidationError):
+        _config(episode_worker_module="not a module; rm -rf /")
