@@ -336,17 +336,30 @@ def _keep_sampled_turns(agent: Any) -> None:
         append_message = empty_response.append_message
 
         def append_sampled(messages, message, *args, **kwargs):
-            if (
-                isinstance(message, dict)
-                and message.get("role") == "assistant"
-                and message.get("content") == "(empty)"
-                and (message.get("_empty_recovery_synthetic") or message.get("_empty_terminal_sentinel"))
-            ):
-                message = {**message, "content": ""}
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                if message.get("content") == "(empty)" and (
+                    message.get("_empty_recovery_synthetic") or message.get("_empty_terminal_sentinel")
+                ):
+                    message = {**message, "content": ""}
+                if message.get("_thinking_prefill"):
+                    # Hermes pops a think-only turn it marked this way once the policy's next turn
+                    # lands (``agent/turn_tool_round.py``, ``agent/turn_final_response.py``); the
+                    # turn was sampled and served, so it stays in the history unmarked.
+                    message = {key: value for key, value in message.items() if key != "_thinking_prefill"}
             return append_message(messages, message, *args, **kwargs)
 
         append_sampled.keeps_sampled_empty_turns = True
         empty_response.append_message = append_sampled
+    # Hermes re-arms its think-only budget when it pops a marked turn after a tool round; the
+    # turns now stay, so each tool round re-arms it here.
+    execute_tool_calls = agent._execute_tool_calls
+
+    def execute_then_rearm(*args, **kwargs):
+        agent._thinking_prefill_retries = 0
+        agent._empty_content_retries = 0
+        return execute_tool_calls(*args, **kwargs)
+
+    agent._execute_tool_calls = execute_then_rearm
     agent._repair_tool_call = lambda _name: None
     agent._deduplicate_tool_calls = lambda tool_calls: tool_calls
 

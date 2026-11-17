@@ -855,6 +855,30 @@ class TestFinishedNaturally:
         assert "(empty)" not in json.dumps(requests[-1]["messages"])
         assert episode.response.status == "completed"
 
+    def test_think_only_turns_stay_in_the_history_after_the_policy_continues(self, monkeypatch, tmp_path) -> None:
+        # Two think-only turns in a row: Hermes nudges past the first and carries the second as a
+        # marked interim turn, which it pops once the next tool call lands. Both were sampled and
+        # served, so every later request replays them.
+        thinking = [
+            {"role": "assistant", "content": "", "reasoning_content": f"Still thinking {index}."} for index in (1, 2)
+        ]
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [
+                _tool_turn(("terminal", {"command": "echo a > a.txt"})),
+                *thinking,
+                _tool_turn(("terminal", {"command": "echo b > b.txt"})),
+                {"role": "assistant", "content": "Done."},
+            ],
+        )
+        assert len(requests) == 5
+        replayed = [m for m in requests[-1]["messages"] if m.get("role") == "assistant"]
+        assert [m.get("reasoning_content") for m in replayed] == [None, "Still thinking 1.", "Still thinking 2.", None]
+        assert [bool(m.get("tool_calls")) for m in replayed] == [True, False, False, True]
+        assert "(empty)" not in json.dumps(requests[-1]["messages"])
+        assert episode.response.status == "completed"
+
     def test_turn_cap_summary_is_not_the_agents_completion(self, monkeypatch, tmp_path) -> None:
         episode, requests = self._run(
             monkeypatch,
