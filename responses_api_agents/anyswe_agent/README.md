@@ -29,6 +29,9 @@ configured `private_grader`, then an R2E-Gym dataset name, then a configured
    runner snapshots the repository, including changes already present in the
    image. Afterwards it emits `git diff --binary` against that snapshot, with
    untracked files included, so the submitted patch holds only the agent's edits.
+   At the agent's time budget the runner stops the harness, keeps the turns it
+   returns and emits the patch present then; a harness that does not stop is
+   left behind after a short grace and its patch is collected all the same.
 2. **Grading.** A nonempty patch goes to a fresh grading sandbox, where the
    dataset's private tests run; they are kept from the agent. The default
    SWE-bench and R2E paths apply the patch with `git apply`, then `--reject`,
@@ -38,15 +41,21 @@ configured `private_grader`, then an R2E-Gym dataset name, then a configured
    receive `0`. An integrity violation reported by the sandbox policy forces
    `resolved=false`.
 4. **Masks.** `mask_sample=true` marks outcomes that say nothing about the
-   policy: an agent timeout; an evaluation timeout; a sandbox, grader or
-   harness error; and a resolved patch whose episode ended on a max-iteration or
+   policy: an agent timeout (with `agent_timeout_grades_workspace` the patch
+   left at the time budget is graded and scored instead, and the row is labelled
+   `agent_budget_exhausted`); an evaluation timeout; a sandbox, grader or
+   harness error, which includes a model endpoint failure or timeout before the
+   time budget; and a resolved patch whose episode ended on a max-iteration or
    context-window error unless the harness reported that stop as its expected
    budget stop. An unresolved patch after an ordinary max-iteration or
    context-window stop keeps its `0`. Keep masked samples out of the success
    denominator, and do not treat every timeout as the same event.
 
 Each rollout includes the trajectory, patch, reward, grading fields and
-`mask_sample`.
+`mask_sample`. `agent_ending` says how the agent phase ended (`agent_wall_budget`
+at the time budget, else the harness's stop reason, else `agent`) and
+`agent_phase_seconds` how long it ran, so rows past another budget can be told
+apart.
 
 Sandbox failures retain their private exception in `sandbox_error.txt` under the
 request's results directory. The native response publishes only that file's

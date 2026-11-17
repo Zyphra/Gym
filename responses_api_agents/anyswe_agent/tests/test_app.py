@@ -1710,6 +1710,193 @@ async def test_agent_wall_grades_the_patch_it_left(
     assert result.patch_exists is bool(patch)
 
 
+_HERMES_WALL_DRIVER = """
+import json, os, subprocess, sys
+from pathlib import Path
+
+from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+from nemo_gym.openai_utils import NeMoGymEasyInputMessage, NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.server_utils import ServerClient
+from responses_api_agents.anyswe_agent import agent_runner as runner
+from responses_api_agents.hermes_agent.app import HermesAgent, HermesAgentConfig
+from responses_api_agents.hermes_agent.tests.test_app import _ScriptedChatServer, _tool_turn
+
+out = Path(sys.argv[1])
+repo = out / "repo"
+repo.mkdir()
+subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+(repo / "base.txt").write_text("base\\n")
+subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "base"], cwd=repo, check=True)
+os.chdir(repo)
+# The policy edits a file, then its next model call is still being served at the wall.
+server = _ScriptedChatServer(
+    [
+        _tool_turn(("terminal", {"command": "echo fixed > fixed.txt"})),
+        {"role": "assistant", "content": "never served", "hold_s": 600},
+    ]
+)
+agent = HermesAgent(
+    config=HermesAgentConfig(
+        host="0.0.0.0",
+        port=0,
+        name="hermesagent",
+        entrypoint="app.py",
+        model_server=ModelServerRef(name="policy_model", type="responses_api_models"),
+        resources_server=ResourcesServerRef(name="anyswe", type="resources_servers"),
+        sandbox_model_base_url=server.url,
+        model="model",
+        enabled_toolsets=["terminal", "file"],
+        disabled_toolsets=["code_execution"],
+        compression_enabled=False,
+    ),
+    server_client=ServerClient.model_construct(global_config_dict={}),
+)
+body = NeMoGymResponseCreateParamsNonStreaming(
+    input=[NeMoGymEasyInputMessage(role="user", content="fix it")], model="model"
+)
+tree = runner._snapshot_repo(repo, out / "index")
+runner._become_subreaper()
+runner._run_and_capture(agent, runner._agent_request("rid"), body, repo, out / "index", tree, out)
+print(json.dumps({"model_requests": len(server.requests)}))
+"""
+
+
+def _run_hermes_to_its_wall(out: Path) -> dict:
+    """A real Hermes episode through the real runner in a fresh interpreter, as the sandbox runs it."""
+    import time
+
+    out.mkdir()
+    root = Path(__file__).resolve().parents[3]
+    started = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-c", _HERMES_WALL_DRIVER, str(out)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{root}:{os.environ.get('PYTHONPATH', '')}",
+            "HOME": str(out),
+            "NGSWE_AGENT_TIMEOUT_S": "8",
+            "NGSWE_AGENT_STOP_GRACE_S": "60",
+        },
+    )
+    assert done.returncode == 0, done.stderr[-3000:]
+    return {"seconds": time.monotonic() - started, "stdout": done.stdout}
+
+
+async def _grade_what_the_runner_wrote(tmp_path, monkeypatch, runner_dir: Path):
+    """AnySWE's own episode over the response and patch a runner left in ``runner_dir``."""
+    from omegaconf import OmegaConf
+
+    from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+    from nemo_gym.server_utils import BaseServerConfig, ServerClient
+    from responses_api_agents.anyswe_agent import app as app_module
+
+    head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
+    config = _config(
+        model_server=None,
+        agent_runtime_source="baked",
+        sandbox_model_base_url="http://127.0.0.1:19002/v1",
+        sandbox_spec={"resources": {"cpu": 2, "memory_mib": 4096, "pids": 128}},
+        agent_timeout_grades_workspace=True,
+    )
+    client = ServerClient(head_server_config=head, global_config_dict=OmegaConf.create({"results_dir": str(tmp_path)}))
+    agent = AnySweAgent(config=config, server_client=client)
+    body = NeMoGymResponseCreateParamsNonStreaming(
+        model="test-model", input="Fix it", metadata={"instance_id": "test__test-1", "problem_statement": "Fix it"}
+    )
+
+    class RunnerSandbox:
+        def __init__(self, provider, spec):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def exec(self, command, **kwargs):
+            return SandboxExecResult("", "", 0, None)
+
+        async def download(self, source, destination):
+            shutil.copyfile(runner_dir / Path(source).name, destination)
+
+    graded = []
+
+    async def grade(self, params, received):
+        graded.append(received)
+        return True, None, None
+
+    monkeypatch.setattr(app_module, "AsyncSandbox", RunnerSandbox)
+    monkeypatch.setattr(AnySweSandboxRunner, "_grade_sandbox_patch", grade)
+    return await agent.run(AnySweRunRequest(responses_create_params=body)), graded
+
+
+async def test_hermes_stopped_at_its_wall_keeps_its_turns_and_its_patch_is_graded(
+    tmp_path, monkeypatch, episode_submissions
+):
+    pytest.importorskip("run_agent", reason="needs the Hermes agent runtime")
+    runner_dir = tmp_path / "runner"
+    summary = _run_hermes_to_its_wall(runner_dir)
+
+    # Hermes itself stopped: the runner neither waited out its thread nor left it behind.
+    assert summary["seconds"] < 60
+    assert "agent did not stop at its wall" not in summary["stdout"]
+    saved = json.loads((runner_dir / "response.json").read_text())
+    assert saved["metadata"]["agent_wall_timeout"] == "true"
+    assert saved["metadata"]["interrupted"] == "true"
+    assert "model_transport_error" not in saved["metadata"]
+    assert [item["name"] for item in saved["output"] if item["type"] == "function_call"] == ["terminal"]
+    patch = (runner_dir / "patch.diff").read_text()
+    assert "+++ b/fixed.txt" in patch and "+fixed" in patch
+
+    result, graded = await _grade_what_the_runner_wrote(tmp_path, monkeypatch, runner_dir)
+    assert graded == [patch]
+    assert result.reward == 1.0 and result.resolved is True
+    assert result.patch_exists is True
+    assert result.mask_sample is False
+    assert result.error_kind is None
+    assert result.agent_budget_exhausted is True
+    assert result.agent_timed_out is False
+    assert result.agent_ending == "agent_wall_budget"
+    assert result.agent_phase_seconds is not None
+
+
+@pytest.mark.parametrize(
+    "mode,env,expected_mask,expected_error_kind,budget_exhausted",
+    [
+        # A harness that never stops: the runner's own collection is graded and scored.
+        ("thread", {"NGSWE_AGENT_TIMEOUT_S": "2", "NGSWE_AGENT_STOP_GRACE_S": "2"}, False, None, True),
+        # A model call that timed out before the wall is a transport failure: masked, not a budget stop.
+        ("transport", {"NGSWE_AGENT_TIMEOUT_S": "600"}, True, "harness", False),
+    ],
+)
+async def test_runner_wall_stop_is_scored_and_a_transport_timeout_is_masked(
+    tmp_path, monkeypatch, episode_submissions, mode, env, expected_mask, expected_error_kind, budget_exhausted
+):
+    from responses_api_agents.anyswe_agent.tests.test_agent_tree_reap import _drive
+
+    runner_dir = tmp_path / "runner"
+    runner_dir.mkdir()
+    _drive(runner_dir, mode, **env)
+    if mode == "transport":
+        # The episode had edited the repository before its model call failed.
+        (runner_dir / "patch.diff").write_text("diff --git a/fixed.txt b/fixed.txt\n+fixed\n")
+    patch = (runner_dir / "patch.diff").read_text()
+
+    result, graded = await _grade_what_the_runner_wrote(tmp_path, monkeypatch, runner_dir)
+    assert graded == [patch]
+    assert result.mask_sample is expected_mask
+    assert result.error_kind == expected_error_kind
+    assert result.agent_budget_exhausted is budget_exhausted
+    assert result.agent_timed_out is False
+    assert result.agent_ending == ("agent_wall_budget" if budget_exhausted else "agent")
+    assert result.reward == 1.0
+
+
 def test_agent_timeout_grades_workspace_is_strict_and_off_by_default() -> None:
     from pydantic import ValidationError
 

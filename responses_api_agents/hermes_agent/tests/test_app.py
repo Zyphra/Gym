@@ -16,6 +16,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -617,6 +618,9 @@ class _ScriptedChatServer:
                     return
                 server.requests.append(body)
                 message = server.turns.pop(0) if server.turns else {"role": "assistant", "content": "unscripted"}
+                if message.get("hold_s"):
+                    # A model call still open when the caller's deadline passes.
+                    time.sleep(message["hold_s"])
                 choice = {
                     "index": 0,
                     "message": message,

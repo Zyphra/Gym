@@ -931,13 +931,24 @@ class HermesAgent(SimpleResponsesAPIAgent):
         agent_error: Optional[BaseException] = None
         interrupted_by_dispatch = False
         try:
-            result = await asyncio.to_thread(
-                agent.run_conversation,
-                user_message,
-                system_message,
-                history,
-                task_id,
+            conversation = asyncio.ensure_future(
+                asyncio.to_thread(
+                    agent.run_conversation,
+                    user_message,
+                    system_message,
+                    history,
+                    task_id,
+                )
             )
+            try:
+                result = await asyncio.shield(conversation)
+            except asyncio.CancelledError:
+                # A caller's deadline (AnySWE's agent wall) cancels this call, which cannot reach
+                # the conversation's thread. Hermes' own stop ends its model call and returns the
+                # turns it has, as on SIGTERM; a second cancellation is not held.
+                self.interrupted_agents.add(agent_id)
+                agent.interrupt("timeout")
+                result = await conversation
             if finished_by_tool is not None and finished_by_tool() and agent_id not in self.interrupted_agents:
                 # The policy ended the run itself; the loop's interrupt check was only the stop point.
                 result = {**result, "completed": True, "interrupted": False}
