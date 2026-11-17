@@ -269,8 +269,11 @@ def _endpoint_stop(response: Any) -> bool:
     )
 
 
-def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
+def _observe_endpoint_stop(agent: Any) -> tuple[Callable[[], bool], Callable[[], bool]]:
     """Record whether the endpoint stopped the episode, and answer every later request with that stop.
+
+    Returns two readers: whether the run counts as ended by the endpoint (true too when the
+    agent's requests cannot be observed), and whether a stop was actually seen.
 
     The stop ends the episode: Hermes would otherwise answer the empty message with its
     empty-response nudge or retry and send another request to a finished episode, which
@@ -282,7 +285,7 @@ def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
     api_call = getattr(agent, "_interruptible_api_call", None)
     if api_call is None:
         # An unobservable stop counts as the endpoint's, so completion is never claimed.
-        return lambda: True
+        return lambda: True, lambda: False
     stop = None
 
     def call_then_observe(*args, **kwargs):
@@ -297,7 +300,7 @@ def _observe_endpoint_stop(agent: Any) -> Callable[[], bool]:
         return response
 
     agent._interruptible_api_call = call_then_observe
-    return lambda: stop is not None
+    return (lambda: stop is not None), (lambda: stop is not None)
 
 
 def _keep_sampled_turns(agent: Any) -> None:
@@ -842,7 +845,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             if offered and resources_url is None:
                 raise ValueError("Hermes request tools need the resources server")
             _offer_request_tools(offered, task_id, resources_url, cookie)
-        ended_by_endpoint = _observe_endpoint_stop(agent)
+        ended_by_endpoint, endpoint_stop_seen = _observe_endpoint_stop(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         if self.config.finish_tool:
             offered = [*offered, {"type": "function", "function": FINISH_TOOL_SCHEMA}]
@@ -877,16 +880,11 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 result = {**result, "completed": True, "interrupted": False}
             elif ended_by_endpoint() and agent_id not in self.interrupted_agents:
                 # The endpoint ended the episode; the interrupt only kept Hermes from asking again.
-                # What Hermes made of the stop afterwards (an empty-response retry it gave up on)
-                # is not a harness failure: the episode's outcome is the endpoint's stop.
-                result = {
-                    **result,
-                    "completed": True,
-                    "interrupted": False,
-                    "failed": False,
-                    "partial": False,
-                    "error": None,
-                }
+                result = {**result, "completed": True, "interrupted": False}
+                if endpoint_stop_seen():
+                    # What Hermes made of a stop it was served (an empty-response retry it gave
+                    # up on) is not a harness failure: the episode's outcome is the endpoint's stop.
+                    result = {**result, "failed": False, "partial": False, "error": None}
         except BaseException as exc:
             agent_error = exc
             raise
