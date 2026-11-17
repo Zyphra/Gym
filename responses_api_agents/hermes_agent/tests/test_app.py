@@ -833,6 +833,24 @@ class TestFinishedNaturally:
         assert episode.response.metadata["stop_reason"] == "invalid_tool_calls"
         assert episode.response.metadata["finished_naturally"] == "false"
 
+    def test_an_empty_turn_is_replayed_empty(self, monkeypatch, tmp_path) -> None:
+        # Hermes nudges past an empty reply after tool calls; the empty turn it replays must stay as
+        # served (empty content), not carry its "(empty)" placeholder.
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [
+                _tool_turn(("terminal", {"command": "echo ok > out.txt"})),
+                {"role": "assistant", "content": "", "reasoning_content": "Still thinking."},
+                {"role": "assistant", "content": "Done."},
+            ],
+        )
+        assert len(requests) == 3
+        replayed = [m for m in requests[-1]["messages"] if m.get("role") == "assistant"]
+        assert replayed[-1].get("content") in ("", None)
+        assert "(empty)" not in json.dumps(requests[-1]["messages"])
+        assert episode.response.status == "completed"
+
     def test_turn_cap_summary_is_not_the_agents_completion(self, monkeypatch, tmp_path) -> None:
         episode, requests = self._run(
             monkeypatch,

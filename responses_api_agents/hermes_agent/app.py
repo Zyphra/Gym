@@ -318,8 +318,28 @@ def _keep_sampled_turns(agent: Any) -> None:
     whole process, which runs only Hermes agents.
     """
     import agent.agent_runtime_helpers as runtime_helpers  # pyright: ignore[reportMissingImports]
+    import agent.turn_empty_response as empty_response  # pyright: ignore[reportMissingImports]
 
     runtime_helpers._repair_invalid_tool_call_names = lambda _messages: None
+    # An empty turn stays empty: Hermes stores the ``(empty)`` placeholder as the content of the
+    # sampled empty turn it nudges past or ends on (``agent/turn_empty_response.py``), and its
+    # pre-request pass pads an empty non-final message (``repair_empty_non_final_messages``).
+    runtime_helpers.repair_empty_non_final_messages = lambda messages: messages
+    if not getattr(empty_response.append_message, "keeps_sampled_empty_turns", False):
+        append_message = empty_response.append_message
+
+        def append_sampled(messages, message, *args, **kwargs):
+            if (
+                isinstance(message, dict)
+                and message.get("role") == "assistant"
+                and message.get("content") == "(empty)"
+                and (message.get("_empty_recovery_synthetic") or message.get("_empty_terminal_sentinel"))
+            ):
+                message = {**message, "content": ""}
+            return append_message(messages, message, *args, **kwargs)
+
+        append_sampled.keeps_sampled_empty_turns = True
+        empty_response.append_message = append_sampled
     agent._repair_tool_call = lambda _name: None
     agent._deduplicate_tool_calls = lambda tool_calls: tool_calls
 
