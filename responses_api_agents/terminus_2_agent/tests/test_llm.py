@@ -579,6 +579,10 @@ async def test_endpoint_guard_stop_on_a_sampled_turn_ends_the_episode(guard):
     ("choice", "stopped"),
     [
         ({"message": {"content": "", "tool_calls": None}, "finish_reason": "stop", "stop_reason": "turn_limit"}, True),
+        # The episode endpoint's ordinary turn carries no stop_reason, even with empty content
+        # (recipe/nemo_async/episode_endpoint.py sets one only on its own stops).
+        ({"message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}, False),
+        ({"message": {"content": ""}, "finish_reason": "stop", "stop_reason": None}, False),
         # A model's own stop: a stop string ending output, or a stop token id.
         ({"message": {"content": "done"}, "finish_reason": "stop", "stop_reason": "eos"}, False),
         ({"message": {"content": ""}, "finish_reason": "stop", "stop_reason": 151645}, False),
