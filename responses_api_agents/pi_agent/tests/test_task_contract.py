@@ -47,6 +47,7 @@ class _Endpoint:
 
     def __init__(self, script: list[dict], prompt_tokens: list[int]) -> None:
         self.requests: list[dict] = []
+        self.request_bytes: list[bytes] = []
         self.summaries = 0
         endpoint = self
 
@@ -55,9 +56,11 @@ class _Endpoint:
                 pass
 
             def do_POST(self) -> None:
-                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.loads(raw)
                 if body.get("tools"):
                     endpoint.requests.append(body)
+                    endpoint.request_bytes.append(raw)
                     n = len(endpoint.requests)
                     step = script[min(n, len(script)) - 1]
                     tokens = prompt_tokens[min(n, len(prompt_tokens)) - 1]
@@ -161,10 +164,25 @@ def test_uncompacted_tagged_run_is_unchanged(monkeypatch, tmp_path):
     }
 
 
+def test_uncompacted_request_bytes_match_the_baseline(monkeypatch, tmp_path):
+    workdir = tmp_path / "same-task"
+    workdir.mkdir()
+    script = [_bash(1), _text("<FINAL_ANSWER>42</FINAL_ANSWER>")]
+    _, candidate = _episode(monkeypatch, tmp_path / "candidate", script, working_directory=str(workdir))
+    noop = tmp_path / "noop.ts"
+    noop.write_text("export default function () {}\n")
+    monkeypatch.setattr("responses_api_agents.pi_agent.app.TASK_CONTRACT_EXTENSION", noop)
+    _, baseline = _episode(monkeypatch, tmp_path / "baseline", script, working_directory=str(workdir))
+    assert len(candidate.request_bytes) == len(baseline.request_bytes) == 2
+    assert candidate.request_bytes == baseline.request_bytes
+
+
 def test_task_survives_compaction_and_empty_final_reply_gets_one_continuation(monkeypatch, tmp_path):
     # The first reply reports a context near the window, so Pi compacts before the second request.
     script = [_bash(1), _bash(2), _text(""), _text("<FINAL_ANSWER>42</FINAL_ANSWER>")]
-    response, endpoint = _episode(monkeypatch, tmp_path, script, prompt_tokens=[7500, 200, 200, 200])
+    response, endpoint = _episode(
+        monkeypatch, tmp_path, script, prompt_tokens=[7500, 200, 200, 200], answer_pattern=TAG
+    )
     assert endpoint.summaries >= 1
     first, *after = endpoint.requests
     assert _user_texts(first) == [TASK]
@@ -180,6 +198,15 @@ def test_task_survives_compaction_and_empty_final_reply_gets_one_continuation(mo
     assert response.metadata["pi_continuation"] == "empty_final_reply"
     assert int(response.metadata["pi_compactions"]) >= 1
     assert int(response.metadata["pi_restated_requests"]) == len(after)
+
+
+@pytest.mark.parametrize("tokens", [100, 7500])
+def test_training_empty_final_settles_with_no_answer_contract(monkeypatch, tmp_path, tokens):
+    monkeypatch.setenv("PI_GYM_ANSWER_PATTERN", TAG)
+    response, endpoint = _episode(monkeypatch, tmp_path, [_bash(1), _text("")], prompt_tokens=[tokens, 200])
+    assert len(endpoint.requests) == 2
+    assert endpoint.summaries == (1 if tokens == 7500 else 0)
+    assert response.metadata["pi_continuation"] == "none"
 
 
 def test_untagged_answer_continues_once_only(monkeypatch, tmp_path):

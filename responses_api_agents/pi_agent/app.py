@@ -633,8 +633,8 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     # session. `extra_args: [--no-builtin-tools, ...]` makes them Pi's only tools.
     request_tools: bool = False
     # The answer the task declares, for task_contract.ts's one continuation: a regex the final reply must
-    # match, and/or files of which one must exist non-empty (matching the regex when one is set). Unset,
-    # only an empty or cut final reply gets the continuation.
+    # match, and/or files of which one must exist non-empty (matching the regex when one is set).
+    # A binding must declare one of these fields for the continuation.
     answer_pattern: Optional[str] = None
     answer_files: list[str] = []
 
@@ -801,10 +801,8 @@ class PiAgent(SimpleResponsesAPIAgent):
             cmd += ["--extension", str(TURN_LIMIT_EXTENSION)]
             env["PI_GYM_MAX_TURNS"] = str(self.config.max_turns)
         cmd += ["--extension", str(TASK_CONTRACT_EXTENSION)]
-        if self.config.answer_pattern:
-            env["PI_GYM_ANSWER_PATTERN"] = self.config.answer_pattern
-        if self.config.answer_files:
-            env["PI_GYM_ANSWER_FILES"] = json.dumps(self.config.answer_files)
+        env["PI_GYM_ANSWER_PATTERN"] = self.config.answer_pattern or ""
+        env["PI_GYM_ANSWER_FILES"] = json.dumps(self.config.answer_files)
         if self.config.request_tools:
             cmd += ["--extension", str(REQUEST_TOOLS_EXTENSION)]
             env["PI_GYM_REQUEST_TOOLS"] = str(self._write_request_tools(home, request_tools, cookies or {}))

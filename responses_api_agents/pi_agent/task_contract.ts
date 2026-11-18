@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 /**
- * Keeps the task in front of `pi --print` across context compaction and gives a run that ends without
- * its answer one more turn. PiAgent loads it on every run.
+ * Keeps the task in front of `pi --print` across context compaction. An evaluation binding can
+ * declare an answer contract for one continuation. PiAgent loads it on every run.
  *
  * - Restate: Pi's compaction replaces the messages that carried the task (the first user message) with
  *   a summary. Once a compaction summary is in context and the instruction is not, every request carries
  *   the original instruction again as a user message right after the summary. It is request-local (the
  *   `context` event), so a run that never compacts sends exactly the requests it sent before, and each
  *   request after a compaction extends the previous one.
- * - Continue: when the run settles on an assistant reply (not on a terminating tool, an abort, an error or
+ * - Continue: when an answer contract is declared and the run settles on an assistant reply (not on a terminating tool, an abort, an error or
  *   a reply cut at the output limit, which Pi's own length recovery retries once) that is empty or carries neither the answer the task declares
  *   (PI_GYM_ANSWER_PATTERN on the reply) nor its answer file (PI_GYM_ANSWER_FILES), the extension asks
  *   for the final answer once. Never past PI_GYM_MAX_TURNS, which turn_limit.ts enforces.
@@ -40,6 +40,7 @@ const answerFiles = (): string[] => {
 };
 
 export function missingReason(last: any, pattern: RegExp | null, files: string[]): string | null {
+  if (!pattern && files.length === 0) return null;
   if (last?.role !== "assistant") return null; // ended on a terminating tool's result
   // A reply cut at the output limit ("length") already had Pi's one compact-and-retry; aborted (turn limit)
   // and error ends are not ours to retry.
@@ -48,7 +49,6 @@ export function missingReason(last: any, pattern: RegExp | null, files: string[]
   if (content.some((b: any) => b?.type === "toolCall")) return null;
   const reply = textOf(content).trim();
   if (!reply) return "empty_final_reply";
-  if (!pattern && files.length === 0) return null;
   if (pattern && pattern.test(reply)) return null;
   for (const file of files) {
     if (!existsSync(file)) continue;

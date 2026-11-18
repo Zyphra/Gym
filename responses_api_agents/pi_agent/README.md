@@ -90,7 +90,8 @@ model call. Model rollout and multi-segment training qualification are separate.
   session, as `simple_agent` makes it. `extra_args: [--no-builtin-tools, --no-extensions, ...]` makes them
   Pi's only tools.
 - `answer_pattern`, `answer_files`: the answer the task declares (a regex on the final reply; files of
-  which one must exist non-empty and match the regex when one is set), for the continuation below.
+  which one must exist non-empty and match the regex when one is set). An evaluation binding
+  declares one of these fields to enable the continuation below.
 - `extra_args`: extra flags appended to the `pi` command
 - `models_config`: written to `~/.pi/agent/models.json`
 - `pi_version`: npm version to pin on install (null means latest)
@@ -112,9 +113,9 @@ Any other non-zero exit stays a `failed` response with error `Pi process_exit_<c
 
 Every run loads `task_contract.ts`. Pi's compaction replaces the messages that carried the task with a
 summary, so after a compaction each request carries the original instruction again, right after the
-summary; it is request-local, so a run that never compacts sends the same requests as without it. When
-the run settles on an assistant reply (not on a terminating tool, an abort or an error) that is empty or
-lacks the declared answer, Pi gets one continuation asking for the final answer, never past `max_turns`.
+summary. This is request-local so a run that never compacts sends the same requests. With an explicit
+answer contract, an empty or untagged final reply can receive one continuation within `max_turns`.
+The stock training bindings leave these fields unset, so an empty final reply ends the episode.
 A reply cut at the output limit is retried by Pi's own length recovery and gets no second retry.
 
 The response metadata labels every run: `pi_compactions`, `pi_restated_requests`, `pi_continuation`
