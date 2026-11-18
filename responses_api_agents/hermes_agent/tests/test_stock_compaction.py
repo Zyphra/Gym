@@ -354,8 +354,12 @@ def test_compaction_trigger_counts_the_output_reserve_once(monkeypatch, tmp_path
     native_agents: list = []
     with _PolicyFixture(_SUMMARY_OK) as policy:
         app = _agent(
-            tmp_path, monkeypatch, policy.server.server_port, native_agents,
-            max_tokens=32768, compression_threshold=0.85,
+            tmp_path,
+            monkeypatch,
+            policy.server.server_port,
+            native_agents,
+            max_tokens=32768,
+            compression_threshold=0.85,
         )
         _run(app, "hi", "rollout-d")
     [native] = native_agents
