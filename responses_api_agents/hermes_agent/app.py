@@ -785,10 +785,12 @@ class HermesAgent(SimpleResponsesAPIAgent):
             # Every auxiliary request Hermes makes without a dedicated provider resolves to the run's
             # own policy endpoint. Only the compression summary belongs to the rollout; Hermes' title
             # generation is switched off with its own setting, and the compression call gets the
-            # run's request budget instead of Hermes' 120 s auxiliary default.
+            # run's request budget instead of Hermes' 120 s auxiliary default. Hermes sends its summary
+            # call without max_tokens (its summary budget is only a target in the prompt, and reasoning
+            # is not counted against it), so the call states the run's per-request output budget.
             "auxiliary": {
                 "title_generation": {"enabled": False},
-                **({"compression": {"timeout": self.config.api_timeout}} if self.config.api_timeout else {}),
+                **({"compression": self._compression_aux_config()} if self._compression_aux_config() else {}),
             },
         }
         if self.config.mcp_servers:
@@ -803,6 +805,15 @@ class HermesAgent(SimpleResponsesAPIAgent):
         # The rollout endpoint answers whole chat completions; Hermes' own switch turns streaming off.
         config["model"]["streaming"] = False
         return yaml.dump(config, default_flow_style=False)
+
+    def _compression_aux_config(self) -> dict[str, Any]:
+        """Hermes' auxiliary.compression settings: the request timeout and the summary's output budget."""
+        aux: dict[str, Any] = {}
+        if self.config.api_timeout:
+            aux["timeout"] = self.config.api_timeout
+        if self.config.max_tokens:
+            aux["extra_body"] = {"max_tokens": self.config.max_tokens}
+        return aux
 
     def model_post_init(self, __context: Any) -> None:
         self.sem = Semaphore(self.config.concurrency)
