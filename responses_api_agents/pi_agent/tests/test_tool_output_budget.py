@@ -29,7 +29,7 @@ WINDOW = 40000
 MAX_OUTPUT = 4096
 TASK = "Inspect the numbers, then answer DONE."
 # 2000 lines of digits, about 45 KB: under Pi's own 50 KB / 2000 line cap, above what the window can take.
-DENSE = "seq 1 1999 | awk '{print \"{\\\"id\\\":\"$1\",\\\"v\\\":[\"$1\",\"$1\",\"$1\"]}\"}' | head -c 49000"
+DENSE = 'seq 1 1999 | awk \'{print "{\\"id\\":"$1",\\"v\\":["$1","$1","$1"]}"}\' | head -c 49000'
 OVERFLOW = (
     '{"message":"This model\'s maximum context length is %d tokens. However, you requested %d output tokens '
     'and your prompt contains at least %d input tokens, for a total of at least %d tokens.","type":"BadRequestError",'
@@ -77,8 +77,12 @@ class _Endpoint:
                     endpoint.prompts.append(prompt)
                     n = len(endpoint.prompts)
                     if n <= len(commands):
-                        call = {"index": 0, "id": f"call_{n}", "type": "function",
-                                "function": {"name": "bash", "arguments": json.dumps({"command": commands[n - 1]})}}
+                        call = {
+                            "index": 0,
+                            "id": f"call_{n}",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": json.dumps({"command": commands[n - 1]})},
+                        }
                         delta, finish = {"role": "assistant", "content": "", "tool_calls": [call]}, "tool_calls"
                     else:
                         delta, finish = {"role": "assistant", "content": "DONE"}, "stop"
@@ -88,14 +92,22 @@ class _Endpoint:
                 chunks = [
                     {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
                     {"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
-                    {"choices": [], "usage": {"prompt_tokens": prompt, "completion_tokens": 20,
-                                              "total_tokens": prompt + 20}},
+                    {
+                        "choices": [],
+                        "usage": {"prompt_tokens": prompt, "completion_tokens": 20, "total_tokens": prompt + 20},
+                    },
                 ]
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 for chunk in chunks:
-                    chunk = {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": body["model"], **chunk}
+                    chunk = {
+                        "id": "c",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": body["model"],
+                        **chunk,
+                    }
                     self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
 
@@ -114,16 +126,27 @@ def _episode(monkeypatch, tmp_path, commands):
     client._build_server_base_url = lambda _cfg: endpoint.url
     agent = PiAgent(
         config=PiAgentConfig(
-            host="127.0.0.1", port=8080, entrypoint="", name="pi", model="model", timeout=120,
-            command=f"{runtime / 'bin/node'} {runtime / 'bin/pi'}", workspace_root=str(tmp_path / "pi"),
+            host="127.0.0.1",
+            port=8080,
+            entrypoint="",
+            name="pi",
+            model="model",
+            timeout=120,
+            command=f"{runtime / 'bin/node'} {runtime / 'bin/pi'}",
+            workspace_root=str(tmp_path / "pi"),
             resources_server=ResourcesServerRef(type="resources_servers", name=""),
             model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
-            max_turns=20, context_window=WINDOW, max_output_tokens=MAX_OUTPUT, compaction_enabled=True,
+            max_turns=20,
+            context_window=WINDOW,
+            max_output_tokens=MAX_OUTPUT,
+            compaction_enabled=True,
         ),
         server_client=client,
     )
     try:
-        episode = asyncio.run(agent._create_episode(NeMoGymResponseCreateParamsNonStreaming(input=TASK), rollout_id="r"))
+        episode = asyncio.run(
+            agent._create_episode(NeMoGymResponseCreateParamsNonStreaming(input=TASK), rollout_id="r")
+        )
     finally:
         endpoint.httpd.shutdown()
     return episode.response, endpoint
