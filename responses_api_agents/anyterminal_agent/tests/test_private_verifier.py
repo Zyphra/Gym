@@ -177,7 +177,9 @@ def test_a_report_from_a_killed_or_shadowed_helper_is_never_graded(tmp_path, mon
 
 def test_grader_outputs_live_beside_the_episode_and_are_published_after_it(tmp_path):
     persistent = tmp_path / "episode"
-    cfg = app.AnyTerminalInstanceConfig.model_construct(persistent_dir=persistent, verifier_dir=persistent / "verifier")
+    cfg = app.AnyTerminalInstanceConfig.model_construct(
+        persistent_dir=persistent, verifier_dir=persistent / "verifier"
+    )
     trusted = cfg.host_only_dir("verifier")
     # /trajectories_mount is the episode directory: nothing the host grades from is below it.
     assert trusted.parent == tmp_path and app.interim_snapshot(cfg, 3).parent.parent == tmp_path
