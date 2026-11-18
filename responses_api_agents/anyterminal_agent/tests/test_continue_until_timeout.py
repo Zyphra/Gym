@@ -30,6 +30,10 @@ from responses_api_agents.anyterminal_agent.app import RunTerminalAgent, Termina
 from responses_api_agents.anyterminal_agent.tests.test_app import _make_instance_config, _sandbox_result
 
 
+async def _no_baseline() -> None:
+    return None
+
+
 @pytest.fixture(autouse=True)
 def _verifier_writes_the_host_directory(monkeypatch):
     """These fakes stand in for test.sh by writing ``verifier_dir`` directly.
@@ -37,7 +41,8 @@ def _verifier_writes_the_host_directory(monkeypatch):
     The private ``/logs/verifier`` transport and the host-only grader directories are covered
     in ``test_private_verifier.py``.
     """
-    monkeypatch.setattr(app, "_private_verifier_command", lambda command, tests_manifest_sha256=None: command)
+    monkeypatch.setattr(app, "_private_verifier_command", lambda command, *_: command)
+    monkeypatch.setattr(app.RunTerminalAgent, "_record_startup_baseline", lambda self, sandbox, cfg: _no_baseline())
     monkeypatch.setattr(app, "_write_private_outputs", lambda stdout, return_code, cfg: {"exit_code": return_code})
     monkeypatch.setattr(
         app.AnyTerminalInstanceConfig,

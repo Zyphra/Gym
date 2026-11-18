@@ -319,3 +319,94 @@ def test_grader_outputs_live_beside_the_episode_and_are_published_after_it(tmp_p
     assert (persistent / "interim_verifier" / "phase-0000" / "reward.txt").read_text() == "0.5"
     assert not (persistent / "interim_verifier.sandbox-written").exists()
     assert not trusted.exists() and not interim.parent.exists()
+
+
+def _run_helper_with_layout(tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+    """The real helper as namespace root, with its system paths under ``tmp_path``."""
+    driver = textwrap.dedent(
+        """
+        import json, runpy, sys
+        module = runpy.run_path(sys.argv[1], run_name="private_verifier")
+        layout = json.loads(sys.argv[2])
+        for name, value in layout.items():
+            module["main"].__globals__[name] = tuple(value) if isinstance(value, list) else value
+        raise SystemExit(module["main"](sys.argv[3:]))
+        """
+    )
+    layout = {
+        "VERIFIER_DIR": str(tmp_path / "logs-verifier"),
+        "TESTS_DIR": str(tmp_path / "tests"),
+        "PYTHON_DIR_GLOBS": [str(tmp_path / "usr/lib/python3*/site-packages")],
+        "ROOT_DIRS": [str(tmp_path / "root-dir"), str(tmp_path / "home")],
+        "GIT_CONFIGS": [str(tmp_path / "etc-gitconfig"), str(tmp_path / "home/.gitconfig")],
+    }
+    return subprocess.run(
+        ["unshare", "-rm", sys.executable, "-I", "-S", "-c", driver, str(HELPER), json.dumps(layout), *args],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
+def test_startup_files_the_agent_added_do_not_run_inside_grading(tmp_path):
+    site = tmp_path / "usr/lib/python3.12/site-packages"
+    (site / "pkg-1.0.dist-info").mkdir(parents=True)
+    for directory in ("root-dir", "home", "logs-verifier", "work"):
+        (tmp_path / directory).mkdir()
+    (site / "image.pth").write_text("/opt/image\n")
+    (tmp_path / "home/.gitconfig").write_text("[user]\n\tname = image\n")
+    baseline = _run_helper_with_layout(tmp_path, "--scan-startup", str(tmp_path / "work"))
+    assert baseline.returncode == 0, baseline.stderr
+    (tmp_path / "baseline.json").write_text(baseline.stdout)
+    # What the agent leaves behind: code Python, pytest or git would run, and one honest install.
+    planted = {
+        site / "sitecustomize.py": "import os; os._exit(0)\n",
+        site / "zz-agent.pth": "import os; os._exit(0)\n",
+        site / "pkg.pth": "import pkg_finder; pkg_finder.install()\n",
+        tmp_path / "root-dir/conftest.py": "raise SystemExit(0)\n",
+        tmp_path / "work/pytest.py": "raise SystemExit(0)\n",
+        tmp_path / "work/conftest.py": "raise SystemExit(0)\n",
+    }
+    for path, text in planted.items():
+        path.write_text(text)
+    (site / "pkg-1.0.dist-info/RECORD").write_text("pkg.pth,sha256=x,40\npkg/__init__.py,,\n")
+    with (tmp_path / "home/.gitconfig").open("a") as stream:
+        stream.write("[core]\n\tfsmonitor = /tmp/agent\n")
+    command = (
+        f'for f in sitecustomize.py zz-agent.pth pkg.pth; do printf "%s=%s;" $f "$(cat {site}/$f)"; done; '
+        f'printf "conftest=%s;pytest=%s;" "$(cat {tmp_path}/root-dir/conftest.py)" "$(cat {tmp_path}/work/pytest.py)"; '
+        'env | grep ^GIT_CONFIG | sort | tr "\\n" ";"'
+    )
+    digest = hashlib.sha256((tmp_path / "baseline.json").read_bytes()).hexdigest()
+    result = _run_helper_with_layout(
+        tmp_path,
+        "--startup",
+        str(tmp_path / "baseline.json"),
+        digest,
+        str(tmp_path / "work"),
+        "{ " + command + f'; }} > "{tmp_path}/logs-verifier/seen"',
+    )
+    report = _helper_report(result)
+    assert report["setup"] is None and report["exit_code"] == 0, result.stderr
+    seen = base64.b64decode({entry["path"]: entry for entry in report["files"]}["seen"]["data"]).decode()
+    assert "sitecustomize.py=;zz-agent.pth=;" in seen  # hidden from the verifier
+    assert "pkg.pth=import pkg_finder" in seen  # an installer recorded it: an honest install stays
+    assert "conftest=;pytest=;" in seen
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in seen and "GIT_CONFIG_KEY_0=core.hooksPath" in seen
+    assert sorted(report["hidden_startup_files"]) == sorted(
+        [
+            str(site / "sitecustomize.py"),
+            str(site / "zz-agent.pth"),
+            str(tmp_path / "root-dir/conftest.py"),
+            str(tmp_path / "work/pytest.py"),
+            str(tmp_path / "work/conftest.py"),
+            str(tmp_path / "home/.gitconfig"),
+        ]
+    )
+    assert all(path.read_text() == text for path, text in planted.items())  # the agent's own view is untouched
+    (tmp_path / "baseline.json").write_text("{}")
+    result = _run_helper_with_layout(
+        tmp_path, "--startup", str(tmp_path / "baseline.json"), digest, str(tmp_path / "work"), "true"
+    )
+    assert "startup baseline differs" in _helper_report(result)["setup"]
