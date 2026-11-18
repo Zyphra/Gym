@@ -913,6 +913,20 @@ PRIVATE_VERIFIER_PYTHON = "/agent_deps_mount/bin/python"
 PRIVATE_VERIFIER = "/nemo_gym_mount/responses_api_agents/anyterminal_agent/private_verifier.py"
 PRIVATE_VERIFIER_MARKER = "NEMO_GYM_PRIVATE_VERIFIER "
 PRIVATE_VERIFIER_RECEIPT = "private-verifier.json"
+AGENT_NO_PTRACE = Path(__file__).with_name("no_ptrace.py")
+
+
+def _without_ptrace(command: str) -> str:
+    """Run an agent command without ``CAP_SYS_PTRACE`` (``no_ptrace.py``).
+
+    No agent process, including one left running into grading, can then open the
+    verifier's ``/proc/<pid>/root``, ``environ`` or ``fd`` entries. The program is passed
+    inline so every provider runs it from the agent runtime's interpreter.
+    """
+    return (
+        f"{PRIVATE_VERIFIER_PYTHON} -I -S -c {shlex.quote(AGENT_NO_PTRACE.read_text())} "
+        f"/bin/sh -c {shlex.quote(command)}"
+    )
 
 
 def _private_verifier_command(command: str) -> str:
@@ -1325,7 +1339,7 @@ class RunTerminalAgent(BaseModel):
             update_metrics(cfg.metrics_fpath, {"agent_started_at": time.time()}, cfg.task_name)
         try:
             result = await sandbox.exec(
-                _apt_root_sandbox(cfg) + (cfg.agent_command_str or ""),
+                _without_ptrace(_apt_root_sandbox(cfg) + (cfg.agent_command_str or "")),
                 timeout_s=cfg.tb_agent_timeout if timeout_s is None else timeout_s,
                 user="root",
                 env=self._agent_env(cfg),
