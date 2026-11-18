@@ -169,6 +169,27 @@ def measured_model_client():
             exchange["client_elapsed_ms"] = 1000 * (perf_counter() - started)
 
 
+@asynccontextmanager
+async def measured_model_server(semaphore):
+    """Measure this server's existing admission and upstream call boundaries."""
+    exchange = _CALL.get()
+    if exchange is None:
+        async with semaphore:
+            yield
+        return
+    started = perf_counter()
+    admitted = None
+    try:
+        async with semaphore:
+            admitted = perf_counter()
+            yield
+    finally:
+        finished = perf_counter()
+        exchange["server_queue_ms"] = 1000 * ((admitted if admitted is not None else finished) - started)
+        if admitted is not None:
+            exchange["server_service_ms"] = 1000 * (finished - admitted)
+
+
 def model_call_role(role):
     """Mark the actual role owner without changing its signature or arguments."""
     from functools import wraps
