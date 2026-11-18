@@ -119,7 +119,10 @@ def test_max_turns_ends_after_the_last_turns_tools(monkeypatch, tmp_path):
     # Three requests reach the endpoint, the tools of all three turns run, and the fourth is never sent.
     assert len(requests) == 3 and ran == ["1", "2", "3"]
     assert response.error is None and response.status is None
-    assert response.metadata == {"stop_reason": "max_iterations", "pi_stop_detail": "Pi reached max_turns=3"}
+    assert {k: response.metadata.get(k) for k in ("stop_reason", "pi_stop_detail")} == {
+        "stop_reason": "max_iterations",
+        "pi_stop_detail": "Pi reached max_turns=3",
+    }
     assert [item.type for item in response.output].count("function_call") == 3
     assert not _should_mask_sample(True, "max_iteration", False, None, "max_iterations")
 

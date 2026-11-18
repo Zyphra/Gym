@@ -70,6 +70,10 @@ LOG = logging.getLogger(__name__)
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
 TURN_LIMIT_EXTENSION = Path(__file__).with_name("turn_limit.ts")
 REQUEST_TOOLS_EXTENSION = Path(__file__).with_name("request_tools.ts")
+TASK_CONTRACT_EXTENSION = Path(__file__).with_name("task_contract.ts")
+TASK_CONTRACT_LABEL = "pi_gym_task_contract"
+# An extension that kills a shell command at its deadline appends one entry of this type per kill.
+COMMAND_TIMEOUT_LABEL = "pi_gym_command_timeout"
 TURN_LIMIT_MARKER = "pi_gym_turn_limit"
 # The model endpoint's context-overflow errors, as Pi's own overflow detection reads them.
 _CONTEXT_OVERFLOW = re.compile(
@@ -87,6 +91,45 @@ class _PiRunResult(NamedTuple):
     timed_out: bool = False
     stderr: str = ""
     budget_stop: Optional[tuple[str, str]] = None
+    labels: Optional[dict[str, str]] = None
+
+
+def pi_episode_labels(stdout: str | bytes) -> dict[str, str]:
+    """What the harness did to the episode, from Pi's JSON events, as response metadata strings.
+
+    * ``pi_compactions``: completed context compactions (``compaction_end`` events).
+    * ``pi_restated_requests``: requests that carried the task again after a compaction (task_contract.ts).
+    * ``pi_continuation``: why task_contract.ts asked for the final answer once, or ``none``.
+    * ``pi_command_timeouts``: shell commands killed at their deadline (``pi_gym_command_timeout`` entries).
+    """
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    compactions = timeouts = 0
+    contract: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "compaction_end":
+            compactions += 1
+        entry = event.get("entry") if event.get("type") == "entry_appended" else None
+        if (
+            isinstance(entry, dict)
+            and entry.get("customType") == TASK_CONTRACT_LABEL
+            and isinstance(entry.get("data"), dict)
+        ):
+            contract = entry["data"]
+        elif isinstance(entry, dict) and entry.get("customType") == COMMAND_TIMEOUT_LABEL:
+            timeouts += 1
+    return {
+        "pi_compactions": str(compactions),
+        "pi_restated_requests": str(int(contract.get("restated_requests") or 0)),
+        "pi_continuation": str(contract.get("continuation") or "none"),
+        "pi_command_timeouts": str(timeouts),
+    }
 
 
 def pi_budget_stop(
@@ -551,6 +594,11 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     # run each call as simple_agent does: POST /<tool name> on the resources server in the episode's
     # session. `extra_args: [--no-builtin-tools, ...]` makes them Pi's only tools.
     request_tools: bool = False
+    # The answer the task declares, for task_contract.ts's one continuation: a regex the final reply must
+    # match, and/or files of which one must exist non-empty (matching the regex when one is set). Unset,
+    # only an empty or cut final reply gets the continuation.
+    answer_pattern: Optional[str] = None
+    answer_files: list[str] = []
 
     @property
     def command_parts(self) -> list[str]:
@@ -714,6 +762,11 @@ class PiAgent(SimpleResponsesAPIAgent):
         if self.config.max_turns is not None:
             cmd += ["--extension", str(TURN_LIMIT_EXTENSION)]
             env["PI_GYM_MAX_TURNS"] = str(self.config.max_turns)
+        cmd += ["--extension", str(TASK_CONTRACT_EXTENSION)]
+        if self.config.answer_pattern:
+            env["PI_GYM_ANSWER_PATTERN"] = self.config.answer_pattern
+        if self.config.answer_files:
+            env["PI_GYM_ANSWER_FILES"] = json.dumps(self.config.answer_files)
         if self.config.request_tools:
             cmd += ["--extension", str(REQUEST_TOOLS_EXTENSION)]
             env["PI_GYM_REQUEST_TOOLS"] = str(self._write_request_tools(home, request_tools, cookies or {}))
@@ -762,6 +815,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                         proc.returncode,
                         True,
                         stderr.decode(errors="replace"),
+                        labels=pi_episode_labels(stdout),
                     )
             else:
                 output_task = asyncio.create_task(proc.communicate(piped_instruction))
@@ -781,6 +835,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                         proc.returncode,
                         True,
                         (stderr or b"").decode(errors="replace"),
+                        labels=pi_episode_labels(stdout),
                     )
 
             if collect_observations and stdin_task is not None:
@@ -799,6 +854,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 proc.returncode,
                 stderr=stderr.decode(errors="replace"),
                 budget_stop=budget_stop,
+                labels=pi_episode_labels(stdout),
             )
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -878,12 +934,16 @@ class PiAgent(SimpleResponsesAPIAgent):
             ),
             error=(ResponseError(code="server_error", message=f"Pi {process_error}") if process_error else None),
             metadata=(
-                {"agent_error": process_error, "pi_return_code": str(result.return_code)}
-                if process_error
-                else {"stop_reason": result.budget_stop[0], "pi_stop_detail": result.budget_stop[1]}
-                if result.budget_stop
-                else None
-            ),
+                (
+                    {"agent_error": process_error, "pi_return_code": str(result.return_code)}
+                    if process_error
+                    else {"stop_reason": result.budget_stop[0], "pi_stop_detail": result.budget_stop[1]}
+                    if result.budget_stop
+                    else {}
+                )
+                | (result.labels or {})
+            )
+            or None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,

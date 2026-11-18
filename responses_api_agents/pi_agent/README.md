@@ -85,6 +85,8 @@ model call. Model rollout and multi-segment training qualification are separate.
   loads `request_tools.ts`, and each call is `POST /<tool name>` on the resources server in the episode's
   session, as `simple_agent` makes it. `extra_args: [--no-builtin-tools, --no-extensions, ...]` makes them
   Pi's only tools.
+- `answer_pattern`, `answer_files`: the answer the task declares (a regex on the final reply; files of
+  which one must exist non-empty and match the regex when one is set), for the continuation below.
 - `extra_args`: extra flags appended to the `pi` command
 - `models_config`: written to `~/.pi/agent/models.json`
 - `pi_version`: npm version to pin on install (null means latest)
@@ -101,3 +103,16 @@ A run that ends on a budget reports it the way the OpenHands adapter does, with 
   own overflow recovery, or the last reply was cut where the context window ends.
 
 Any other non-zero exit stays a `failed` response with error `Pi process_exit_<code>`.
+
+## Task contract
+
+Every run loads `task_contract.ts`. Pi's compaction replaces the messages that carried the task with a
+summary, so after a compaction each request carries the original instruction again, right after the
+summary; it is request-local, so a run that never compacts sends the same requests as without it. When
+the run settles on an assistant reply (not on a terminating tool, an abort or an error) that is empty or
+lacks the declared answer, Pi gets one continuation asking for the final answer, never past `max_turns`.
+A reply cut at the output limit is retried by Pi's own length recovery and gets no second retry.
+
+The response metadata labels every run: `pi_compactions`, `pi_restated_requests`, `pi_continuation`
+(`none`, `empty_final_reply` or `answer_missing`) and `pi_command_timeouts`
+(`pi_gym_command_timeout` entries an extension appends for each shell command killed at its deadline).
