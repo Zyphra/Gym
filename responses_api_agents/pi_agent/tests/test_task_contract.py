@@ -200,8 +200,9 @@ def test_answer_file_satisfies_the_contract(monkeypatch, tmp_path):
 
 def test_no_continuation_past_the_turn_limit_or_after_a_cut_tool_turn(monkeypatch, tmp_path):
     response, endpoint = _episode(monkeypatch, tmp_path, [_bash(1)], max_turns=2)
-    # The third request is aborted by turn_limit.ts before it is sent; the run gets no continuation.
-    assert len(endpoint.requests) == 2
+    # Two turns, then turn_limit.ts's cap request and its one re-ask (both replies are calls, blocked);
+    # the run gets no continuation.
+    assert len(endpoint.requests) == 4
     assert response.metadata["pi_continuation"] == "none"
     response, endpoint = _episode(monkeypatch, tmp_path / "b", [_text("")], max_turns=1)
     assert len(endpoint.requests) == 1 and response.metadata["pi_continuation"] == "none"

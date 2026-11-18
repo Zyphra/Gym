@@ -92,6 +92,40 @@ class _PiRunResult(NamedTuple):
     stderr: str = ""
     budget_stop: Optional[tuple[str, str]] = None
     labels: Optional[dict[str, str]] = None
+    turn_cap_answer: Optional[str] = None
+
+
+def pi_turn_cap_answer(stdout: str | bytes, max_turns: int) -> str:
+    """How the cap request (``turn_limit.ts``, the request after the last of ``max_turns``) was answered:
+    ``tool_free_reply`` (text), ``reask_reply`` (its reply was a tool call, which was blocked, and the one
+    re-ask was answered with text), ``tool_call`` (both replies were tool calls, from an endpoint that
+    ignores ``tool_choice``; both were blocked), or ``none`` (no reply, or an empty one)."""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    replies = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        message = event.get("message") if isinstance(event, dict) and event.get("type") == "message_end" else None
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            replies.append(message)
+
+    def answer(reply: dict) -> str:
+        parts = [part for part in reply.get("content") or [] if isinstance(part, dict)]
+        if any(part.get("type") == "toolCall" for part in parts):
+            return "tool_call"
+        text = "".join(str(part.get("text") or "") for part in parts if part.get("type") == "text")
+        return "tool_free_reply" if text.strip() else "none"
+
+    if len(replies) <= max_turns:
+        return "none"
+    first = answer(replies[max_turns])
+    if first != "tool_call" or len(replies) <= max_turns + 1:
+        return first
+    second = answer(replies[max_turns + 1])
+    return "reask_reply" if second == "tool_free_reply" else second
 
 
 def pi_episode_labels(stdout: str | bytes) -> dict[str, str]:
@@ -139,7 +173,8 @@ def pi_budget_stop(
 
     The reasons are the ones the OpenHands adapter reports, so AnySWE grades the partial patch the same way:
 
-    * ``max_iterations``: ``turn_limit.ts`` aborted the request after the last of ``max_turns`` turns.
+    * ``max_iterations``: the run used all ``max_turns`` turns and ``turn_limit.ts`` ended it on the
+      cap request or its re-ask (answered as text, a tool call blocked, or a later request aborted).
     * ``context_exhausted``: the last request failed on the context window and Pi's overflow recovery
       did not recover it, or the last reply was cut where the window ends.
     """
@@ -160,7 +195,10 @@ def pi_budget_stop(
         return None
     stop = last.get("stopReason")
     error = last.get("errorMessage") if isinstance(last.get("errorMessage"), str) else ""
-    if stop == "aborted" and max_turns is not None and TURN_LIMIT_MARKER in stderr:
+    # A blocked call in the re-ask ends the run on "toolUse"; a request after the re-ask is aborted, which
+    # Pi reports as stopReason "aborted" or as an "error" whose message says the operation was aborted.
+    aborted = stop == "aborted" or (stop == "error" and "aborted" in error.lower())
+    if (aborted or stop in ("stop", "toolUse")) and max_turns is not None and TURN_LIMIT_MARKER in stderr:
         return "max_iterations", f"Pi reached max_turns={max_turns}"
     if stop == "error" and _CONTEXT_OVERFLOW.search(error):
         return "context_exhausted", error[:500]
@@ -855,6 +893,11 @@ class PiAgent(SimpleResponsesAPIAgent):
                 stderr=stderr.decode(errors="replace"),
                 budget_stop=budget_stop,
                 labels=pi_episode_labels(stdout),
+                turn_cap_answer=(
+                    pi_turn_cap_answer(stdout, self.config.max_turns)
+                    if budget_stop is not None and budget_stop[0] == "max_iterations"
+                    else None
+                ),
             )
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -937,7 +980,11 @@ class PiAgent(SimpleResponsesAPIAgent):
                 (
                     {"agent_error": process_error, "pi_return_code": str(result.return_code)}
                     if process_error
-                    else {"stop_reason": result.budget_stop[0], "pi_stop_detail": result.budget_stop[1]}
+                    else {
+                        "stop_reason": result.budget_stop[0],
+                        "pi_stop_detail": result.budget_stop[1],
+                        **({"turn_cap_answer": result.turn_cap_answer} if result.turn_cap_answer is not None else {}),
+                    }
                     if result.budget_stop
                     else {}
                 )
