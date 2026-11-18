@@ -66,6 +66,17 @@ def _config(**kwargs) -> HermesAgentConfig:
 
 
 class TestSanity:
+    @pytest.mark.parametrize("limit", [None, 32_000])
+    def test_file_read_cap_projects_only_when_set(self, limit) -> None:
+        import yaml
+
+        agent = HermesAgent.model_construct(config=_config(model="fixture", file_read_max_chars=limit))
+        config = yaml.safe_load(agent._build_config())
+        if limit is None:
+            assert "file_read_max_chars" not in config
+        else:
+            assert config["file_read_max_chars"] == limit
+
     @pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
     def test_api_timeout_rejects_invalid_budget(self, timeout) -> None:
         with pytest.raises(ValueError):
