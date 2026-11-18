@@ -31,6 +31,26 @@ if [ ! -f "$HERMES_DIR/run_agent.py" ]; then
     mkdir -p "$HERMES_DIR"
     curl -fsSL "${HERMES_REPO/github.com/codeload.github.com}/tar.gz/$HERMES_COMMIT" | tar xz -C "$HERMES_DIR" --strip-components=1
 fi
+# patches/*.patch apply, in name order, to the pinned source and nothing else: each is a
+# defect fix in Hermes' own tool handling (patches/README.md). A patch that no longer applies
+# exactly (fuzz 0) fails the build instead of landing elsewhere. Read from NEMO_GYM_ROOT, as the
+# pin is, so a staged copy of this script (AnySWE's) applies the same patches.
+PATCH_DIR="$NEMO_GYM_ROOT/responses_api_agents/hermes_agent/patches"
+shopt -s nullglob
+PATCHES=("$PATCH_DIR"/*.patch)
+shopt -u nullglob
+if [ -d "$PATCH_DIR" ] && [ "${#PATCHES[@]}" -eq 0 ]; then
+    echo "$PATCH_DIR holds no patches" >&2
+    exit 1
+fi
+if [ ! -f "$HERMES_DIR/.hermes_patches" ]; then
+    : > "$HERMES_DIR/.hermes_patches.partial"
+    for patch_file in "${PATCHES[@]}"; do
+        patch -d "$HERMES_DIR" -p1 --fuzz=0 --no-backup-if-mismatch --batch < "$patch_file"
+        sha256sum "$patch_file" | sed "s|  .*/|  |" >> "$HERMES_DIR/.hermes_patches.partial"
+    done
+    mv "$HERMES_DIR/.hermes_patches.partial" "$HERMES_DIR/.hermes_patches"
+fi
 echo "$HERMES_COMMIT" > "$HERMES_DIR/.hermes_commit"
 
 LOCKED="$DEPS_DIR/.hermes-locked-requirements.txt"

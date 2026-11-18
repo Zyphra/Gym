@@ -493,6 +493,7 @@ class GymAgentHarnessProcessor(BaseModel):
             scripts / "_portable_python.sh",
             PARENT_DIR / "responses_api_agents" / self._agent_key / "requirements.txt",
             *sorted((PARENT_DIR / "responses_api_agents" / self._agent_key).glob("*.py")),
+            *sorted((PARENT_DIR / "responses_api_agents" / self._agent_key / "patches").glob("*.patch")),
         )
         recipe = hashlib.sha256(b"".join(path.read_bytes() for path in sources if path.exists())).hexdigest()
         if sentinel.exists() and sentinel.read_text().strip() == recipe:

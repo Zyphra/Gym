@@ -1,0 +1,24 @@
+--- a/agent/conversation_loop.py	2026-11-11 13:25:31.037295750 +0000
++++ b/agent/conversation_loop.py	2026-11-11 13:25:31.065296019 +0000
+@@ -1134,6 +1134,21 @@
+             "tool, use a valid name from your tool list; otherwise reply in plain text."
+         )
+     available = ", ".join(sorted(valid_tool_names))
++    if "tool_call" in valid_tool_names:
++        # A deferred tool (e.g. process_manage, named in the terminal description) is reached
++        # through the bridge, never by its own name. Say so instead of "does not exist".
++        try:
++            from tools.tool_search import is_deferrable_tool_name, load_config_readonly
++            deferred = is_deferrable_tool_name(name, load_config_readonly().effective_defer_tools)
++        except Exception:
++            deferred = False
++        if deferred:
++            return (
++                f"Tool '{name}' is a deferred tool and is not called by its own name. Call "
++                f"tool_describe(names=['{name}']) to load its schema, then invoke it with "
++                f"tool_call(calls=[{{\"name\": \"{name}\", \"arguments\": {{...}}}}]). "
++                f"Tools you call directly: {available}"
++            )
+     return f"Tool '{name}' does not exist. Available tools: {available}"
+ 
+ 
