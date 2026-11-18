@@ -89,6 +89,16 @@ class _PiRunResult(NamedTuple):
     budget_stop: Optional[tuple[str, str]] = None
 
 
+def _turn_cap_answer(output_items: list) -> str:
+    """How a capped run's final answer was obtained: ``tool_free_reply`` when the cap request
+    (``turn_limit.ts``) was answered with text, else ``none``."""
+    last = output_items[-1] if output_items else None
+    if getattr(last, "type", None) != "message":
+        return "none"
+    text = "".join(getattr(part, "text", "") or "" for part in getattr(last, "content", None) or [])
+    return "tool_free_reply" if text.strip() else "none"
+
+
 def pi_budget_stop(
     stdout: str | bytes, stderr: str | bytes, *, max_turns: Optional[int], context_window: int
 ) -> Optional[tuple[str, str]]:
@@ -96,7 +106,8 @@ def pi_budget_stop(
 
     The reasons are the ones the OpenHands adapter reports, so AnySWE grades the partial patch the same way:
 
-    * ``max_iterations``: ``turn_limit.ts`` aborted the request after the last of ``max_turns`` turns.
+    * ``max_iterations``: the run used all ``max_turns`` turns and ``turn_limit.ts`` ended it on the
+      cap request (answered as text, its tool call blocked, or a later request aborted).
     * ``context_exhausted``: the last request failed on the context window and Pi's overflow recovery
       did not recover it, or the last reply was cut where the window ends.
     """
@@ -117,7 +128,7 @@ def pi_budget_stop(
         return None
     stop = last.get("stopReason")
     error = last.get("errorMessage") if isinstance(last.get("errorMessage"), str) else ""
-    if stop == "aborted" and max_turns is not None and TURN_LIMIT_MARKER in stderr:
+    if stop in ("aborted", "stop", "toolUse") and max_turns is not None and TURN_LIMIT_MARKER in stderr:
         return "max_iterations", f"Pi reached max_turns={max_turns}"
     if stop == "error" and _CONTEXT_OVERFLOW.search(error):
         return "context_exhausted", error[:500]
@@ -880,7 +891,15 @@ class PiAgent(SimpleResponsesAPIAgent):
             metadata=(
                 {"agent_error": process_error, "pi_return_code": str(result.return_code)}
                 if process_error
-                else {"stop_reason": result.budget_stop[0], "pi_stop_detail": result.budget_stop[1]}
+                else {
+                    "stop_reason": result.budget_stop[0],
+                    "pi_stop_detail": result.budget_stop[1],
+                    **(
+                        {"turn_cap_answer": _turn_cap_answer(output_items)}
+                        if result.budget_stop[0] == "max_iterations"
+                        else {}
+                    ),
+                }
                 if result.budget_stop
                 else None
             ),
