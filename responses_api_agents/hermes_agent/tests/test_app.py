@@ -628,6 +628,14 @@ class _ScriptedChatServer:
                     return
                 server.requests.append(body)
                 message = server.turns.pop(0) if server.turns else {"role": "assistant", "content": "unscripted"}
+                if "error" in message:
+                    payload = json.dumps(message).encode()
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 choice = {
                     "index": 0,
                     "message": message,
@@ -864,6 +872,30 @@ class TestFinishedNaturally:
     """Which real Hermes endings are the agent's own completion."""
 
     _run = TestFinishTool._run
+
+    @pytest.mark.parametrize(
+        "code, expected_status", [("episode_terminated", "completed"), ("invalid_request", "failed")]
+    )
+    def test_typed_refusal_after_compaction(self, monkeypatch, tmp_path, code, expected_status) -> None:
+        # An auxiliary summary received the terminal completion. The next main
+        # request sees the already-ended episode as a typed HTTP refusal.
+        refusal = {
+            "error": {
+                "type": "invalid_request_error",
+                "code": code,
+                "param": "messages",
+                "message": "This episode has ended (compaction_limit); no further turns are served.",
+            }
+        }
+        episode, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [_tool_turn(("terminal", {"command": "echo ok > out.txt"})), refusal, refusal],
+        )
+        assert len(requests) >= 2
+        assert (tmp_path / "out.txt").read_text().strip() == "ok"
+        assert episode.response.status == expected_status
+        assert episode.response.metadata["finished_naturally"] == "false"
 
     def test_final_answer_is_the_agents_own_completion(self, monkeypatch, tmp_path) -> None:
         episode, requests = self._run(

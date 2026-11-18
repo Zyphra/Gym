@@ -34,6 +34,7 @@ from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
 from fastapi import Request
+from openai import BadRequestError
 from pydantic import ConfigDict, Field
 
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -356,20 +357,33 @@ def _observe_endpoint_stop(agent: Any) -> tuple[Callable[[], bool], Callable[[],
         # An unobservable stop counts as the endpoint's, so completion is never claimed.
         return lambda: True, lambda: False
     stop = None
+    refused_after_stop = False
 
     def call_then_observe(*args, **kwargs):
-        nonlocal stop
+        nonlocal stop, refused_after_stop
         if stop is not None:
             agent._interrupt_requested = True
             return stop
-        response = api_call(*args, **kwargs)
+        try:
+            response = api_call(*args, **kwargs)
+        except BadRequestError as error:
+            # A compaction uses an auxiliary client that can receive the stop
+            # before the primary client sees this terminal refusal.
+            if error.code == "episode_terminated":
+                refused_after_stop = True
+                agent._interrupt_requested = True
+            raise
         if _endpoint_stop(response):
             stop = response
             agent._interrupt_requested = True
         return response
 
     agent._interruptible_api_call = call_then_observe
-    return (lambda: stop is not None), (lambda: stop is not None)
+
+    def stop_seen() -> bool:
+        return stop is not None or refused_after_stop
+
+    return stop_seen, stop_seen
 
 
 def _keep_sampled_turns(agent: Any) -> None:
