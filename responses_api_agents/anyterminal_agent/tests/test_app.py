@@ -306,6 +306,17 @@ def _make_body(content: str = "solve this", **kwargs) -> NeMoGymResponseCreatePa
     )
 
 
+@pytest.fixture(autouse=True)
+def _verifier_writes_the_host_directory(monkeypatch):
+    """These fakes stand in for test.sh by writing ``verifier_dir`` directly.
+
+    The private ``/logs/verifier`` transport between them is covered in
+    ``test_private_verifier.py``.
+    """
+    monkeypatch.setattr(app, "_private_verifier_command", lambda command: command)
+    monkeypatch.setattr(app, "_write_private_outputs", lambda stdout, cfg: None)
+
+
 def _make_instance_config(tmp_path: Path, **overrides) -> AnyTerminalInstanceConfig:
     persistent_dir = tmp_path / "persistent"
     persistent_dir.mkdir(parents=True, exist_ok=True)
@@ -1074,7 +1085,7 @@ class TestBuildProvider:
         assert any(str(cfg.persistent_dir) in b and "/trajectories_mount" in b for b in binds)
         assert any(str(cfg.nemo_gym_root) in b and "/nemo_gym_mount" in b for b in binds)
         assert any(str(cfg.agent_deps_dir) in b and "/agent_deps_mount" in b for b in binds)
-        assert any(str(cfg.verifier_dir) in b and "/logs/verifier" in b for b in binds)
+        assert f"{cfg.sandbox_verifier_dir}:/logs/verifier" in binds
 
     def test_apptainer_writable_and_no_home(self, tmp_path: Path) -> None:
         provider = _build_provider(_make_instance_config(tmp_path, sandbox_provider={"apptainer": {}}))
@@ -1092,7 +1103,7 @@ class TestBuildProvider:
         cfg = _make_instance_config(tmp_path, sandbox_provider={"docker": {}})
         provider = _build_provider(cfg)
         assert any(str(cfg.persistent_dir) in a for a in provider._create_config.extra_run_args)
-        assert any(str(cfg.verifier_dir) in a for a in provider._create_config.extra_run_args)
+        assert f"{cfg.sandbox_verifier_dir}:/logs/verifier" in provider._create_config.extra_run_args
 
     def test_unknown_provider_returned_as_is(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path, sandbox_provider={"opensandbox": {"foo": "bar"}})

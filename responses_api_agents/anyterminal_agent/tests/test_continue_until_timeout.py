@@ -24,9 +24,21 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from responses_api_agents.anyterminal_agent import app
 from responses_api_agents.anyterminal_agent import continue_until_timeout as phases
 from responses_api_agents.anyterminal_agent.app import RunTerminalAgent, TerminalBenchMetrics
 from responses_api_agents.anyterminal_agent.tests.test_app import _make_instance_config, _sandbox_result
+
+
+@pytest.fixture(autouse=True)
+def _verifier_writes_the_host_directory(monkeypatch):
+    """These fakes stand in for test.sh by writing ``verifier_dir`` directly.
+
+    The private ``/logs/verifier`` transport between them is covered in
+    ``test_private_verifier.py``.
+    """
+    monkeypatch.setattr(app, "_private_verifier_command", lambda command: command)
+    monkeypatch.setattr(app, "_write_private_outputs", lambda stdout, cfg: None)
 
 
 INSTRUCTION = "Build the thing.\n"
