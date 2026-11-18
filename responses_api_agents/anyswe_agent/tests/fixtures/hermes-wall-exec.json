@@ -1,0 +1,9 @@
+{
+  "agent_budget_exhausted": true,
+  "agent_error_type": "timeout",
+  "agent_response_saved": false,
+  "agent_return_code": 125,
+  "grader_ran": false,
+  "mask_sample": false,
+  "patch_exists": false
+}
