@@ -121,3 +121,15 @@ A reply cut at the output limit is retried by Pi's own length recovery and gets 
 The response metadata labels every run: `pi_compactions`, `pi_restated_requests`, `pi_continuation`
 (`none`, `empty_final_reply` or `answer_missing`) and `pi_command_timeouts`
 (`pi_gym_command_timeout` entries an extension appends for each shell command killed at its deadline).
+
+## Tool output budget
+
+Every run loads `tool_output_budget.ts`. Pi sizes each request from the last reply's real token usage plus
+4 characters per token for what was appended since, and caps a tool result at 50 KB. Dense JSON or numbers
+tokenize at about one token per byte, so one capped result can put a request tens of thousands of tokens
+above Pi's estimate: the endpoint rejects it as a context overflow, and the summary request of Pi's overflow
+recovery overruns the window too. Before a tool result enters the history, the extension counts it at one
+token per UTF-8 byte and cuts it (head, a notice, the last lines) so the next request fits whichever output
+budget Pi asks for: real context at most `context_window - max_output_tokens`, or real context within Pi's
+4096-token safety margin of its estimate. Results that fit are unchanged. `pi_cut_tool_results` counts the
+cut results (`pi_gym_tool_output_budget` entries).

@@ -72,6 +72,8 @@ TURN_LIMIT_EXTENSION = Path(__file__).with_name("turn_limit.ts")
 REQUEST_TOOLS_EXTENSION = Path(__file__).with_name("request_tools.ts")
 TASK_CONTRACT_EXTENSION = Path(__file__).with_name("task_contract.ts")
 TASK_CONTRACT_LABEL = "pi_gym_task_contract"
+TOOL_OUTPUT_BUDGET_EXTENSION = Path(__file__).with_name("tool_output_budget.ts")
+TOOL_OUTPUT_BUDGET_LABEL = "pi_gym_tool_output_budget"
 # An extension that kills a shell command at its deadline appends one entry of this type per kill.
 COMMAND_TIMEOUT_LABEL = "pi_gym_command_timeout"
 TURN_LIMIT_MARKER = "pi_gym_turn_limit"
@@ -135,10 +137,11 @@ def pi_episode_labels(stdout: str | bytes) -> dict[str, str]:
     * ``pi_restated_requests``: requests that carried the task again after a compaction (task_contract.ts).
     * ``pi_continuation``: why task_contract.ts asked for the final answer once, or ``none``.
     * ``pi_command_timeouts``: shell commands killed at their deadline (``pi_gym_command_timeout`` entries).
+    * ``pi_cut_tool_results``: tool results tool_output_budget.ts cut to keep the next request in the window.
     """
     if isinstance(stdout, bytes):
         stdout = stdout.decode(errors="replace")
-    compactions = timeouts = 0
+    compactions = timeouts = cuts = 0
     contract: dict[str, Any] = {}
     for line in stdout.splitlines():
         try:
@@ -158,11 +161,14 @@ def pi_episode_labels(stdout: str | bytes) -> dict[str, str]:
             contract = entry["data"]
         elif isinstance(entry, dict) and entry.get("customType") == COMMAND_TIMEOUT_LABEL:
             timeouts += 1
+        elif isinstance(entry, dict) and entry.get("customType") == TOOL_OUTPUT_BUDGET_LABEL:
+            cuts += 1
     return {
         "pi_compactions": str(compactions),
         "pi_restated_requests": str(int(contract.get("restated_requests") or 0)),
         "pi_continuation": str(contract.get("continuation") or "none"),
         "pi_command_timeouts": str(timeouts),
+        "pi_cut_tool_results": str(cuts),
     }
 
 
@@ -801,6 +807,7 @@ class PiAgent(SimpleResponsesAPIAgent):
             cmd += ["--extension", str(TURN_LIMIT_EXTENSION)]
             env["PI_GYM_MAX_TURNS"] = str(self.config.max_turns)
         cmd += ["--extension", str(TASK_CONTRACT_EXTENSION)]
+        cmd += ["--extension", str(TOOL_OUTPUT_BUDGET_EXTENSION)]
         env["PI_GYM_ANSWER_PATTERN"] = self.config.answer_pattern or ""
         env["PI_GYM_ANSWER_FILES"] = json.dumps(self.config.answer_files)
         if self.config.request_tools:
