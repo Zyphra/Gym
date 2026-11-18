@@ -27,9 +27,10 @@ pytestmark = pytest.mark.skipif(not os.environ.get("TASK_STOCK_PI_RUNTIME"), rea
 
 
 class _Endpoint:
-    """Every request is answered with one bash call that appends to a marker file."""
+    """Every request is answered with one bash call that appends to a marker file, or, from request
+    ``text_from`` on, with a text reply."""
 
-    def __init__(self, marker: Path, extra: str = "") -> None:
+    def __init__(self, marker: Path, extra: str = "", text_from: int | None = None) -> None:
         self.requests: list[dict] = []
         endpoint = self
 
@@ -41,6 +42,7 @@ class _Endpoint:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 endpoint.requests.append(body)
                 n = len(endpoint.requests)
+                delta = {"role": "assistant", "content": f"answer {n}"}
                 call = {
                     "index": 0,
                     "id": f"call_{n}",
@@ -52,12 +54,22 @@ class _Endpoint:
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"role": "assistant", "content": "", "tool_calls": [call]},
+                                "delta": delta
+                                if text_from is not None and n >= text_from
+                                else {"role": "assistant", "content": "", "tool_calls": [call]},
                                 "finish_reason": None,
                             }
                         ]
                     },
-                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop" if text_from is not None and n >= text_from else "tool_calls",
+                            }
+                        ]
+                    },
                     {"choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}},
                 ]
                 self.send_response(200)
@@ -79,10 +91,10 @@ class _Endpoint:
         Thread(target=self.httpd.serve_forever, daemon=True).start()
 
 
-def _episode(monkeypatch, tmp_path, max_turns, extra="", **config):
+def _episode(monkeypatch, tmp_path, max_turns, extra="", text_from=None, **config):
     runtime = Path(os.environ["TASK_STOCK_PI_RUNTIME"])
     marker = tmp_path / "turns.txt"
-    endpoint = _Endpoint(marker, extra)
+    endpoint = _Endpoint(marker, extra, text_from)
     monkeypatch.setenv("PATH", f"{runtime / 'bin'}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setattr(base_agent, "get_first_server_config_dict", lambda _gc, _name: {})
     client = MagicMock(spec=ServerClient)
@@ -111,17 +123,42 @@ def _episode(monkeypatch, tmp_path, max_turns, extra="", **config):
         )
     finally:
         endpoint.httpd.shutdown()
-    return episode.response, endpoint.requests, marker.read_text().split()
+    return episode.response, endpoint.requests, marker.read_text().split() if marker.exists() else []
 
 
 def test_max_turns_ends_after_the_last_turns_tools(monkeypatch, tmp_path):
     response, requests, ran = _episode(monkeypatch, tmp_path, max_turns=3)
-    # Three requests reach the endpoint, the tools of all three turns run, and the fourth is never sent.
-    assert len(requests) == 3 and ran == ["1", "2", "3"]
+    # The tools of all three turns run; the cap request forbids tool calls, an endpoint that ignores
+    # that returns one anyway, it runs, and the fifth request is never sent.
+    assert len(requests) == 4 and ran == ["1", "2", "3", "4"]
+    assert [request.get("tool_choice") for request in requests] == [None, None, None, "none"]
+    assert requests[-1]["tools"] == requests[0]["tools"]
     assert response.error is None and response.status is None
-    assert response.metadata == {"stop_reason": "max_iterations", "pi_stop_detail": "Pi reached max_turns=3"}
-    assert [item.type for item in response.output].count("function_call") == 3
+    assert response.metadata == {
+        "stop_reason": "max_iterations",
+        "pi_stop_detail": "Pi reached max_turns=3",
+        "turn_cap_answer": "tool_call",
+    }
+    assert [item.type for item in response.output].count("function_call") == 4
     assert not _should_mask_sample(True, "max_iteration", False, None, "max_iterations")
+
+
+def test_cap_request_answer_is_the_final_text(monkeypatch, tmp_path):
+    response, requests, ran = _episode(monkeypatch, tmp_path, max_turns=3, text_from=4)
+    # Three tool turns, then the cap request: tools offered, calls forbidden, the cap message last.
+    assert len(requests) == 4 and ran == ["1", "2", "3"]
+    assert requests[-1]["tool_choice"] == "none" and requests[-1]["tools"] == requests[0]["tools"]
+    last = requests[-1]["messages"][-1]
+    text = last["content"] if isinstance(last["content"], str) else last["content"][0]["text"]
+    assert last["role"] == "user" and text.startswith("You have used all 3 turns; no turn follows this reply.")
+    assert response.error is None and response.status is None
+    assert response.metadata == {
+        "stop_reason": "max_iterations",
+        "pi_stop_detail": "Pi reached max_turns=3",
+        "turn_cap_answer": "tool_free_reply",
+    }
+    # The answer is the response's last assistant message, which graders read as the final message.
+    assert response.output[-1].type == "message" and response.output[-1].content[0].text == "answer 4"
 
 
 @pytest.mark.skipif(
@@ -136,7 +173,7 @@ def test_hidden_harness_mounts_are_empty_for_pi_bash(monkeypatch, tmp_path):
         listing = f"; ls -A {mount} | wc -l"
         response, _, ran = _episode(monkeypatch, tmp_path, 1, listing, hide_harness_mounts=True)
         output = [item.output for item in response.output if item.type == "function_call_output"]
-        assert ran == ["1"] and output[0].strip() == "0"
+        assert ran == ["1", "2"] and output[0].strip() == "0"
         (tmp_path / "plain").mkdir()
         response, _, _ = _episode(monkeypatch, tmp_path / "plain", 1, listing)
         output = [item.output for item in response.output if item.type == "function_call_output"]
