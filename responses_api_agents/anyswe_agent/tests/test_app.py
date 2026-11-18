@@ -1633,6 +1633,8 @@ async def test_expected_budget_stop_keeps_graded_patch(
     [
         (True, "exec", "diff --git a/fixed.txt b/fixed.txt\n+fixed\n", 1.0, False),
         (True, "runner", "diff --git a/fixed.txt b/fixed.txt\n+fixed\n", 1.0, False),
+        (True, "runner", "diff --git a/fixed.txt b/fixed.txt\n+wrong\n", 0.0, False),
+        (True, "runner", "", 0.0, False),
         (True, "exec", "", 0.0, False),
         (False, "exec", "diff --git a/fixed.txt b/fixed.txt\n+fixed\n", 1.0, True),
     ],
@@ -1668,7 +1670,11 @@ async def test_agent_wall_grades_the_patch_it_left(
         parallel_tool_calls=False,
         tool_choice="auto",
         tools=[],
-        metadata={"agent_wall_timeout": "true"} if wall == "runner" else None,
+        status="failed" if wall == "runner" else None,
+        error={"code": "server_error", "message": "Harness exception: TimeoutError"} if wall == "runner" else None,
+        metadata={"agent_wall_timeout": "true", "runner_exception": "true", "model_transport_error": "true"}
+        if wall == "runner"
+        else None,
     )
 
     class WallSandbox:
@@ -1697,7 +1703,7 @@ async def test_agent_wall_grades_the_patch_it_left(
 
     async def grade(self, params, received):
         graded.append(received)
-        return True, None, None
+        return received.endswith("+fixed\n"), None, None
 
     monkeypatch.setattr(app_module, "AsyncSandbox", WallSandbox)
     monkeypatch.setattr(AnySweSandboxRunner, "_grade_sandbox_patch", grade)
@@ -1708,6 +1714,10 @@ async def test_agent_wall_grades_the_patch_it_left(
     assert result.agent_timed_out is (not grades_workspace)
     assert result.agent_budget_exhausted is grades_workspace
     assert result.patch_exists is bool(patch)
+    if grades_workspace:
+        assert result.error_kind is None
+        assert result.response.status != "failed"
+        assert result.response.error is None
 
 
 def test_agent_timeout_grades_workspace_is_strict_and_off_by_default() -> None:
