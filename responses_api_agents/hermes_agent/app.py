@@ -288,7 +288,11 @@ def _answer_at_turn_cap(agent: Any) -> Callable[[], Optional[str]]:
             source = "summary"
             return text
         source = "none"
-        if not (isinstance(last, dict) and last.get("role") == "user" and last.get("content") == MAX_ITERATIONS_SUMMARY_REQUEST):
+        if not (
+            isinstance(last, dict)
+            and last.get("role") == "user"
+            and last.get("content") == MAX_ITERATIONS_SUMMARY_REQUEST
+        ):
             # Hermes' request failed (its own failure copy) or the endpoint ended the episode.
             return text
         try:

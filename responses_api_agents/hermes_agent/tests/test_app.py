@@ -785,7 +785,9 @@ class TestTurnCapAnswer:
         return self._run(monkeypatch, tmp_path, [first, *cap_replies], max_turns=1, **config_kwargs)
 
     def test_a_text_cap_reply_is_hermes_own_summary(self, monkeypatch, tmp_path) -> None:
-        episode, requests = self._cap_run(monkeypatch, tmp_path, [{"role": "assistant", "content": "The answer is 42."}])
+        episode, requests = self._cap_run(
+            monkeypatch, tmp_path, [{"role": "assistant", "content": "The answer is 42."}]
+        )
         assert len(requests) == 2 and self._CAP in json.dumps(requests[1]["messages"][-1])
         assert episode.response.output[-1].content[0].text == "The answer is 42."
         assert episode.response.metadata["stop_reason"] == "max_iterations"
