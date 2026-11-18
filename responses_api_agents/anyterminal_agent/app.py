@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -915,8 +916,37 @@ PRIVATE_VERIFIER_MARKER = "NEMO_GYM_PRIVATE_VERIFIER "
 PRIVATE_VERIFIER_RECEIPT = "private-verifier.json"
 
 
-def _private_verifier_command(command: str) -> str:
-    return f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} {shlex.quote(command)}"
+STAGED_TESTS = "/trajectories_mount/staging/tests"
+
+
+def _private_verifier_command(command: str, tests_manifest_sha256: Optional[str] = None) -> str:
+    tests = "" if tests_manifest_sha256 is None else f"--tests {STAGED_TESTS} {tests_manifest_sha256} "
+    return f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} {tests}{shlex.quote(command)}"
+
+
+def tests_manifest(source: Path, extra: Optional[dict[str, tuple[bytes, int]]] = None) -> bytes:
+    """The host's description of a task's tests, read from its pristine source.
+
+    The private verifier copies exactly these files into its own ``/tests`` and refuses any
+    whose staged bytes differ, so nothing a sandbox process staged reaches the grader.
+    ``extra`` adds host-held files (path -> bytes, mode) staged beside the source's.
+    """
+    directories, links, files = [], [], []
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source).as_posix()
+        if path.is_symlink():
+            links.append({"path": relative, "target": os.readlink(path)})
+        elif path.is_dir():
+            directories.append(relative)
+        else:
+            data = path.read_bytes()
+            mode = stat.S_IMODE(path.stat().st_mode)
+            files.append(
+                {"path": relative, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mode": mode}
+            )
+    for relative, (data, mode) in sorted((extra or {}).items()):
+        files.append({"path": relative, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mode": mode})
+    return json.dumps({"directories": directories, "links": links, "files": files}, sort_keys=True).encode()
 
 
 def _relative_parts(path: str) -> list[str]:
@@ -963,6 +993,8 @@ def _write_private_outputs(stdout: Optional[str], return_code: Optional[int], cf
         raise RuntimeError(f"private verifier setup failed: {report['setup']}")
     if return_code != 0:
         raise RuntimeError(f"private verifier exited {return_code} after a report; it is not graded")
+    if report.get("integrity"):
+        raise VerifierIntegrityRefused("; ".join(report["integrity"]))
     for entry in report["files"]:
         parts = _relative_parts(entry["path"])
         if "data" in entry:
@@ -1535,6 +1567,17 @@ class RunTerminalAgent(BaseModel):
         if extension_runtime.sha256(target) != receipt["output_sha256"]:
             raise RuntimeError("restaged stock extension differs")
 
+    def _write_tests_manifest(self, cfg: AnyTerminalInstanceConfig) -> str:
+        """Describe the tests test.sh may run, from the host's own copies; return the digest."""
+        receipt = self._prepared_extension
+        extra = None
+        if receipt is not None:
+            extra = {receipt["output"].removeprefix("tests/"): (self._prepared_extension_bytes, 0o444)}
+        manifest = tests_manifest(Path(cfg.problem_info["task_dir"]) / "tests", extra)
+        (cfg.persistent_dir / "staging").mkdir(parents=True, exist_ok=True)
+        (cfg.persistent_dir / "staging" / "tests-manifest.json").write_bytes(manifest)
+        return hashlib.sha256(manifest).hexdigest()
+
     async def _exec_verifier(
         self, sandbox: AsyncSandbox, command: str, *, env: dict[str, str] | None, timeout_s: int | float
     ):
@@ -1656,16 +1699,19 @@ class RunTerminalAgent(BaseModel):
         task_env = task_verifier_environment(Path(cfg.problem_info["task_dir"]), cfg.verifier_environment)
         if task_env or cfg.verifier_forwarded_environment:
             verifier_env = {**cfg.verifier_forwarded_environment, **task_env, **(verifier_env or {})}
+        private = self._uses_bind_mounts(cfg)
+        # The private verifier brings its own verified /tests; others read the staged tree.
+        link_tests = "" if private else "rm -rf /tests && ln -s /trajectories_mount/staging/tests /tests && "
         test_cmd = (
             (
                 "readlink /proc/self/ns/net > /logs/verifier/network-namespace.txt && "
                 if cfg.task_network is not None
                 else ""
             )
-            + "rm -rf /tests && ln -s /trajectories_mount/staging/tests /tests && "
+            + link_tests
             # A minimal pytest.ini at / stops pytest from picking up Gym's pyproject.toml
             # (whose --pyargs breaks paths inside the sandbox).
-            "printf '[pytest]\\naddopts =\\n' > /pytest.ini && "
+            + "printf '[pytest]\\naddopts =\\n' > /pytest.ini && "
             "mkdir -p /logs/verifier && bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
         )
         if receipt is not None:
@@ -1695,11 +1741,10 @@ class RunTerminalAgent(BaseModel):
             }
             test_cmd = "bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
         command = _apt_root_sandbox(cfg) + test_cmd
-        private = self._uses_bind_mounts(cfg)
         if private:
             # Agent processes may outlive the agent phase to serve the tests; none of them
-            # sees the directory test.sh writes its reward into.
-            command = _private_verifier_command(command)
+            # sees the directory test.sh writes its reward into or the tests it runs.
+            command = _private_verifier_command(command, self._write_tests_manifest(cfg))
         result = await self._exec_verifier(sandbox, command, timeout_s=cfg.tb_eval_timeout, env=verifier_env)
         return_code = result.return_code
         if private and result.error_type is None:

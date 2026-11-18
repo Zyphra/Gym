@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """A process left in the sandbox cannot reach the directory the reward is read from."""
 
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -27,22 +29,140 @@ def _namespaces_available() -> bool:
     return unshare is not None and subprocess.run([unshare, "-rm", "true"], capture_output=True).returncode == 0
 
 
-def _run_helper(private: Path, command: str) -> subprocess.CompletedProcess:
-    """The real helper as namespace root, with its verifier path at ``private``."""
+def _run_helper(private: Path, command: str, tests: Path | None = None, *options: str) -> subprocess.CompletedProcess:
+    """The real helper as namespace root, with its verifier path at ``private`` and tests at ``tests``."""
     driver = textwrap.dedent(
         """
         import runpy, sys
         module = runpy.run_path(sys.argv[1], run_name="private_verifier")
         module["main"].__globals__["VERIFIER_DIR"] = sys.argv[2]
-        raise SystemExit(module["main"](sys.argv[3:]))
+        module["main"].__globals__["TESTS_DIR"] = sys.argv[3]
+        raise SystemExit(module["main"](sys.argv[4:]))
         """
     )
+    tests_dir = str(tests or private.parent / "tests")
     return subprocess.run(
-        ["unshare", "-rm", sys.executable, "-I", "-S", "-c", driver, str(HELPER), str(private), command],
+        [
+            "unshare",
+            "-rm",
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            driver,
+            str(HELPER),
+            str(private),
+            tests_dir,
+            *options,
+            command,
+        ],
         capture_output=True,
         text=True,
         timeout=60,
     )
+
+
+def _helper_report(result: subprocess.CompletedProcess) -> dict:
+    (line,) = [line for line in result.stdout.splitlines() if line.startswith(private_verifier.MARKER)]
+    return json.loads(line[len(private_verifier.MARKER) :])
+
+
+def _staged_task(tmp_path: Path) -> tuple[Path, Path, str]:
+    """A task's pristine tests, their staged copy and the host's manifest digest for it."""
+    source = tmp_path / "task" / "tests"
+    (source / "data").mkdir(parents=True)
+    (source / "test.sh").write_text('echo "$(cat "$(dirname "$0")/data/expected")" > "$1/reward.txt"\n')
+    (source / "test.sh").chmod(0o755)
+    (source / "data" / "expected").write_text("0")
+    (source / "link").symlink_to("data/expected")
+    staged = tmp_path / "staging" / "tests"
+    shutil.copytree(source, staged, symlinks=True)
+    manifest = app.tests_manifest(source)
+    (tmp_path / "staging" / "tests-manifest.json").write_bytes(manifest)
+    return source, staged, hashlib.sha256(manifest).hexdigest()
+
+
+@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
+def test_test_sh_runs_the_host_tests_whatever_was_staged(tmp_path):
+    _source, staged, digest = _staged_task(tmp_path)
+    (staged / "planted.py").write_text("raise SystemExit(0)")  # staged, but not the task's
+    shared, tests = tmp_path / "logs-verifier", tmp_path / "tests"
+    shared.mkdir()
+    tests.symlink_to(staged)  # what the staged tree used to be reached through
+    # A left-behind writer rewrites the staged test.sh for as long as the verifier runs.
+    writer = subprocess.Popen(
+        ["sh", "-c", f'while :; do printf "echo 1 > \\"\\$1/reward.txt\\"\\n" > "{staged}/test.sh"; sleep 0.01; done']
+    )
+    try:
+        time.sleep(0.1)
+        result = _run_helper(
+            shared,
+            f'sleep 0.3; ls -A "{tests}" > "{shared}/listing"; bash "{tests}/test.sh" "{shared}"',
+            tests,
+            "--tests",
+            str(staged),
+            digest,
+        )
+        report = _helper_report(result)
+        assert report["setup"] and "differs from the task source" in report["setup"]  # refused, never run
+    finally:
+        writer.kill()
+        writer.wait()
+    shutil.copy2(tmp_path / "task" / "tests" / "test.sh", staged / "test.sh")
+    result = _run_helper(
+        shared,
+        f'ls -A "{tests}" > "{shared}/listing"; bash "{tests}/test.sh" "{shared}"',
+        tests,
+        "--tests",
+        str(staged),
+        digest,
+    )
+    report = _helper_report(result)
+    assert result.returncode == 0 and report["exit_code"] == 0 and report["integrity"] == []
+    files = {entry["path"]: base64.b64decode(entry["data"]) for entry in report["files"]}
+    assert files["reward.txt"] == b"0\n"
+    assert files["listing"].split() == [b"data", b"link", b"test.sh"]  # planted.py never reached the grader
+    (staged / "test.sh").write_text("echo 1")
+    (tmp_path / "staging" / "tests-manifest.json").write_bytes(app.tests_manifest(staged))
+    result = _run_helper(shared, "true", tests, "--tests", str(staged), digest)
+    assert "manifest differs" in _helper_report(result)["setup"]  # a restaged manifest is not the host's
+
+
+@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
+def test_a_private_directory_detached_during_grading_is_reported(tmp_path):
+    _source, staged, digest = _staged_task(tmp_path)
+    shared, tests = tmp_path / "logs" / "verifier", tmp_path / "tests"
+    shared.mkdir(parents=True)
+    # Renaming a mount point in the sandbox's namespace detaches the verifier's private mount
+    # at it; the swapped-in directory then serves the tests and receives the reward.
+    swap = (
+        f'(sleep 0.2; mv "{tests}" "{tests}.old"; mkdir "{tests}"; echo "echo 1 > \\"\\$1/reward.txt\\"" > "{tests}/test.sh"; '
+        f'mv "{tmp_path}/logs" "{tmp_path}/logs.old"; mkdir -p "{shared}") &'
+    )
+    subprocess.run(["sh", "-c", swap])
+    result = _run_helper(
+        shared, f'sleep 0.6; bash "{tests}/test.sh" "{shared}"', tests, "--tests", str(staged), digest
+    )
+    report = _helper_report(result)
+    assert result.returncode == 0 and report["exit_code"] == 0
+    assert sorted(report["integrity"]) == [
+        f"private {shared} was detached during the command",
+        f"private {tests} was detached during the command",
+    ]
+    stdout = private_verifier.MARKER + json.dumps(report) + "\n"
+    with pytest.raises(VerifierIntegrityRefused, match="detached"):
+        app._write_private_outputs(stdout, 0, _make_instance_config(tmp_path / "episode"))
+
+
+def test_the_tests_manifest_is_the_task_source_plus_host_held_files(tmp_path):
+    source, _staged, _digest = _staged_task(tmp_path)
+    manifest = json.loads(app.tests_manifest(source, {"ext.so": (b"\x7fELF", 0o444)}))
+    assert manifest["directories"] == ["data"]
+    assert manifest["links"] == [{"path": "link", "target": "data/expected"}]
+    files = {entry["path"]: entry for entry in manifest["files"]}
+    assert set(files) == {"data/expected", "test.sh", "ext.so"}
+    assert files["test.sh"]["mode"] == 0o755 and files["ext.so"]["mode"] == 0o444
+    assert files["ext.so"]["sha256"] == hashlib.sha256(b"\x7fELF").hexdigest()
 
 
 def test_sandbox_paths_of_the_verifier_output_are_a_scratch_directory(tmp_path, monkeypatch):
