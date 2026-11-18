@@ -343,3 +343,37 @@ def test_rejected_summary_policy_calls_are_counted(monkeypatch, tmp_path, summar
     assert response.status in ("completed", "incomplete")
     assert len(summaries) == summary_requests, f"upstream sent {len(summaries)} summary requests"
     assert {path for path, _ in summaries + mains} == {"/ng-rollout/rollout-f/v1/chat/completions"}
+
+
+def test_observed_conversation_keeps_what_real_compaction_dropped(monkeypatch, tmp_path):
+    native_agents: list = []
+    bundles: list = []
+    with _PolicyFixture(_SUMMARY_OK, main_turns=[_todo_turn("call_a")]) as policy:
+        app = _agent(tmp_path, monkeypatch, policy.server.server_port, native_agents, enabled_toolsets=["todo"])
+
+        async def exercise():
+            return await app._create_response(
+                NeMoGymResponseCreateParamsNonStreaming(input=_long_history_input()),
+                rollout_id="rollout-a",
+                observation_collector=bundles.append,
+            )
+
+        response = asyncio.run(exercise())
+        assert policy.summaries()
+
+    # Hermes' own compaction replaced part of the long history with a summary in the last request ...
+    last = json.dumps(policy.mains()[-1][1]["messages"])
+    dropped = [index for index in range(34) if f"history message {index}:" not in last]
+    assert dropped
+    # ... and the observed root conversation still holds every message of the run, in order, then the run's own turns.
+    [bundle] = bundles
+    root = next(
+        record
+        for record in bundle.records
+        if getattr(record, "invocation_id", None) == "root" and getattr(record, "kind", None) == "agent_invocation"
+    )
+    texts = json.dumps([item.model_dump(mode="json") for item in root.conversation])
+    positions = [texts.index(f"history message {index}:") for index in range(34)]
+    assert positions == sorted(positions)
+    assert "call_a" in texts and texts.index("call_a") > positions[-1]
+    assert MAIN_TEXT in texts and response.status == "completed"

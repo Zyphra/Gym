@@ -100,6 +100,22 @@ def normalize_hermes_messages(messages: Iterable[Any], *, id_prefix: str = "herm
     return output
 
 
+def _uncompacted(compacted: list[tuple[list[Any], int]], final: list[Any]) -> list[Any]:
+    """The whole conversation of a run whose context Hermes compacted.
+
+    Hermes replaces its message list at each compaction (a kept head, a summary and a recent tail)
+    and only appends afterwards, so every message the run produced is either in a compaction's input
+    past the list the previous compaction returned, or in the final list past the last one.
+    """
+    if not compacted:
+        return list(final)
+    whole = list(compacted[0][0])
+    for (_, kept), (before, _) in zip(compacted, compacted[1:]):
+        whole.extend(before[kept:])
+    whole.extend(final[compacted[-1][1] :])
+    return whole
+
+
 class _ObservedChildren(list):
     def __init__(self, values: Iterable[Any], observer: "HermesAgentObserver", parent_id: str):
         super().__init__(values)
@@ -131,6 +147,8 @@ class HermesAgentObserver:
         self._started_ticks: dict[tuple[str, str], float] = {}
         self._invocations = {root_invocation_id: AgentInvocation(invocation_id=root_invocation_id)}
         self._compactions: list[ContextCompactionObservation] = []
+        # Per invocation: each completed compaction's input messages and the length of the list it returned.
+        self._compacted: dict[str, list[tuple[list[Any], int]]] = {}
         self._gaps: list[ObservationGap] = []
 
     def instrument(self, agent: Any) -> "HermesAgentObserver":
@@ -304,13 +322,19 @@ class HermesAgentObserver:
 
         def compact(*args: Any, **kwargs: Any) -> Any:
             failed = False
+            messages = args[0] if args else kwargs.get("messages")
+            before = list(messages) if isinstance(messages, list) else None
             try:
                 result = original(*args, **kwargs)
+                kept = result[0] if isinstance(result, tuple) and result else None
+                if before is not None and isinstance(kept, list):
+                    with self._lock:
+                        self._compacted.setdefault(invocation_id, []).append((before, len(kept)))
             except BaseException:
                 failed = True
                 raise
             finally:
-                before = kwargs.get("approx_tokens")
+                tokens_before = kwargs.get("approx_tokens")
                 try:
                     after = None
                     if not failed:
@@ -323,7 +347,7 @@ class HermesAgentObserver:
                                 invocation_id=invocation_id,
                                 observed_at=time(),
                                 trigger="context_pressure",
-                                tokens_before=before if type(before) is int else None,
+                                tokens_before=tokens_before if type(tokens_before) is int else None,
                                 tokens_after=after,
                                 outcome="failed" if failed else "completed",
                             )
@@ -423,7 +447,10 @@ class HermesAgentObserver:
     ) -> None:
         try:
             messages = result.get("messages") if isinstance(result, dict) else []
-            conversation = normalize_hermes_messages(messages or [], id_prefix=invocation_id)
+            with self._lock:
+                compacted = list(self._compacted.get(invocation_id, ()))
+            messages = _uncompacted(compacted, messages or [])
+            conversation = normalize_hermes_messages(messages, id_prefix=invocation_id)
             if any(isinstance(message, dict) and message.get("reasoning_details") for message in messages or []):
                 self._gap("reasoning_details_unavailable", invocation_id)
             if (
