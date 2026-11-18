@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import base64
 import hashlib
 import importlib
 import json
@@ -62,6 +63,7 @@ from responses_api_agents.anyterminal_agent.continue_until_timeout import (
     task_continues_until_timeout,
 )
 from responses_api_agents.anyterminal_agent.task_network import TaskNetwork
+from responses_api_agents.anyterminal_agent.verifier_integrity import VerifierIntegrityRefused
 
 
 # The harness runner's response.json carries its observation bundle under this key; the Agent Server
@@ -820,6 +822,20 @@ class AnyTerminalInstanceConfig(AnyTerminalAgentConfig, AnyTerminalServerConfig)
         return self.problem_info.get("task_name", self.problem_info.get("instance_id", "unknown"))
 
     @property
+    def sandbox_verifier_dir(self) -> Path:
+        """What sandbox processes see at ``/logs/verifier``; ``verifier_dir`` stays host-only."""
+        return self.persistent_dir.with_name(self.persistent_dir.name + ".sandbox-verifier")
+
+    def host_only_dir(self, name: str) -> Path:
+        """Where the episode's ``name`` directory lives until the sandbox stopped.
+
+        ``persistent_dir`` is the sandbox's ``/trajectories_mount``, so a sandbox process that
+        unmounts a cover there reaches anything below it. Grader outputs stay in this sibling
+        while the sandbox runs and are published below ``persistent_dir`` afterwards.
+        """
+        return self.persistent_dir.with_name(f"{self.persistent_dir.name}.{name}")
+
+    @property
     def instance_id(self) -> str:
         return self.problem_info.get("instance_id", self.task_name)
 
@@ -892,6 +908,129 @@ def _apt_root_sandbox(cfg: AnyTerminalInstanceConfig) -> str:
     )
 
 
+# test.sh runs through this program, from the read-only Gym and agent-runtime binds.
+PRIVATE_VERIFIER_PYTHON = "/agent_deps_mount/bin/python"
+PRIVATE_VERIFIER = "/nemo_gym_mount/responses_api_agents/anyterminal_agent/private_verifier.py"
+PRIVATE_VERIFIER_MARKER = "NEMO_GYM_PRIVATE_VERIFIER "
+PRIVATE_VERIFIER_RECEIPT = "private-verifier.json"
+
+
+def _private_verifier_command(command: str) -> str:
+    return f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} {shlex.quote(command)}"
+
+
+def _relative_parts(path: str) -> list[str]:
+    parts = path.split("/")
+    if not path or path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        raise VerifierIntegrityRefused(f"verifier output path is not relative: {path!r}")
+    return parts
+
+
+def _open_beneath(root: Path, parts: list[str], flags: int, mode: int = 0o644, create_parents: bool = False) -> int:
+    """Open ``root/parts`` without following a link at any component."""
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for part in parts[:-1]:
+            if create_parents:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=directory)
+                except FileExistsError:
+                    pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        return os.open(parts[-1], flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=directory)
+    finally:
+        os.close(directory)
+
+
+def _write_private_outputs(stdout: Optional[str], return_code: Optional[int], cfg: AnyTerminalInstanceConfig) -> dict:
+    """Write the private ``/logs/verifier`` into ``verifier_dir`` from the verifier's own report.
+
+    The report is the helper's only if it is the one report on its stdout and the helper then
+    exited 0; a sandbox process that can reach the helper could print another one or kill it.
+    Small outputs come inline in the report. Larger ones were copied into the sandbox's
+    shared directory and are admitted only with the size and sha256 the report gives.
+    """
+    started = time.monotonic()
+    lines = [line for line in (stdout or "").splitlines() if line.startswith(PRIVATE_VERIFIER_MARKER)]
+    if len(lines) > 1:
+        raise VerifierIntegrityRefused(f"private verifier output carries {len(lines)} reports")
+    if not lines:
+        raise RuntimeError("private verifier wrote no report")
+    report = json.loads(lines[0][len(PRIVATE_VERIFIER_MARKER) :])
+    if report.get("setup") is not None:
+        raise RuntimeError(f"private verifier setup failed: {report['setup']}")
+    if return_code != 0:
+        raise RuntimeError(f"private verifier exited {return_code} after a report; it is not graded")
+    for entry in report["files"]:
+        parts = _relative_parts(entry["path"])
+        if "data" in entry:
+            data = base64.b64decode(entry["data"], validate=True)
+        else:
+            try:
+                fd = _open_beneath(cfg.sandbox_verifier_dir, parts, os.O_RDONLY)
+            except OSError as error:
+                raise VerifierIntegrityRefused(f"verifier output {entry['path']} is unreadable: {error}") from None
+            with os.fdopen(fd, "rb") as stream:
+                data = stream.read()
+        if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            raise VerifierIntegrityRefused(f"verifier output {entry['path']} differs from what test.sh wrote")
+        fd = _open_beneath(
+            cfg.verifier_dir, parts, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, entry["mode"] & 0o777, create_parents=True
+        )
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+    for link in report["links"]:
+        parts = _relative_parts(link["path"])
+        target = cfg.verifier_dir.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        target.symlink_to(link["target"])
+    receipt = {key: value for key, value in report.items() if key != "files"}
+    receipt["files"] = [{key: value for key, value in entry.items() if key != "data"} for entry in report["files"]]
+    receipt["host_s"] = round(time.monotonic() - started, 4)
+    (cfg.verifier_dir / PRIVATE_VERIFIER_RECEIPT).write_text(json.dumps(receipt))
+    return receipt
+
+
+def interim_snapshot(cfg: AnyTerminalInstanceConfig, phase: int) -> Path:
+    """An interim verifier's outputs, host-only while the sandbox runs."""
+    return cfg.host_only_dir("interim_verifier") / f"phase-{phase:04d}"
+
+
+def _publish_host_only_outputs(cfg: AnyTerminalInstanceConfig) -> None:
+    """Move the host-only grader outputs to their episode paths once no sandbox process is left.
+
+    Whatever a sandbox process put at a published path is kept beside it as ``*.sandbox-written``.
+    """
+    for name, target in (
+        ("verifier", cfg.verifier_dir),
+        ("interim_verifier", cfg.persistent_dir / "interim_verifier"),
+    ):
+        source = cfg.host_only_dir(name)
+        if source == target or not source.is_dir() or source.is_symlink():
+            continue
+        if target.is_symlink() or target.exists():
+            if target.is_dir() and not target.is_symlink() and not any(target.iterdir()):
+                target.rmdir()
+            else:
+                os.replace(target, target.with_name(f"{target.name}.sandbox-written"))
+        os.replace(source, target)
+
+
+def _verifier_binds(params: AnyTerminalInstanceConfig) -> list[str]:
+    """Sandbox processes see a scratch directory at both sandbox paths of the verifier output.
+
+    ``test.sh`` writes its outputs in a private mount namespace (``private_verifier.py``) and
+    the host writes them into ``verifier_dir``, which no sandbox path reaches.
+    """
+    return [
+        f"{params.sandbox_verifier_dir}:/logs/verifier",
+        f"{params.sandbox_verifier_dir}:/trajectories_mount/verifier",
+    ]
+
+
 def _build_provider(params: AnyTerminalInstanceConfig):
     """Build a sandbox provider with the per-instance mounts the run needs.
 
@@ -909,7 +1048,7 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 f"{params.persistent_dir}:/trajectories_mount",
                 f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
                 f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-                f"{params.verifier_dir}:/logs/verifier",
+                *_verifier_binds(params),
                 *verifier_binds,
             ],
             task_network=params.task_network,
@@ -936,7 +1075,7 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 f"{params.persistent_dir}:/trajectories_mount",
                 f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
                 f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-                f"{params.verifier_dir}:/logs/verifier",
+                *_verifier_binds(params),
             ]
             + verifier_binds
         )
@@ -998,9 +1137,8 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
                 "-v",
                 f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-                "-v",
-                f"{params.verifier_dir}:/logs/verifier",
             ]
+            + [arg for bind in _verifier_binds(params) for arg in ("-v", bind)]
             + [arg for bind in verifier_binds for arg in ("-v", bind)],
         ),
     )
@@ -1248,7 +1386,7 @@ class RunTerminalAgent(BaseModel):
                     reward = None
                 except OSError:
                     reward = None
-            snapshot = cfg.persistent_dir / "interim_verifier" / f"phase-{phase:04d}"
+            snapshot = interim_snapshot(cfg, phase)
             snapshot.parent.mkdir(exist_ok=True)
             shutil.copytree(cfg.verifier_dir, snapshot, symlinks=True, ignore_dangling_symlinks=True)
             (snapshot / "dispatch.json").write_text(
@@ -1556,21 +1694,39 @@ class RunTerminalAgent(BaseModel):
                 "NEMO_VERIFIER_ATTESTATION": json.dumps(attestation, sort_keys=True),
             }
             test_cmd = "bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
-        result = await self._exec_verifier(
-            sandbox, _apt_root_sandbox(cfg) + test_cmd, timeout_s=cfg.tb_eval_timeout, env=verifier_env
-        )
-        if receipt is not None and result.return_code == 125:
+        command = _apt_root_sandbox(cfg) + test_cmd
+        private = self._uses_bind_mounts(cfg)
+        if private:
+            # Agent processes may outlive the agent phase to serve the tests; none of them
+            # sees the directory test.sh writes its reward into.
+            command = _private_verifier_command(command)
+        result = await self._exec_verifier(sandbox, command, timeout_s=cfg.tb_eval_timeout, env=verifier_env)
+        return_code = result.return_code
+        if private and result.error_type is None:
+            # The helper exits 0 after its report; the report carries test.sh's own status.
+            return_code = _write_private_outputs(result.stdout, result.return_code, cfg)["exit_code"]
+        if receipt is not None and return_code == 125:
             raise RuntimeError("prepared stock interpreter attestation failed")
-        if result.return_code != 0:
-            print(f"[{cfg.task_name}] eval exit {result.return_code}: {(result.stderr or '')[-2000:]}", flush=True)
+        if return_code != 0:
+            print(f"[{cfg.task_name}] eval exit {return_code}: {(result.stderr or '')[-2000:]}", flush=True)
         return (
             time.time() - t0,
             result.error_type == "timeout",
-            result.return_code,
+            return_code,
             result.error_type,
         )
 
     async def process_single_datapoint(self) -> bool:
+        """Grade the episode into host-only directories; publish them after the sandbox stopped."""
+        cfg = self.config
+        self.config = cfg.model_copy(update={"verifier_dir": cfg.host_only_dir("verifier")})
+        try:
+            return await self._process_single_datapoint()
+        finally:
+            self.config = cfg
+            _publish_host_only_outputs(cfg)
+
+    async def _process_single_datapoint(self) -> bool:
         from core.sandbox.memory_evidence import memory_event_delta, sandbox_memory_snapshot
 
         from responses_api_agents.anyterminal_agent.verifier_integrity import (
@@ -1580,6 +1736,8 @@ class RunTerminalAgent(BaseModel):
 
         cfg = self.config
         cfg.verifier_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(cfg.sandbox_verifier_dir, ignore_errors=True)
+        cfg.sandbox_verifier_dir.mkdir(parents=True)
         (cfg.persistent_dir / "staging").mkdir(parents=True, exist_ok=True)
         continues = cfg.continue_until_timeout and task_continues_until_timeout(Path(cfg.problem_info["task_dir"]))
         t0 = time.time()
@@ -1696,6 +1854,7 @@ class RunTerminalAgent(BaseModel):
                             integrity_problem = f"{type(e).__name__}: {e}"[:512]
                             print(f"[{cfg.task_name}] verifier receipt refused: {integrity_problem}", flush=True)
             shutil.rmtree(cfg.persistent_dir / "staging", ignore_errors=True)
+            shutil.rmtree(cfg.sandbox_verifier_dir, ignore_errors=True)
 
         total_run_time = time.time() - t0
         memory_events = sandbox_memory_events(sandbox)
