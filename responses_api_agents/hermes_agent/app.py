@@ -244,6 +244,70 @@ def _offer_finish_tool(agent: Any) -> Callable[[], bool]:
     return lambda: message is not None
 
 
+def _answer_at_turn_cap(agent: Any) -> Callable[[], Optional[str]]:
+    """End a run that reached its turn cap on the policy's answer.
+
+    At the cap Hermes asks once more for a final reply (``agent/chat_completion_helpers.py``
+    ``handle_max_iterations``) and keeps the tools offered so the request extends the cached
+    context. It discards every tool call in that reply (``_summary_text``), retries once, and
+    otherwise ends on ``"I reached the iteration limit and couldn't generate a summary."``:
+    a policy that answers the cap request with a call loses its answer. When that happens,
+    the same request is sent once more with tool calls forbidden (``tool_choice: "none"``,
+    tools still offered, as simple_agent's ``final_answer_after_max_steps``), and its text
+    is the final reply. Hermes' own reply is kept whenever it has text.
+
+    Returns how the capped run's answer was obtained: ``"summary"`` (Hermes' cap reply),
+    ``"tool_free_reply"`` (the reply with calls forbidden), ``"none"``, or None before the cap.
+    """
+    from agent.chat_completion_helpers import (  # pyright: ignore[reportMissingImports]
+        _iteration_summary_api_messages,
+    )
+    from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST  # pyright: ignore[reportMissingImports]
+    from agent.message_metadata import append_message  # pyright: ignore[reportMissingImports]
+
+    handle_max_iterations = getattr(agent, "_handle_max_iterations", None)
+    source: Optional[str] = None
+    if handle_max_iterations is None:
+        return lambda: source
+
+    def tool_free_reply(messages: list) -> str:
+        kwargs = agent._build_api_kwargs(_iteration_summary_api_messages(agent, messages))
+        kwargs["tool_choice"] = "none"
+        response = agent._interruptible_api_call(kwargs)
+        if _endpoint_stop(response):
+            return ""
+        normalized = agent._get_transport().normalize_response(response)
+        text = normalized.content or ""
+        return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+
+    def summary_or_tool_free_reply(messages, api_call_count):
+        nonlocal source
+        text = handle_max_iterations(messages, api_call_count)
+        last = messages[-1] if messages else None
+        if isinstance(last, dict) and last.get("role") == "assistant" and last.get("content") == text:
+            source = "summary"
+            return text
+        source = "none"
+        if not (isinstance(last, dict) and last.get("role") == "user" and last.get("content") == MAX_ITERATIONS_SUMMARY_REQUEST):
+            # Hermes' request failed (its own failure copy) or the endpoint ended the episode.
+            return text
+        try:
+            reply = tool_free_reply(messages)
+        except InterruptedError:
+            raise
+        except Exception:
+            LOG.exception("tool-free reply at the turn cap failed")
+            return text
+        if not reply:
+            return text
+        source = "tool_free_reply"
+        append_message(messages, {"role": "assistant", "content": reply})
+        return reply
+
+    agent._handle_max_iterations = summary_or_tool_free_reply
+    return lambda: source
+
+
 def _endpoint_stop(response: Any) -> bool:
     """The serving endpoint's episode stop: an empty assistant message with a named stop reason.
 
@@ -592,6 +656,9 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # dependency closure). Each episode then runs in one process of that runtime
     # (runtime_runner.py), for a server whose own Python has no Hermes.
     hermes_runtime: Optional[str] = None
+    # Hermes' agent.budget_warning_ratio: once this fraction of max_turns is used, Hermes appends its
+    # one-shot iteration-budget notice to the newest tool result. None keeps Hermes' default (off).
+    budget_warning_ratio: float | None = Field(default=None, gt=0, lt=1, allow_inf_nan=False)
     # Environment for Hermes, e.g. HERMES_REDACT_SECRETS.
     agent_environment: dict[str, str] = Field(default_factory=dict)
 
@@ -675,7 +742,14 @@ class HermesAgent(SimpleResponsesAPIAgent):
             # run's route is the rollout URL it is given (a provider name here would not match it).
             "model": self._model_name(),
             "toolsets": ["hermes-cli"],
-            "agent": {"max_turns": self.config.max_turns},
+            "agent": {
+                "max_turns": self.config.max_turns,
+                **(
+                    {"budget_warning_ratio": self.config.budget_warning_ratio}
+                    if self.config.budget_warning_ratio is not None
+                    else {}
+                ),
+            },
             "memory": {
                 "memory_enabled": False,
                 "user_profile_enabled": False,
@@ -909,6 +983,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
                 raise ValueError("Hermes request tools need the resources server")
             _offer_request_tools(offered, task_id, resources_url, cookie)
         ended_by_endpoint, endpoint_stop_seen = _observe_endpoint_stop(agent)
+        cap_answer = _answer_at_turn_cap(agent)
         finished_by_tool = _offer_finish_tool(agent) if self.config.finish_tool else None
         if self.config.finish_tool:
             offered = [*offered, {"type": "function", "function": FINISH_TOOL_SCHEMA}]
@@ -1076,6 +1151,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             # Hermes' iteration cap (its run returns completed=False after the budget summary turn):
             # OpenHands' label for the same stop, so AnySWE classifies it as an expected budget stop.
             metadata["stop_reason"] = "max_iterations"
+        if cap_answer() is not None:
+            # How the capped run's final reply was obtained (``_answer_at_turn_cap``).
+            metadata["turn_cap_answer"] = cap_answer()
 
         # Populate the structured error field too. `code` must be one of OpenAI's Literals, so we
         # use the generic "server_error"; the real text lives in `message`.

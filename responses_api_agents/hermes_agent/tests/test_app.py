@@ -772,6 +772,81 @@ class TestFinishTool:
         assert episode.response.status == "completed"
 
 
+class TestTurnCapAnswer:
+    """Real Hermes at its turn cap: the run ends on the policy's answer even when the cap reply is a call."""
+
+    _run = TestFinishTool._run
+    _offered = staticmethod(TestFinishTool._offered)
+    _CAP = "You've reached the maximum number of tool-calling iterations"
+    _STUB = "I reached the iteration limit and couldn't generate a summary."
+
+    def _cap_run(self, monkeypatch, tmp_path, cap_replies: list[dict], **config_kwargs):
+        first = _tool_turn(("terminal", {"command": "echo looked > seen.txt"}))
+        return self._run(monkeypatch, tmp_path, [first, *cap_replies], max_turns=1, **config_kwargs)
+
+    def test_a_text_cap_reply_is_hermes_own_summary(self, monkeypatch, tmp_path) -> None:
+        episode, requests = self._cap_run(monkeypatch, tmp_path, [{"role": "assistant", "content": "The answer is 42."}])
+        assert len(requests) == 2 and self._CAP in json.dumps(requests[1]["messages"][-1])
+        assert episode.response.output[-1].content[0].text == "The answer is 42."
+        assert episode.response.metadata["stop_reason"] == "max_iterations"
+        assert episode.response.metadata["turn_cap_answer"] == "summary"
+        assert episode.response.status == "incomplete"
+
+    def test_a_call_at_the_cap_gets_one_tool_free_reply(self, monkeypatch, tmp_path) -> None:
+        call = _tool_turn(("terminal", {"command": "echo late > late.txt"}))
+        episode, requests = self._cap_run(
+            monkeypatch, tmp_path, [call, call, {"role": "assistant", "content": "The answer is 42."}]
+        )
+        # Hermes' cap request and its one retry, then the same request with calls forbidden.
+        assert len(requests) == 4
+        assert [request.get("tool_choice") for request in requests[1:3]] != ["none", "none"]
+        assert requests[3]["tool_choice"] == "none" and self._offered(requests[3]) == self._offered(requests[1])
+        assert requests[3]["messages"] == requests[1]["messages"]
+        # The discarded cap calls never ran.
+        assert not (tmp_path / "late.txt").exists() and (tmp_path / "seen.txt").exists()
+        output = episode.response.output
+        assert [item.name for item in output if item.type == "function_call"] == ["terminal"]
+        assert output[-1].type == "message" and output[-1].content[0].text == "The answer is 42."
+        assert self._STUB not in json.dumps([item.model_dump(mode="json") for item in output])
+        assert episode.response.metadata["stop_reason"] == "max_iterations"
+        assert episode.response.metadata["turn_cap_answer"] == "tool_free_reply"
+        assert episode.response.metadata["finished_naturally"] == "false"
+
+    def test_no_text_at_all_keeps_hermes_ending(self, monkeypatch, tmp_path) -> None:
+        call = _tool_turn(("terminal", {"command": "true"}))
+        episode, requests = self._cap_run(monkeypatch, tmp_path, [call, call, {"role": "assistant", "content": ""}])
+        assert len(requests) == 4
+        assert episode.response.output[-1].content[0].text == self._STUB
+        assert episode.response.metadata["turn_cap_answer"] == "none"
+
+    def test_a_finish_at_the_cap_is_still_the_answer(self, monkeypatch, tmp_path) -> None:
+        finish = _tool_turn(("finish", {"message": "unused"}))
+        episode, requests = self._cap_run(
+            monkeypatch, tmp_path, [finish, finish, {"role": "assistant", "content": "Fixed."}], finish_tool=True
+        )
+        assert requests[3]["tool_choice"] == "none" and "finish" in self._offered(requests[3])
+        assert episode.response.output[-1].content[0].text == "Fixed."
+        assert episode.response.metadata["turn_cap_answer"] == "tool_free_reply"
+
+    @pytest.mark.parametrize("ratio", [None, 0.5])
+    def test_budget_warning_ratio_reaches_hermes(self, monkeypatch, tmp_path, ratio) -> None:
+        turns = [_tool_turn(("terminal", {"command": f"echo {index}"})) for index in range(3)]
+        _, requests = self._run(
+            monkeypatch,
+            tmp_path,
+            [*turns, {"role": "assistant", "content": "done"}],
+            max_turns=4,
+            **({} if ratio is None else {"budget_warning_ratio": ratio}),
+        )
+        notices = [json.dumps(request["messages"]).count("iteration budget checkpoint") for request in requests]
+        # Hermes appends its one-shot notice once to the newest tool result after half the budget is used.
+        assert notices == ([0, 0, 0, 0] if ratio is None else [0, 1, 1, 1])
+
+    def test_runs_below_the_cap_carry_no_cap_label(self, monkeypatch, tmp_path) -> None:
+        episode, _ = self._run(monkeypatch, tmp_path, [{"role": "assistant", "content": "done"}])
+        assert "turn_cap_answer" not in episode.response.metadata
+
+
 class TestFinishedNaturally:
     """Which real Hermes endings are the agent's own completion."""
 
