@@ -892,6 +892,20 @@ def _apt_root_sandbox(cfg: AnyTerminalInstanceConfig) -> str:
     )
 
 
+def _row_task_network(configured: Optional[TaskNetwork], problem_info: Mapping[str, Any]) -> Optional[TaskNetwork]:
+    """A row's own network, else the run's, with the row's declared services and egress applied."""
+    network = (
+        configured
+        if "task_network" not in problem_info
+        else TaskNetwork.model_validate_json(problem_info["task_network"])
+    )
+    if "task_network_declaration" not in problem_info:
+        return network
+    if network is None:
+        raise ValueError("a task network declaration requires the run's private task network")
+    return network.declared(problem_info["task_network_declaration"])
+
+
 def _build_provider(params: AnyTerminalInstanceConfig):
     """Build a sandbox provider with the per-instance mounts the run needs.
 
@@ -913,10 +927,19 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 *verifier_binds,
             ],
             task_network=params.task_network,
+            # An offline task network keeps one route: the policy's model endpoint.
+            **(
+                {"model_url": params.model_server_url}
+                if params.task_network is not None and not params.task_network.outbound
+                else {}
+            ),
         )
     if params.task_network is not None:
         if name != "apptainer":
             raise ValueError("private task networking requires Apptainer")
+        if not params.task_network.outbound or params.task_network.services:
+            # Only the native Enroot provider withholds egress and starts task services.
+            raise ValueError("offline egress and task services require the native Enroot provider")
         runtime = getattr(params, "verifier_runtime", None)
         if runtime is not None and runtime.isolate_network:
             raise ValueError("private task verifier must inherit its instance network")
@@ -2025,11 +2048,7 @@ class AnyTerminalAgent(SimpleResponsesAPIAgent):
             **{**self.config.model_dump(exclude={"task_network"}), **config_overrides},
             **server_config,
             problem_info=problem_info,
-            task_network=(
-                self.config.task_network
-                if "task_network" not in problem_info
-                else TaskNetwork.model_validate_json(problem_info["task_network"])
-            ),
+            task_network=_row_task_network(self.config.task_network, problem_info),
             verifier_runtime=(
                 VerifierRuntime.model_validate(task_meta["verifier_extension"]["runtime"])
                 if "verifier_extension" in task_meta

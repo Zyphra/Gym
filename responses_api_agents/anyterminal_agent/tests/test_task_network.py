@@ -101,3 +101,37 @@ def test_factory_preserves_instance_mounts_and_default_provider(tmp_path, monkey
 def test_private_network_rejects_remote_provider(tmp_path):
     with pytest.raises(ValueError, match="requires Apptainer"):
         _build_provider(params(tmp_path, task_network=network(tmp_path), sandbox_provider={"docker": {}}))
+
+
+def test_row_declaration_adds_services_and_offline_egress_to_the_run_network(tmp_path):
+    import json
+
+    from responses_api_agents.anyterminal_agent.app import _row_task_network
+
+    configured = network(tmp_path)
+    service = {"hostname": "game", "port": 8080, "image": str(tmp_path / "game.sif"),
+               "image_sha256": "a" * 64, "health_path": "/health",
+               "command": "python3 /opt/chess/chess_server.py", "workdir": "/opt/chess"}
+    declared = _row_task_network(
+        configured, {"task_network_declaration": json.dumps({"outbound": False, "services": [service]})}
+    )
+    assert declared.tools_root == configured.tools_root
+    assert declared.outbound is False
+    assert [item.model_dump(mode="json") for item in declared.services] == [service]
+    assert _row_task_network(configured, {}) is configured
+    with pytest.raises(ValueError, match="requires the run's private task network"):
+        _row_task_network(None, {"task_network_declaration": "{}"})
+    with pytest.raises(ValidationError, match="repeat a hostname"):
+        _row_task_network(configured, {"task_network_declaration": json.dumps({"services": [service, service]})})
+    with pytest.raises(ValidationError):
+        _row_task_network(configured, {"task_network_declaration": json.dumps({"services": [{**service, "image": "game.sif"}]})})
+
+
+def test_declared_network_is_refused_outside_native_enroot(tmp_path):
+    base = network(tmp_path)
+    for declaration in ({"outbound": False}, {"services": [{
+            "hostname": "game", "port": 8080, "image": str(tmp_path / "game.sif"),
+            "image_sha256": "a" * 64, "command": "true"}]}):
+        declared = base.model_validate({**base.model_dump(), **declaration})
+        with pytest.raises(ValueError, match="native Enroot"):
+            _build_provider(params(tmp_path, task_network=declared, sandbox_provider={"apptainer": {}}))
