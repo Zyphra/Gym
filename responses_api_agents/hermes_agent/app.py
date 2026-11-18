@@ -625,6 +625,7 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     context_window: int | None = Field(default=None, gt=0)
     enabled_toolsets: Optional[list[str]] = None
     disabled_toolsets: Optional[list[str]] = None
+    file_read_max_chars: int | None = Field(default=None, gt=0)
     terminal_backend: str = "local"
     terminal_timeout: int = 180
     api_timeout: float | None = Field(default=None, gt=0, allow_inf_nan=False)
@@ -795,6 +796,8 @@ class HermesAgent(SimpleResponsesAPIAgent):
         }
         if self.config.mcp_servers:
             config["mcp_servers"] = self.config.mcp_servers
+        if self.config.file_read_max_chars is not None:
+            config["file_read_max_chars"] = self.config.file_read_max_chars
         if self.config.context_window is not None:
             config["model"] = {"default": self._model_name(), "context_length": self.config.context_window}
             reserve = self.config.max_tokens or 0
