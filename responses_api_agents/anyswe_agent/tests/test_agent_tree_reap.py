@@ -26,12 +26,33 @@ DRIVER = textwrap.dedent(
 
     mode, out = sys.argv[1], Path(sys.argv[2])
     pids = out / "pids"
+    repo = out / "repo" if mode == "stalled-hermes" else None
+    baseline_tree = None
+    if repo:
+        repo.mkdir()
+        (repo / "answer.txt").write_text("original\\n")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "answer.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.name=Fixture", "-c",
+             "user.email=fixture@example.test", "commit", "-qm", "baseline"],
+            check=True,
+        )
+        baseline_tree = runner._snapshot_repo(repo, out / "index")
 
     class Body:
         model = "m"; tool_choice = "auto"; tools = []; parallel_tool_calls = True
 
     class Agent:
         async def responses(self, request=None, body=None):
+            if mode == "stalled-hermes":
+                (repo / "answer.txt").write_text("fixed\\n")
+                while True:
+                    try:
+                        await asyncio.sleep(60)
+                    except asyncio.CancelledError:
+                        # The harness keeps its session open after cancellation.
+                        continue
             if mode == "orphan":
                 # A test runner left in the background, escaping into its own session.
                 subprocess.run(
@@ -61,7 +82,7 @@ DRIVER = textwrap.dedent(
 
     runner._become_subreaper()
     started = time.monotonic()
-    runner._run_and_capture(Agent(), None, Body(), None, out / "index", None, out)
+    runner._run_and_capture(Agent(), None, Body(), repo, out / "index", baseline_tree, out)
     print(json.dumps({"seconds": time.monotonic() - started}))
     """
 )
@@ -104,6 +125,31 @@ def test_wall_deadline_kills_a_tool_held_at_its_memory_limit(tmp_path):
     assert response["metadata"]["agent_wall_timeout"] == "true"
     assert response["error"]["message"] == "Harness exception: TimeoutError"
     assert len(pids) == 1 and not _alive(pids[0])
+
+
+def test_wall_deadline_captures_patch_when_hermes_does_not_yield(tmp_path):
+    from nemo_gym.openai_utils import NeMoGymResponse
+
+    root = Path(__file__).resolve().parents[3]
+    done = subprocess.run(
+        [sys.executable, "-c", DRIVER, "stalled-hermes", str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{root}:{os.environ.get('PYTHONPATH', '')}",
+            "NGSWE_AGENT_TIMEOUT_S": "1",
+        },
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    response = NeMoGymResponse.model_validate_json((tmp_path / "response.json").read_text())
+    assert response.metadata["agent_wall_timeout"] == "true"
+    patch = tmp_path / "patch.diff"
+    assert "-original\n+fixed\n" in patch.read_text()
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "-C", str(repo), "checkout", "--", "answer.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "apply", "--check", str(patch)], check=True)
 
 
 def test_agent_phase_leaves_an_extraction_reserve():

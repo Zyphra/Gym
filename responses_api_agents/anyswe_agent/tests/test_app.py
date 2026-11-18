@@ -1648,6 +1648,7 @@ async def test_agent_wall_grades_the_patch_it_left(
     from nemo_gym.server_utils import BaseServerConfig, ServerClient
     from responses_api_agents.anyswe_agent import app as app_module
 
+    saved_exec = json.loads((Path(__file__).parent / "fixtures/hermes-wall-exec.json").read_text())
     head = BaseServerConfig(host="127.0.0.1", port=19000, name="head", entrypoint="app.py")
     config = _config(
         model_server=None,
@@ -1689,11 +1690,17 @@ async def test_agent_wall_grades_the_patch_it_left(
 
         async def exec(self, command, **kwargs):
             if command.startswith("test -f"):
-                missing = command.endswith("patch.diff") and not patch
+                missing = (
+                    command.endswith("patch.diff")
+                    and not patch
+                    or command.endswith("response.json")
+                    and wall == "exec"
+                    and not saved_exec["agent_response_saved"]
+                )
                 return SandboxExecResult("", "", 1 if missing else 0, None)
             # Only the agent command runs on the agent budget; setup probes succeed.
             if wall == "exec" and kwargs.get("timeout_s") == config.swebench_agent_timeout:
-                return SandboxExecResult("", "", -1, "timeout")
+                return SandboxExecResult("", "", saved_exec["agent_return_code"], saved_exec["agent_error_type"])
             return SandboxExecResult("", "", 0, None)
 
         async def download(self, source, destination):
@@ -1714,6 +1721,11 @@ async def test_agent_wall_grades_the_patch_it_left(
     assert result.agent_timed_out is (not grades_workspace)
     assert result.agent_budget_exhausted is grades_workspace
     assert result.patch_exists is bool(patch)
+    if wall == "exec" and grades_workspace and not patch:
+        assert result.agent_budget_exhausted is saved_exec["agent_budget_exhausted"]
+        assert result.mask_sample is saved_exec["mask_sample"]
+        assert result.patch_exists is saved_exec["patch_exists"]
+        assert bool(graded) is saved_exec["grader_ran"]
     if grades_workspace:
         assert result.error_kind is None
         assert result.response.status != "failed"
