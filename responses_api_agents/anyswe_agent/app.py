@@ -113,6 +113,10 @@ class SWEBenchMetrics(SandboxMemoryEvents):
     agent_budget_exhausted: Optional[bool] = None
     agent_error_kind: Optional[str] = None
     agent_stop_reason: Optional[str] = None
+    # How the agent phase ended, on every row: `agent_wall_budget` at its time budget, else the
+    # harness's own stop reason, else `agent`. `agent_phase_seconds` is that phase's wall time.
+    agent_ending: Optional[str] = None
+    agent_phase_seconds: Optional[float] = None
     eval_timed_out: Optional[bool] = None
     error_kind: Optional[str] = None
     error_detail: Optional[str] = None
@@ -287,6 +291,11 @@ def _notify_agent_finished(policy: Any, result: Any) -> None:
 def _agent_phase_seconds(exec_timeout_s: int) -> int:
     """The runner's agent deadline: the exec timeout minus a patch-extraction reserve."""
     return max(1, exec_timeout_s - min(300, exec_timeout_s // 10))
+
+
+def _agent_stop_grace_seconds(exec_timeout_s: int) -> int:
+    """The part of that reserve a harness may take to stop before the runner collects the patch itself."""
+    return max(1, (exec_timeout_s - _agent_phase_seconds(exec_timeout_s)) // 5)
 
 
 def _should_mask_sample(
@@ -701,6 +710,7 @@ class AnySweSandboxRunner:
         timeout_s = getattr(params, "swebench_agent_timeout", None)
         if timeout_s is not None:
             env["NGSWE_AGENT_TIMEOUT_S"] = str(_agent_phase_seconds(timeout_s))
+            env["NGSWE_AGENT_STOP_GRACE_S"] = str(_agent_stop_grace_seconds(timeout_s))
         # Invocation identity remains available even when a sandbox relay owns
         # upstream URL scoping. Its explicit endpoint prevents double scoping.
         if params.rollout_id:
@@ -953,6 +963,7 @@ class AnySweSandboxRunner:
         )
         agent_workdir = spec.workdir
         result = None
+        agent_phase_seconds = None
         sandbox_failed = False
         sandbox_error_kind = None
         error_detail: Optional[str] = None
@@ -1052,6 +1063,7 @@ class AnySweSandboxRunner:
             if policy is not None:
                 await policy.prepare(sandbox)
                 command = policy.wrap_command(command, runtime_dir)
+            agent_phase_started = time.monotonic()
             with _policy_agent_execution(policy):
                 result = await sandbox.exec(
                     command,
@@ -1060,6 +1072,7 @@ class AnySweSandboxRunner:
                     timeout_s=params.swebench_agent_timeout,
                     user="root",
                 )
+            agent_phase_seconds = time.monotonic() - agent_phase_started
             _notify_agent_finished(policy, result)
             for remote, local in (
                 ("/trajectories_mount/response.json", params.persistent_dir / "response.json"),
@@ -1159,6 +1172,7 @@ class AnySweSandboxRunner:
             agent_timed_out = True
         elif saved is not None and (saved.metadata or {}).get("runner_exception") == "true" and harness_error is None:
             error_kind = error_kind or "agent"
+        agent_ending = "agent_wall_budget" if agent_timed_out else (agent_stop_reason or "agent")
         agent_budget_exhausted = bool(agent_timed_out and params.agent_timeout_grades_workspace)
         if agent_budget_exhausted:
             # The wall is the task's budget, not an infrastructure failure: the patch is graded below.
@@ -1207,6 +1221,8 @@ class AnySweSandboxRunner:
                 "agent_budget_exhausted": agent_budget_exhausted,
                 "agent_error_kind": agent_error_kind,
                 "agent_stop_reason": agent_stop_reason,
+                "agent_ending": agent_ending if result is not None else None,
+                "agent_phase_seconds": agent_phase_seconds,
                 "eval_timed_out": eval_timed_out,
                 "error_kind": error_kind,
                 "error_detail": error_detail,

@@ -380,39 +380,64 @@ def _agent_deadline_s() -> float | None:
     return float(value) if value else None
 
 
+def _agent_stop_grace_s() -> float:
+    """How long a harness may take to return its turns once its wall has passed."""
+    return float(os.environ.get("NGSWE_AGENT_STOP_GRACE_S") or 60.0)
+
+
+def _wall_response(body):
+    """The agent spent its time budget: its own ending, not a harness or transport failure."""
+    from nemo_gym.openai_utils import NeMoGymResponse
+
+    return NeMoGymResponse(
+        id="anyswe-runner-wall",
+        created_at=0,
+        model=body.model,
+        object="response",
+        output=[],
+        tool_choice=body.tool_choice,
+        tools=body.tools,
+        parallel_tool_calls=body.parallel_tool_calls,
+        status="incomplete",
+        metadata={"agent_wall_timeout": "true"},
+    )
+
+
+async def _run_until_wall(agent, request, body, deadline_s: float | None, expired: threading.Event):
+    """The agent's response, or the wall's when the deadline (and nothing else) ended the run."""
+    run = asyncio.ensure_future(agent.responses(request=request, body=body))
+    done, _ = await asyncio.wait({run}, timeout=deadline_s)
+    if not done:
+        # Cancellation is the stop request. A harness that honors it returns the turns it has.
+        expired.set()
+        run.cancel()
+        await asyncio.wait({run})
+    if run.cancelled():
+        return _wall_response(body)
+    exc = run.exception()
+    if exc is None:
+        response = run.result()
+    elif expired.is_set() or not isinstance(exc, Exception):
+        return _wall_response(body)
+    else:
+        # A timeout the harness raised before its wall is a failure of what it called.
+        response = _exception_response(exc, body)
+    if expired.is_set():
+        response.metadata = {**(response.metadata or {}), "agent_wall_timeout": "true"}
+    return response
+
+
 def _run_and_capture(agent, request, body, repo, index_path, baseline_tree, output_dir: Path) -> None:
-    """Write response and patch even when a harness raises after editing files."""
+    """Write response and patch even when a harness raises, or does not stop, after editing files."""
     deadline_s = _agent_deadline_s()
     expired = threading.Event()
-
-    def on_deadline() -> None:
-        # The tools, not the coroutine, are what block: killing them unblocks the
-        # agent even when its sandbox is in memory livelock.
-        expired.set()
-        while not finished.wait(1.0):
-            _reap_agent_tree(timeout_s=1.0)
-
     finished = threading.Event()
-    timer = threading.Timer(deadline_s, on_deadline) if deadline_s else None
-    if timer is not None:
-        timer.daemon = True
-        timer.start()
-    try:
-        try:
-            response = asyncio.run(asyncio.wait_for(agent.responses(request=request, body=body), timeout=deadline_s))
-        except Exception as exc:
-            if expired.is_set() or isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-                expired.set()
-                exc = TimeoutError(f"agent wall timeout after {deadline_s}s")
-            response = _exception_response(exc, body)
-            if expired.is_set():
-                response.metadata = {**(response.metadata or {}), "agent_wall_timeout": "true"}
-        (output_dir / "response.json").write_text(response.model_dump_json())
-        print(f"agent finished: {len(response.output)} output items", flush=True)
-    finally:
-        finished.set()
-        if timer is not None:
-            timer.cancel()
+    capturing = threading.Lock()
+
+    def capture(response) -> None:
+        if response is not None:
+            (output_dir / "response.json").write_text(response.model_dump_json())
+            print(f"agent finished: {len(response.output)} output items", flush=True)
         reaped = _reap_agent_tree()
         if reaped:
             print(f"reaped {reaped} leftover agent processes", flush=True)
@@ -425,6 +450,43 @@ def _run_and_capture(agent, request, body, repo, index_path, baseline_tree, outp
             index_path.unlink(missing_ok=True)
             if repo:
                 shutil.rmtree(_baseline_git_dir(index_path))
+
+    def on_deadline() -> None:
+        # The tools, not the coroutine, are what block: killing them unblocks the
+        # agent even when its sandbox is in memory livelock.
+        stop_by = time.monotonic() + _agent_stop_grace_s()
+        while not finished.wait(1.0):
+            _reap_agent_tree(timeout_s=1.0)
+            if time.monotonic() < stop_by or not capturing.acquire(blocking=False):
+                continue
+            # The harness kept running in a thread that cancellation cannot reach (and that the
+            # interpreter would wait for): the patch present now is the agent's, so collect it
+            # here and leave before the exec timeout takes the sandbox.
+            code = 1
+            try:
+                print("agent did not stop at its wall; collecting its patch", flush=True)
+                capture(_wall_response(body))
+                code = 0
+            finally:
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(code)
+
+    timer = threading.Timer(deadline_s, on_deadline) if deadline_s else None
+    if timer is not None:
+        timer.daemon = True
+        timer.start()
+    response = None
+    try:
+        response = asyncio.run(_run_until_wall(agent, request, body, deadline_s, expired))
+    finally:
+        finished.set()
+        if timer is not None:
+            timer.cancel()
+            # Its last sweep must not meet the extraction's own git processes.
+            timer.join()
+        with capturing:
+            capture(response)
 
 
 def main() -> None:
