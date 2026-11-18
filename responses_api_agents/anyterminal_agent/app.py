@@ -826,6 +826,15 @@ class AnyTerminalInstanceConfig(AnyTerminalAgentConfig, AnyTerminalServerConfig)
         """What sandbox processes see at ``/logs/verifier``; ``verifier_dir`` stays host-only."""
         return self.persistent_dir.with_name(self.persistent_dir.name + ".sandbox-verifier")
 
+    def host_only_dir(self, name: str) -> Path:
+        """Where the episode's ``name`` directory lives until the sandbox stopped.
+
+        ``persistent_dir`` is the sandbox's ``/trajectories_mount``, so a sandbox process that
+        unmounts a cover there reaches anything below it. Grader outputs stay in this sibling
+        while the sandbox runs and are published below ``persistent_dir`` afterwards.
+        """
+        return self.persistent_dir.with_name(f"{self.persistent_dir.name}.{name}")
+
     @property
     def instance_id(self) -> str:
         return self.problem_info.get("instance_id", self.task_name)
@@ -935,19 +944,25 @@ def _open_beneath(root: Path, parts: list[str], flags: int, mode: int = 0o644, c
         os.close(directory)
 
 
-def _write_private_outputs(stdout: Optional[str], cfg: AnyTerminalInstanceConfig) -> dict:
+def _write_private_outputs(stdout: Optional[str], return_code: Optional[int], cfg: AnyTerminalInstanceConfig) -> dict:
     """Write the private ``/logs/verifier`` into ``verifier_dir`` from the verifier's own report.
 
+    The report is the helper's only if it is the one report on its stdout and the helper then
+    exited 0; a sandbox process that can reach the helper could print another one or kill it.
     Small outputs come inline in the report. Larger ones were copied into the sandbox's
     shared directory and are admitted only with the size and sha256 the report gives.
     """
     started = time.monotonic()
     lines = [line for line in (stdout or "").splitlines() if line.startswith(PRIVATE_VERIFIER_MARKER)]
-    if len(lines) != 1:
-        raise RuntimeError(f"private verifier wrote {len(lines)} reports, expected 1")
+    if len(lines) > 1:
+        raise VerifierIntegrityRefused(f"private verifier output carries {len(lines)} reports")
+    if not lines:
+        raise RuntimeError("private verifier wrote no report")
     report = json.loads(lines[0][len(PRIVATE_VERIFIER_MARKER) :])
     if report.get("setup") is not None:
         raise RuntimeError(f"private verifier setup failed: {report['setup']}")
+    if return_code != 0:
+        raise RuntimeError(f"private verifier exited {return_code} after a report; it is not graded")
     for entry in report["files"]:
         parts = _relative_parts(entry["path"])
         if "data" in entry:
@@ -977,6 +992,31 @@ def _write_private_outputs(stdout: Optional[str], cfg: AnyTerminalInstanceConfig
     receipt["host_s"] = round(time.monotonic() - started, 4)
     (cfg.verifier_dir / PRIVATE_VERIFIER_RECEIPT).write_text(json.dumps(receipt))
     return receipt
+
+
+def interim_snapshot(cfg: AnyTerminalInstanceConfig, phase: int) -> Path:
+    """An interim verifier's outputs, host-only while the sandbox runs."""
+    return cfg.host_only_dir("interim_verifier") / f"phase-{phase:04d}"
+
+
+def _publish_host_only_outputs(cfg: AnyTerminalInstanceConfig) -> None:
+    """Move the host-only grader outputs to their episode paths once no sandbox process is left.
+
+    Whatever a sandbox process put at a published path is kept beside it as ``*.sandbox-written``.
+    """
+    for name, target in (
+        ("verifier", cfg.verifier_dir),
+        ("interim_verifier", cfg.persistent_dir / "interim_verifier"),
+    ):
+        source = cfg.host_only_dir(name)
+        if source == target or not source.is_dir() or source.is_symlink():
+            continue
+        if target.is_symlink() or target.exists():
+            if target.is_dir() and not target.is_symlink() and not any(target.iterdir()):
+                target.rmdir()
+            else:
+                os.replace(target, target.with_name(f"{target.name}.sandbox-written"))
+        os.replace(source, target)
 
 
 def _verifier_binds(params: AnyTerminalInstanceConfig) -> list[str]:
@@ -1346,7 +1386,7 @@ class RunTerminalAgent(BaseModel):
                     reward = None
                 except OSError:
                     reward = None
-            snapshot = cfg.persistent_dir / "interim_verifier" / f"phase-{phase:04d}"
+            snapshot = interim_snapshot(cfg, phase)
             snapshot.parent.mkdir(exist_ok=True)
             shutil.copytree(cfg.verifier_dir, snapshot, symlinks=True, ignore_dangling_symlinks=True)
             (snapshot / "dispatch.json").write_text(
@@ -1661,20 +1701,32 @@ class RunTerminalAgent(BaseModel):
             # sees the directory test.sh writes its reward into.
             command = _private_verifier_command(command)
         result = await self._exec_verifier(sandbox, command, timeout_s=cfg.tb_eval_timeout, env=verifier_env)
+        return_code = result.return_code
         if private and result.error_type is None:
-            _write_private_outputs(result.stdout, cfg)
-        if receipt is not None and result.return_code == 125:
+            # The helper exits 0 after its report; the report carries test.sh's own status.
+            return_code = _write_private_outputs(result.stdout, result.return_code, cfg)["exit_code"]
+        if receipt is not None and return_code == 125:
             raise RuntimeError("prepared stock interpreter attestation failed")
-        if result.return_code != 0:
-            print(f"[{cfg.task_name}] eval exit {result.return_code}: {(result.stderr or '')[-2000:]}", flush=True)
+        if return_code != 0:
+            print(f"[{cfg.task_name}] eval exit {return_code}: {(result.stderr or '')[-2000:]}", flush=True)
         return (
             time.time() - t0,
             result.error_type == "timeout",
-            result.return_code,
+            return_code,
             result.error_type,
         )
 
     async def process_single_datapoint(self) -> bool:
+        """Grade the episode into host-only directories; publish them after the sandbox stopped."""
+        cfg = self.config
+        self.config = cfg.model_copy(update={"verifier_dir": cfg.host_only_dir("verifier")})
+        try:
+            return await self._process_single_datapoint()
+        finally:
+            self.config = cfg
+            _publish_host_only_outputs(cfg)
+
+    async def _process_single_datapoint(self) -> bool:
         from core.sandbox.memory_evidence import memory_event_delta, sandbox_memory_snapshot
 
         from responses_api_agents.anyterminal_agent.verifier_integrity import (

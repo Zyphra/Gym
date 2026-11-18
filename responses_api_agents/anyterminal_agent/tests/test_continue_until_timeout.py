@@ -34,11 +34,16 @@ from responses_api_agents.anyterminal_agent.tests.test_app import _make_instance
 def _verifier_writes_the_host_directory(monkeypatch):
     """These fakes stand in for test.sh by writing ``verifier_dir`` directly.
 
-    The private ``/logs/verifier`` transport between them is covered in
-    ``test_private_verifier.py``.
+    The private ``/logs/verifier`` transport and the host-only grader directories are covered
+    in ``test_private_verifier.py``.
     """
     monkeypatch.setattr(app, "_private_verifier_command", lambda command: command)
-    monkeypatch.setattr(app, "_write_private_outputs", lambda stdout, cfg: None)
+    monkeypatch.setattr(app, "_write_private_outputs", lambda stdout, return_code, cfg: {"exit_code": return_code})
+    monkeypatch.setattr(
+        app.AnyTerminalInstanceConfig,
+        "host_only_dir",
+        lambda self, name: self.verifier_dir if name == "verifier" else self.persistent_dir / name,
+    )
 
 
 INSTRUCTION = "Build the thing.\n"

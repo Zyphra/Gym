@@ -17,9 +17,11 @@ as one ``MARKER`` line:
 * larger files by size and sha256, copied into the shared ``/logs/verifier`` for the host
   to verify before use.
 
-The command's own stdout and stderr go to this program's stderr. Exit status: the
-command's, or ``SETUP_FAILED`` with a ``setup`` problem in the report when the private
-directory could not be made, in which case the command never runs.
+The command's own stdout and stderr go to this program's stderr. The report carries the
+command's exit status; this program exits 0 once it wrote the report, or ``SETUP_FAILED``
+with a ``setup`` problem in the report when the private directory could not be made, in
+which case the command never runs. Any other exit (this program killed) means the report on
+stdout, if any, is not its own, so the host never grades it.
 """
 
 from __future__ import annotations
@@ -154,7 +156,7 @@ def main(argv: list[str]) -> int:
     report["collect_s"] = round(time.monotonic() - collect_started, 4)
     sys.stdout.write(MARKER + json.dumps(report) + "\n")
     sys.stdout.flush()
-    return report["exit_code"]
+    return 0
 
 
 if __name__ == "__main__":

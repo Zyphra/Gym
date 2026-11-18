@@ -81,6 +81,7 @@ def test_a_left_behind_writer_cannot_change_the_reported_reward(tmp_path):
     assert result.returncode == 0, result.stderr
     (line,) = [line for line in result.stdout.splitlines() if line.startswith(private_verifier.MARKER)]
     report = json.loads(line[len(private_verifier.MARKER) :])
+    assert report["exit_code"] == 0  # the command's own status; the helper exits 0 after its report
     files = {entry["path"]: entry for entry in report["files"]}
     assert files["reward.txt"]["data"] == "MA=="  # b"0", inline: never read back from the sandbox
     assert "data" not in files["pytest.log"]  # too large to inline: copied out with its digest
@@ -121,7 +122,7 @@ def test_host_writes_exactly_what_test_sh_wrote(tmp_path, monkeypatch):
     stdout = _report(cfg, monkeypatch, {"reward.txt": b"1\n", "artifacts/score.json": b"{}", "pytest.log": large})
     (cfg.sandbox_verifier_dir / "reward.txt").write_text("1")  # what a sandbox process wrote is never read
     started = time.monotonic()
-    receipt = app._write_private_outputs(stdout, cfg)
+    receipt = app._write_private_outputs(stdout, 0, cfg)
     assert (cfg.verifier_dir / "reward.txt").read_bytes() == b"1\n"
     assert (cfg.verifier_dir / "artifacts/score.json").read_bytes() == b"{}"
     assert (cfg.verifier_dir / "pytest.log").read_bytes() == large
@@ -136,7 +137,7 @@ def test_a_large_output_changed_in_the_sandbox_is_refused(tmp_path, monkeypatch)
     stdout = _report(cfg, monkeypatch, {"pytest.log": b"x" * (private_verifier.INLINE_FILE_BYTES + 1)})
     (cfg.sandbox_verifier_dir / "pytest.log").write_text("forged")
     with pytest.raises(VerifierIntegrityRefused, match="differs"):
-        app._write_private_outputs(stdout, cfg)
+        app._write_private_outputs(stdout, 0, cfg)
 
 
 @pytest.mark.parametrize("path", ["../reward.txt", "/logs/verifier/reward.txt", "a//b", ""])
@@ -145,18 +146,54 @@ def test_a_report_cannot_name_a_path_outside_the_verifier_directory(tmp_path, pa
     entry = {"path": path, "size": 1, "mode": 0o644, "sha256": "0" * 64, "data": "MQ=="}
     stdout = app.PRIVATE_VERIFIER_MARKER + json.dumps({"setup": None, "files": [entry], "links": []})
     with pytest.raises(VerifierIntegrityRefused, match="not relative"):
-        app._write_private_outputs(stdout, cfg)
+        app._write_private_outputs(stdout, 0, cfg)
 
 
 @pytest.mark.parametrize(
     "stdout,message",
     [
-        ("", "wrote 0 reports"),
+        ("", "wrote no report"),
         (app.PRIVATE_VERIFIER_MARKER + json.dumps({"setup": "OSError: mount"}), "setup failed"),
     ],
 )
 def test_a_missing_or_failed_private_verifier_is_never_graded(tmp_path, stdout, message):
     cfg = _make_instance_config(tmp_path)
     with pytest.raises(RuntimeError, match=message):
-        app._write_private_outputs(stdout, cfg)
+        app._write_private_outputs(stdout, 0, cfg)
     assert not (cfg.verifier_dir / "reward.txt").exists()
+
+
+def test_a_report_from_a_killed_or_shadowed_helper_is_never_graded(tmp_path, monkeypatch):
+    cfg = _make_instance_config(tmp_path)
+    forged = _report(cfg, monkeypatch, {"reward.txt": b"1"})
+    # A sandbox process printed a report on the helper's stdout and killed it.
+    with pytest.raises(RuntimeError, match="exited 137"):
+        app._write_private_outputs(forged, 137, cfg)
+    # Or printed one beside the helper's own.
+    with pytest.raises(VerifierIntegrityRefused, match="2 reports"):
+        app._write_private_outputs(forged + forged.splitlines()[-1] + "\n", 0, cfg)
+    assert not (cfg.verifier_dir / "reward.txt").exists()
+
+
+def test_grader_outputs_live_beside_the_episode_and_are_published_after_it(tmp_path):
+    persistent = tmp_path / "episode"
+    cfg = app.AnyTerminalInstanceConfig.model_construct(persistent_dir=persistent, verifier_dir=persistent / "verifier")
+    trusted = cfg.host_only_dir("verifier")
+    # /trajectories_mount is the episode directory: nothing the host grades from is below it.
+    assert trusted.parent == tmp_path and app.interim_snapshot(cfg, 3).parent.parent == tmp_path
+    cfg.verifier_dir.mkdir(parents=True)
+    (cfg.verifier_dir / "reward.txt").write_text("1")  # a sandbox process uncovered and wrote this
+    trusted.mkdir()
+    (trusted / "reward.txt").write_text("0")
+    (persistent / "interim_verifier").mkdir()  # empty: nothing written there
+    interim = app.interim_snapshot(cfg, 0)
+    interim.mkdir(parents=True)
+    (interim / "reward.txt").write_text("0.5")
+
+    app._publish_host_only_outputs(cfg)
+
+    assert (persistent / "verifier" / "reward.txt").read_text() == "0"
+    assert (persistent / "verifier.sandbox-written" / "reward.txt").read_text() == "1"
+    assert (persistent / "interim_verifier" / "phase-0000" / "reward.txt").read_text() == "0.5"
+    assert not (persistent / "interim_verifier.sandbox-written").exists()
+    assert not trusted.exists() and not interim.parent.exists()
