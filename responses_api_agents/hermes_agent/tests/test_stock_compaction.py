@@ -238,12 +238,12 @@ def test_stock_summary_request_goes_to_each_rollouts_own_policy(monkeypatch, tmp
     record_property("refused_streams", len(policy.refused_streams))
     assert len(summaries) == 2 and sorted(policy.refused_streams) == sorted(path for path, _ in summaries)
     for _, body in summaries:
-        # Upstream's own request: one user message, no tools, no output cap and no sampling
-        # parameters, so the rollout endpoint samples it at the policy's temperature.
+        # Upstream's own request: one user message, no tools and no sampling parameters, so the
+        # rollout endpoint samples it at the policy's temperature; its output budget is the run's.
         assert [message["role"] for message in body["messages"]] == ["user"]
         assert "TASK BEING WORKED ON" not in body["messages"][0]["content"]
         assert "tools" not in body and "tool_choice" not in body
-        assert "max_tokens" not in body and "max_completion_tokens" not in body
+        assert body["max_tokens"] == 8192 and "max_completion_tokens" not in body
         assert not {"temperature", "top_p", "top_k"} & body.keys()
     for _, body in mains:
         assert not {"temperature", "top_p", "top_k"} & body.keys()
@@ -274,7 +274,10 @@ def test_hermes_config_carries_the_compaction_trigger(monkeypatch, tmp_path):
     written = yaml.safe_load((Path(os.environ["HERMES_HOME"]) / "config.yaml").read_text())
     assert written["compression"] == {"enabled": True, "threshold": 0.75, "target_ratio": 0.10, "tail_mode": "legacy"}
     assert written["model"]["context_length"] == CONTEXT_WINDOW and written["model"]["streaming"] is False
-    assert written["auxiliary"] == {"title_generation": {"enabled": False}, "compression": {"timeout": 5400}}
+    assert written["auxiliary"] == {
+        "title_generation": {"enabled": False},
+        "compression": {"timeout": 5400, "extra_body": {"max_tokens": 8192}},
+    }
     [native] = native_agents
     compressor = native.context_compressor
     assert compressor.context_length == CONTEXT_WINDOW
@@ -343,3 +346,19 @@ def test_rejected_summary_policy_calls_are_counted(monkeypatch, tmp_path, summar
     assert response.status in ("completed", "incomplete")
     assert len(summaries) == summary_requests, f"upstream sent {len(summaries)} summary requests"
     assert {path for path, _ in summaries + mains} == {"/ng-rollout/rollout-f/v1/chat/completions"}
+
+
+def test_compaction_trigger_counts_the_output_reserve_once(monkeypatch, tmp_path):
+    # Hermes triggers at threshold x (context_length - max_tokens): the reply reserve is taken out of the
+    # window once, so a request at the trigger plus a full reply still fits the window.
+    native_agents: list = []
+    with _PolicyFixture(_SUMMARY_OK) as policy:
+        app = _agent(
+            tmp_path, monkeypatch, policy.server.server_port, native_agents,
+            max_tokens=32768, compression_threshold=0.85,
+        )
+        _run(app, "hi", "rollout-d")
+    [native] = native_agents
+    trigger = native.context_compressor.threshold_tokens
+    assert trigger == int((CONTEXT_WINDOW - 32768) * 0.85) == 83558
+    assert trigger + 32768 <= CONTEXT_WINDOW
