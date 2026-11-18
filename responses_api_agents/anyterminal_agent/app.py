@@ -1126,6 +1126,8 @@ class RunTerminalAgent(BaseModel):
             env["NGTB_TASK_WORKDIR"] = str(cfg.problem_info["workdir"])
         if cfg.rollout_id:
             env["NGTB_ROLLOUT_ID"] = cfg.rollout_id
+        # The task's agent clock, for a harness that bounds its own run inside it (OpenClaw --timeout).
+        env["NGTB_AGENT_TIMEOUT_S"] = str(cfg.tb_agent_timeout)
         if (cfg.persistent_dir / "agent_overlay").is_dir():
             # The runner puts the shipped overlay first on its own sys.path; the harness's own Python
             # children (Pi's bash tool runs `python3 -m core.sandbox.command_process`) need it too,
