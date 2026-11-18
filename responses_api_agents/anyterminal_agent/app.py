@@ -186,8 +186,7 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     container_timed_out: bool = False
     sandbox_failed: bool = False
     mask_sample: bool = False
-    # Labels only, never a mask: a harness or verifier failure that still
-    # scores is named, so it is not indistinguishable from a policy miss.
+    # Harness outcome labels used alongside the verifier's grade.
     agent_exit_nonzero: bool = False
     agent_failed: bool = False
     agent_error: Optional[str] = None
@@ -237,8 +236,8 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
         `agent_timeout_is_failure` scores a timed-out agent 0. `agent_timeout_grades_workspace`
         keeps the verifier's grade of the workspace at the wall, as Harbor does after an
         AgentTimeoutError: the timeout becomes the `agent_budget_exhausted` label and the row's
-        reward is the verifier's. A missing or unreadable reward still scores 0 with its label;
-        verifier timeouts and sandbox failures stay masked. Idempotent.
+        reward is the verifier's. Missing or unreadable verifier rewards, verifier timeouts,
+        and sandbox failures stay masked. Idempotent.
         """
         if self.agent_timed_out and agent_timeout_grades_workspace:
             self.agent_timed_out = False
@@ -251,6 +250,7 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
             self.mask_sample
             or self.container_timed_out
             or self.sandbox_failed
+            or self.verifier_reward_unreadable
             or (self.agent_timed_out and not agent_timeout_is_failure)
         )
 

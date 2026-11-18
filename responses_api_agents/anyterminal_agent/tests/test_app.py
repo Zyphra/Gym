@@ -1666,6 +1666,7 @@ class TestProcessSingleDatapoint:
 
         metrics = app.TerminalBenchMetrics.model_validate_json(cfg.metrics_fpath.read_text())
         assert metrics.verifier_reward_unreadable is unreadable
+        assert metrics.mask_sample is unreadable
         assert metrics.reward(fractional=fractional) == expected_reward
 
     def test_fractional_reward_is_strict_and_default_off(self, tmp_path: Path) -> None:
@@ -1678,24 +1679,37 @@ class TestProcessSingleDatapoint:
         metrics.apply_timeout_policy(agent_timeout_is_failure=True)
         assert metrics.reward(fractional=True) == 0.0
 
-    async def test_unresolved_when_no_reward_file(self, tmp_path: Path) -> None:
-        cfg = _make_instance_config(tmp_path)
-        sandbox = SimpleNamespace(
-            start=AsyncMock(),
-            exec=AsyncMock(return_value=_sandbox_result()),
-            stop=AsyncMock(),
-        )
+    @pytest.mark.parametrize(
+        "return_code,reward,masked",
+        [(0, None, True), (1, None, True), (0, "0", False)],
+        ids=["missing-reward", "failed-judge", "graded-empty"],
+    )
+    async def test_missing_grade_is_masked_but_valid_zero_is_scored(
+        self, tmp_path: Path, return_code: int, reward: str | None, masked: bool
+    ) -> None:
+        cfg = _make_instance_config(tmp_path, fractional_reward=True)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                if reward is not None:
+                    (cfg.verifier_dir / "reward.txt").write_text(reward)
+                return _sandbox_result(return_code=return_code)
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=verifier), stop=AsyncMock())
         with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
             with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
                 result = await RunTerminalAgent(config=cfg).process_single_datapoint()
 
         assert result is False
-        metrics = json.loads(cfg.metrics_fpath.read_text())
-        # test.sh writes 0 or 1: a completed eval without reward.txt is labelled, not masked.
-        assert metrics["verifier_reward_unreadable"] is True
-        assert metrics["mask_sample"] is False
+        response = app._terminal_response(cfg)
+        metrics = app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"])
+        assert metrics.verifier_reward_unreadable is masked
+        assert metrics.mask_sample is masked
+        assert metrics.verifier_return_code == return_code
+        assert metrics.verifier_reward == (None if masked else 0.0)
 
-    async def test_unparsable_reward_is_labelled_not_masked(self, tmp_path: Path, capsys) -> None:
+    async def test_unparsable_reward_is_unscored(self, tmp_path: Path, capsys) -> None:
         cfg = _make_instance_config(tmp_path)
 
         async def verifier(command, **kwargs):
@@ -1715,7 +1729,7 @@ class TestProcessSingleDatapoint:
         assert result is False
         metrics = json.loads(cfg.metrics_fpath.read_text())
         assert metrics["verifier_reward_unreadable"] is True
-        assert metrics["mask_sample"] is False
+        assert metrics["mask_sample"] is True
         assert "without a readable reward.txt: ValueError" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
@@ -2249,7 +2263,7 @@ def test_pi_terminal_config_selects_the_pi_agent() -> None:
 
 
 class TestAgentTimeoutGradesWorkspace:
-    """An agent that hits its budget is graded on the workspace it left, never masked."""
+    """An agent at its wall keeps a valid workspace grade."""
 
     @pytest.fixture(autouse=True)
     def _no_provider(self):
@@ -2289,13 +2303,12 @@ class TestAgentTimeoutGradesWorkspace:
         assert metrics.verifier_reward == 0.4 and metrics.reward(fractional=True) == 0.4
         assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
 
-    async def test_unreadable_reward_is_flagged_and_scores_zero(self, tmp_path: Path) -> None:
+    async def test_unreadable_reward_is_masked_even_at_the_agent_wall(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True)
         result, metrics = await self._run_to_wall(cfg, None)
         assert result is False
         assert metrics.verifier_reward_unreadable is True
-        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
-        assert metrics.reward(fractional=True) == 0.0
+        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is True
 
     @pytest.mark.parametrize("fault", ["container_timed_out", "sandbox_failed"])
     def test_infrastructure_stays_masked(self, fault) -> None:
