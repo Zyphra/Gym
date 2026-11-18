@@ -16,7 +16,14 @@ rewrite) and admits a file only if its bytes match the host's manifest ``SOURCE-
 whose sha256 the host passes. Files staged there but absent from the manifest are ignored.
 Both private directories must still be mounted when the command ends; a sandbox process
 that detached one (by renaming its mount point in the sandbox's namespace) leaves an
-``integrity`` problem the host refuses to grade. After the command exits, the program
+``integrity`` problem the host refuses to grade.
+
+With ``--startup BASELINE SHA256 WORKDIR`` the command also runs without the startup files
+added or changed since the sandbox started (``BASELINE``, taken by ``--scan-startup`` before the
+agent ran): Python ``sitecustomize``/``usercustomize`` and ``.pth`` files no installer recorded,
+modules that shadow the test runner, ``conftest.py`` in ``/`` and the working directory and the agent's git configuration.
+They are hidden in this namespace only, so services the agent left running keep them, and git runs
+with hooks and fsmonitor off. After the command exits, the program
 reports every output it wrote on stdout, as one ``MARKER`` line:
 
 * small files inline (``data``, base64), so the host never reads them from the sandbox;
@@ -54,7 +61,7 @@ INLINE_FILE_BYTES = 64 * 1024
 INLINE_TOTAL_BYTES = 384 * 1024
 
 CLONE_NEWNS = 0x00020000
-MS_NOSUID, MS_NODEV, MS_REC, MS_PRIVATE = 0x2, 0x4, 0x4000, 0x40000
+MS_NOSUID, MS_NODEV, MS_BIND, MS_REC, MS_PRIVATE = 0x2, 0x4, 0x1000, 0x4000, 0x40000
 
 _libc = ctypes.CDLL(None, use_errno=True)
 _libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_char_p]
@@ -130,6 +137,116 @@ def private_tests(source: str, manifest_sha256: str) -> str:
     return mount_id
 
 
+STARTUP_FILES = ("sitecustomize.py", "usercustomize.py")
+SHADOW_MODULES = ("pytest.py", "py.py", "_pytest.py", "pluggy.py", "unittest.py")
+# Directories Python adds at startup, by layout rather than by asking an interpreter (which the agent can replace).
+PYTHON_DIR_GLOBS = (
+    "/usr/lib/python3*",
+    "/usr/lib/python3*/site-packages",
+    "/usr/lib/python3*/dist-packages",
+    "/usr/lib/python3/dist-packages",
+    "/usr/local/lib/python3*",
+    "/usr/local/lib/python3*/site-packages",
+    "/usr/local/lib/python3*/dist-packages",
+    "/opt/*/lib/python3*",
+    "/opt/*/lib/python3*/site-packages",
+    "/opt/*/*/lib/python3*",
+    "/opt/*/*/lib/python3*/site-packages",
+    "/root/.local/lib/python3*/site-packages",
+    "/home/*/.local/lib/python3*/site-packages",
+    "/root/.local/share/uv/python/*/lib/python3*",
+    "/root/.local/share/uv/python/*/lib/python3*/site-packages",
+    "/*/.venv/lib/python3*/site-packages",
+    "/*/*/.venv/lib/python3*/site-packages",
+)
+# pytest's rootdir (``/pytest.ini``) and root's home.
+ROOT_DIRS = ("/", "/root")
+GIT_CONFIGS = ("/etc/gitconfig", "/root/.gitconfig", "/root/.config/git/config")
+# Command-line git settings outrank every config file: no hook or fsmonitor runs inside grading.
+GIT_SETTINGS = (
+    ("core.hooksPath", "/dev/null"),
+    ("core.fsmonitor", "false"),
+    ("commit.gpgSign", "false"),
+    ("tag.gpgSign", "false"),
+)
+
+
+def _digest(path: str) -> str | None:
+    try:
+        with open(path, "rb") as stream:
+            return hashlib.sha256(stream.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def startup_files(workdir: str) -> dict[str, str]:
+    """Files that run code when Python, pytest or git start, with their sha256."""
+    import glob
+
+    found = {}
+    for pattern in PYTHON_DIR_GLOBS:
+        for directory in glob.glob(pattern):
+            if not os.path.isdir(directory) or os.path.islink(directory):
+                continue
+            for name in os.listdir(directory):
+                if name in STARTUP_FILES or name.endswith(".pth"):
+                    found[os.path.join(directory, name)] = None
+    for directory in {*ROOT_DIRS, workdir}:
+        for name in SHADOW_MODULES + (("conftest.py",) if directory in (ROOT_DIRS[0], workdir) else ()):
+            found[os.path.join(directory, name)] = None
+    for path in GIT_CONFIGS:
+        found[path] = None
+    return {path: digest for path in sorted(found) if os.path.isfile(path) and (digest := _digest(path)) is not None}
+
+
+def _installed(path: str) -> bool:
+    """A ``.pth`` file an installer recorded (``*.dist-info/RECORD``) beside it."""
+    import glob
+
+    directory, name = os.path.split(path)
+    for record in glob.glob(os.path.join(glob.escape(directory), "*.dist-info", "RECORD")):
+        try:
+            with open(record, errors="replace") as stream:
+                if any(line.split(",", 1)[0] == name for line in stream):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def neutralize_startup_files(baseline: dict[str, str], workdir: str) -> tuple[list[str], dict[str, str]]:
+    """Hide, in this namespace only, every startup file added or changed since the sandbox started.
+
+    Returns the hidden paths and the environment that keeps the agent's git settings out.
+    """
+    hidden, env = [], {}
+    for path, digest in startup_files(workdir).items():
+        if baseline.get(path) == digest:
+            continue
+        if path in GIT_CONFIGS:
+            system = path == GIT_CONFIGS[0]
+            env["GIT_CONFIG_NOSYSTEM" if system else "GIT_CONFIG_GLOBAL"] = "1" if system else "/dev/null"
+            hidden.append(path)
+            continue
+        if path.endswith(".pth") and _installed(path):
+            continue
+        _mount("/dev/null", path, None, MS_BIND)
+        hidden.append(path)
+    count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or 0)
+    for index, (key, value) in enumerate(GIT_SETTINGS, start=count):
+        env[f"GIT_CONFIG_KEY_{index}"], env[f"GIT_CONFIG_VALUE_{index}"] = key, value
+    env["GIT_CONFIG_COUNT"] = str(count + len(GIT_SETTINGS))
+    return hidden, env
+
+
+def _baseline(path: str, sha256: str) -> dict[str, str]:
+    with open(path, "rb") as stream:
+        raw = stream.read()
+    if hashlib.sha256(raw).hexdigest() != sha256:
+        raise RuntimeError("startup baseline differs from the host's")
+    return json.loads(raw)
+
+
 def detached(mounts: dict[str, str]) -> list[str]:
     """Private mounts that are no longer where the command found them."""
     current = _mount_ids()
@@ -199,11 +316,21 @@ def collect(shared: int | None) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    tests = None
-    if len(argv) == 4 and argv[0] == "--tests":
-        tests, argv = (argv[1], argv[2]), argv[3:]
+    if len(argv) == 2 and argv[0] == "--scan-startup":
+        sys.stdout.write(json.dumps(startup_files(argv[1]), sort_keys=True))
+        return 0
+    tests = startup = None
+    while len(argv) > 1 and argv[0] in ("--tests", "--startup"):
+        if argv[0] == "--tests":
+            tests, argv = (argv[1], argv[2]), argv[3:]
+        else:
+            startup, argv = (argv[1], argv[2], argv[3]), argv[4:]
     if len(argv) != 1:
-        print("usage: private_verifier.py [--tests SOURCE MANIFEST_SHA256] COMMAND", file=sys.stderr)
+        print(
+            "usage: private_verifier.py [--tests SOURCE SHA256] [--startup BASELINE SHA256 WORKDIR] COMMAND"
+            " | --scan-startup WORKDIR",
+            file=sys.stderr,
+        )
         return SETUP_FAILED
     started = time.monotonic()
     report: dict = {"schema": "private-verifier/v1", "setup": None, "exit_code": None, "integrity": []}
@@ -211,6 +338,10 @@ def main(argv: list[str]) -> int:
         shared, mounts = private_directory()
         if tests is not None:
             mounts[TESTS_DIR] = private_tests(*tests)
+        env = None
+        if startup is not None:
+            report["hidden_startup_files"], extra = neutralize_startup_files(_baseline(*startup[:2]), startup[2])
+            env = {**os.environ, **extra}
     except BaseException as error:  # noqa: BLE001 - reported; the command never runs
         report["setup"] = f"{type(error).__name__}: {error}"
         sys.stdout.write(MARKER + json.dumps(report) + "\n")
@@ -218,7 +349,7 @@ def main(argv: list[str]) -> int:
     report["setup_s"] = round(time.monotonic() - started, 4)
     command_started = time.monotonic()
     # The command's output must not mix with the report on stdout.
-    status = subprocess.call(["/bin/sh", "-c", argv[0]], stdin=subprocess.DEVNULL, stdout=2, stderr=2)
+    status = subprocess.call(["/bin/sh", "-c", argv[0]], stdin=subprocess.DEVNULL, stdout=2, stderr=2, env=env)
     report["command_s"] = round(time.monotonic() - command_started, 4)
     report["exit_code"] = status if status >= 0 else 128 - status
     report["integrity"] = [f"private {path} was detached during the command" for path in detached(mounts)]

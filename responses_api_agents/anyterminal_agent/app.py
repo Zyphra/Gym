@@ -919,8 +919,16 @@ PRIVATE_VERIFIER_RECEIPT = "private-verifier.json"
 STAGED_TESTS = "/trajectories_mount/staging/tests"
 
 
-def _private_verifier_command(command: str, tests_manifest_sha256: Optional[str] = None) -> str:
+STARTUP_BASELINE = "/trajectories_mount/staging/startup-baseline.json"
+
+
+def _private_verifier_command(
+    command: str, tests_manifest_sha256: Optional[str] = None, startup: Optional[tuple[str, str]] = None
+) -> str:
+    """``startup`` is the sha256 of the startup baseline and the task's working directory."""
     tests = "" if tests_manifest_sha256 is None else f"--tests {STAGED_TESTS} {tests_manifest_sha256} "
+    if startup is not None:
+        tests += f"--startup {STARTUP_BASELINE} {startup[0]} {shlex.quote(startup[1])} "
     return f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} {tests}{shlex.quote(command)}"
 
 
@@ -1185,6 +1193,7 @@ class RunTerminalAgent(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     config: AnyTerminalInstanceConfig
     _prepared_extension: Optional[dict] = PrivateAttr(default=None)
+    _startup_baseline: Optional[bytes] = PrivateAttr(default=None)
     _prepared_extension_bytes: Optional[bytes] = PrivateAttr(default=None)
 
     @staticmethod
@@ -1567,6 +1576,34 @@ class RunTerminalAgent(BaseModel):
         if extension_runtime.sha256(target) != receipt["output_sha256"]:
             raise RuntimeError("restaged stock extension differs")
 
+    @staticmethod
+    def _task_workdir(cfg: AnyTerminalInstanceConfig) -> str:
+        return cfg.problem_info.get("workdir") or "/"
+
+    async def _record_startup_baseline(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
+        """Record the sandbox's startup files before the agent runs (``private_verifier.py --scan-startup``).
+
+        A task whose answer is such a file sets ``verifier_keeps_agent_startup_files``.
+        """
+        if cfg.problem_info.get("verifier_keeps_agent_startup_files"):
+            return
+        result = await sandbox.exec(
+            f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} --scan-startup {shlex.quote(self._task_workdir(cfg))}",
+            timeout_s=setup_timeout_seconds(60),
+            user="root",
+        )
+        if result.return_code != 0 or result.error_type:
+            raise RuntimeError(f"startup baseline failed: {result.error_type} {(result.stderr or '')[-500:]}")
+        json.loads(result.stdout)
+        self._startup_baseline = result.stdout.encode()
+
+    def _write_startup_baseline(self, cfg: AnyTerminalInstanceConfig) -> Optional[tuple[str, str]]:
+        if self._startup_baseline is None:
+            return None
+        (cfg.persistent_dir / "staging").mkdir(parents=True, exist_ok=True)
+        (cfg.persistent_dir / "staging" / "startup-baseline.json").write_bytes(self._startup_baseline)
+        return hashlib.sha256(self._startup_baseline).hexdigest(), self._task_workdir(cfg)
+
     def _write_tests_manifest(self, cfg: AnyTerminalInstanceConfig) -> str:
         """Describe the tests test.sh may run, from the host's own copies; return the digest."""
         receipt = self._prepared_extension
@@ -1744,7 +1781,9 @@ class RunTerminalAgent(BaseModel):
         if private:
             # Agent processes may outlive the agent phase to serve the tests; none of them
             # sees the directory test.sh writes its reward into or the tests it runs.
-            command = _private_verifier_command(command, self._write_tests_manifest(cfg))
+            command = _private_verifier_command(
+                command, self._write_tests_manifest(cfg), self._write_startup_baseline(cfg)
+            )
         result = await self._exec_verifier(sandbox, command, timeout_s=cfg.tb_eval_timeout, env=verifier_env)
         return_code = result.return_code
         if private and result.error_type is None:
@@ -1814,6 +1853,8 @@ class RunTerminalAgent(BaseModel):
             update_metrics(cfg.metrics_fpath, {"sandbox_ready_at": time.time()}, cfg.task_name)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_runtime(sandbox, cfg)
+            else:
+                await self._record_startup_baseline(sandbox, cfg)
             if cfg.problem_info.get("verifier_extension") is not None:
                 if not self._uses_bind_mounts(cfg):
                     raise ValueError("declared extension requires a local bind-mount provider")
