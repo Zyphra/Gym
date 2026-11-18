@@ -161,6 +161,7 @@ def test_uncompacted_tagged_run_is_unchanged(monkeypatch, tmp_path):
         "pi_restated_requests": "0",
         "pi_continuation": "none",
         "pi_command_timeouts": "0",
+        "pi_cut_tool_results": "0",
     }
 
 
@@ -260,6 +261,7 @@ def test_labels_from_events():
         "pi_restated_requests": "3",
         "pi_continuation": "answer_missing",
         "pi_command_timeouts": "1",
+        "pi_cut_tool_results": "0",
     }
 
 
