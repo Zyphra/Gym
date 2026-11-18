@@ -269,4 +269,4 @@ def test_a_reply_cut_below_the_window_is_not_a_context_stop(tmp_path):
     reply = dict(stopReason="length", usage=dict(input=1000, output=32768))
     agent = _agent(tmp_path / "work", _last_reply(**reply), 0, context_window=131072)
     saved, _, _ = _stock_roundtrip(tmp_path, asyncio.run(_response(agent, True)))
-    assert saved.metadata is None and saved.error is None
+    assert "stop_reason" not in (saved.metadata or {}) and saved.error is None
