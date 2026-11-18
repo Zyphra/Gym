@@ -926,11 +926,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 else {
                     "stop_reason": result.budget_stop[0],
                     "pi_stop_detail": result.budget_stop[1],
-                    **(
-                        {"turn_cap_answer": result.turn_cap_answer}
-                        if result.turn_cap_answer is not None
-                        else {}
-                    ),
+                    **({"turn_cap_answer": result.turn_cap_answer} if result.turn_cap_answer is not None else {}),
                 }
                 if result.budget_stop
                 else None
