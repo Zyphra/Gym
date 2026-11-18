@@ -126,20 +126,30 @@ def _episode(monkeypatch, tmp_path, max_turns, extra="", text_from=None, **confi
     return episode.response, endpoint.requests, marker.read_text().split() if marker.exists() else []
 
 
+def _cap_text(request: dict) -> str:
+    last = request["messages"][-1]
+    assert last["role"] == "user"
+    return last["content"] if isinstance(last["content"], str) else last["content"][-1]["text"]
+
+
 def test_max_turns_ends_after_the_last_turns_tools(monkeypatch, tmp_path):
     response, requests, ran = _episode(monkeypatch, tmp_path, max_turns=3)
-    # The tools of all three turns run; the cap request forbids tool calls, an endpoint that ignores
-    # that returns one anyway, it runs, and the fifth request is never sent.
-    assert len(requests) == 4 and ran == ["1", "2", "3", "4"]
-    assert [request.get("tool_choice") for request in requests] == [None, None, None, "none"]
-    assert requests[-1]["tools"] == requests[0]["tools"]
+    # The tools of all three turns run. The cap request forbids tool calls; an endpoint that ignores that
+    # returns one anyway, which is blocked, and the cap request is asked once more. That reply's call is
+    # blocked too and ends the run: no sixth request, no fourth tool turn.
+    assert len(requests) == 5 and ran == ["1", "2", "3"]
+    assert [request.get("tool_choice") for request in requests] == [None, None, None, "none", "none"]
+    assert requests[3]["tools"] == requests[0]["tools"] == requests[4]["tools"]
+    assert _cap_text(requests[3]).startswith("You have used all 3 turns; tools no longer run.")
+    assert _cap_text(requests[4]).startswith("You have used all 3 turns; tools no longer run.")
+    # The re-ask carries the blocked call's result, which says why it did not run.
+    assert "3-turn limit is reached" in json.dumps(requests[4]["messages"][-2])
     assert response.error is None and response.status is None
     assert response.metadata == {
         "stop_reason": "max_iterations",
         "pi_stop_detail": "Pi reached max_turns=3",
         "turn_cap_answer": "tool_call",
     }
-    assert [item.type for item in response.output].count("function_call") == 4
     assert not _should_mask_sample(True, "max_iteration", False, None, "max_iterations")
 
 
@@ -148,9 +158,7 @@ def test_cap_request_answer_is_the_final_text(monkeypatch, tmp_path):
     # Three tool turns, then the cap request: tools offered, calls forbidden, the cap message last.
     assert len(requests) == 4 and ran == ["1", "2", "3"]
     assert requests[-1]["tool_choice"] == "none" and requests[-1]["tools"] == requests[0]["tools"]
-    last = requests[-1]["messages"][-1]
-    text = last["content"] if isinstance(last["content"], str) else last["content"][0]["text"]
-    assert last["role"] == "user" and text.startswith("You have used all 3 turns; no turn follows this reply.")
+    assert _cap_text(requests[-1]).startswith("You have used all 3 turns; tools no longer run.")
     assert response.error is None and response.status is None
     assert response.metadata == {
         "stop_reason": "max_iterations",
@@ -159,6 +167,20 @@ def test_cap_request_answer_is_the_final_text(monkeypatch, tmp_path):
     }
     # The answer is the response's last assistant message, which graders read as the final message.
     assert response.output[-1].type == "message" and response.output[-1].content[0].text == "answer 4"
+
+
+def test_cap_reply_call_is_blocked_and_the_reask_answer_is_final(monkeypatch, tmp_path):
+    response, requests, ran = _episode(monkeypatch, tmp_path, max_turns=3, text_from=5)
+    # The cap reply's call does not run; the one re-ask is answered with text, which ends the run.
+    assert len(requests) == 5 and ran == ["1", "2", "3"]
+    assert requests[-1]["tool_choice"] == "none"
+    assert response.error is None and response.status is None
+    assert response.metadata == {
+        "stop_reason": "max_iterations",
+        "pi_stop_detail": "Pi reached max_turns=3",
+        "turn_cap_answer": "reask_reply",
+    }
+    assert response.output[-1].type == "message" and response.output[-1].content[0].text == "answer 5"
 
 
 @pytest.mark.skipif(
@@ -173,7 +195,7 @@ def test_hidden_harness_mounts_are_empty_for_pi_bash(monkeypatch, tmp_path):
         listing = f"; ls -A {mount} | wc -l"
         response, _, ran = _episode(monkeypatch, tmp_path, 1, listing, hide_harness_mounts=True)
         output = [item.output for item in response.output if item.type == "function_call_output"]
-        assert ran == ["1", "2"] and output[0].strip() == "0"
+        assert ran == ["1"] and output[0].strip() == "0"
         (tmp_path / "plain").mkdir()
         response, _, _ = _episode(monkeypatch, tmp_path / "plain", 1, listing)
         output = [item.output for item in response.output if item.type == "function_call_output"]

@@ -80,7 +80,11 @@ model call. Model rollout and multi-segment training qualification are separate.
   (`nemo_gym/hidden_mounts.py`, as Hermes does). Pi's bash tool takes the hiding shell as its `shellPath`;
   an extension that spawns its own shell reads `PI_HIDE_HARNESS_MOUNTS=1`.
 - `max_turns`: assistant requests per run (Pi has none of its own). When set, the agent loads
-  `turn_limit.ts`, which aborts the request after the last allowed turn, once that turn's tools have run.
+  `turn_limit.ts`. The request after the last allowed turn is the cap request: it asks for the final
+  answer as text with `tool_choice: "none"`. A tool call in its reply (an endpoint that ignores
+  `tool_choice`) is blocked and the cap request is asked once more; a call in that reply is blocked and
+  ends the run. `metadata.turn_cap_answer` says how the cap was answered (`tool_free_reply`,
+  `reask_reply`, `tool_call` or `none`).
 - `request_tools`: offer the request's function tools (a row's `responses_create_params.tools`). The agent
   loads `request_tools.ts`, and each call is `POST /<tool name>` on the resources server in the episode's
   session, as `simple_agent` makes it. `extra_args: [--no-builtin-tools, --no-extensions, ...]` makes them
