@@ -10,8 +10,14 @@ service the agent started. Those processes share the sandbox's mount namespace, 
 process left behind could rewrite ``/logs/verifier/reward.txt`` after ``test.sh`` wrote it.
 This program gives the command its own mount namespace in which ``/logs/verifier`` is an
 empty tmpfs. Everything else is the sandbox's own view: the same files, processes, network
-and services. After the command exits, the program reports every output it wrote on stdout,
-as one ``MARKER`` line:
+and services. With ``--tests SOURCE SHA256`` the command also reads its tests from a private ``/tests``:
+the program copies them from ``SOURCE`` (the staged tree, which sandbox processes can
+rewrite) and admits a file only if its bytes match the host's manifest ``SOURCE-manifest.json``
+whose sha256 the host passes. Files staged there but absent from the manifest are ignored.
+Both private directories must still be mounted when the command ends; a sandbox process
+that detached one (by renaming its mount point in the sandbox's namespace) leaves an
+``integrity`` problem the host refuses to grade. After the command exits, the program
+reports every output it wrote on stdout, as one ``MARKER`` line:
 
 * small files inline (``data``, base64), so the host never reads them from the sandbox;
 * larger files by size and sha256, copied into the shared ``/logs/verifier`` for the host
@@ -39,6 +45,9 @@ import time
 
 MARKER = "NEMO_GYM_PRIVATE_VERIFIER "
 VERIFIER_DIR = "/logs/verifier"
+TESTS_DIR = "/tests"
+TESTS_MANIFEST_SUFFIX = "-manifest.json"
+COPY_CHUNK = 1 << 20
 SETUP_FAILED = 125
 # Inline outputs keep the report well under a provider's 1 MiB exec output capture.
 INLINE_FILE_BYTES = 64 * 1024
@@ -58,17 +67,73 @@ def _mount(source: str | None, target: str, fstype: str | None, flags: int, data
         raise OSError(error, f"mount {target}: {os.strerror(error)}")
 
 
-def private_directory() -> int:
+def _mount_ids() -> dict[str, str]:
+    """Mount point -> mount id of this namespace's mounts."""
+    with open("/proc/self/mountinfo") as stream:
+        fields = [line.split() for line in stream]
+    return {field[4]: field[0] for field in fields}
+
+
+def _private_tmpfs(path: str) -> str:
+    """Mount an empty tmpfs at ``path`` in this namespace; return its mount id."""
+    _mount("tmpfs", path, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755")
+    # A link raced in at ``path`` would have moved the mount elsewhere.
+    mount_id = _mount_ids().get(path)
+    if mount_id is None or os.path.realpath(path) != path:
+        raise RuntimeError(f"private {path} is not mounted at {path}")
+    if os.listdir(path):
+        raise RuntimeError(f"private {path} is not empty")
+    return mount_id
+
+
+def private_directory() -> tuple[int, dict[str, str]]:
     """Cover ``/logs/verifier`` in a new mount namespace; return a descriptor of the shared one."""
     os.makedirs(VERIFIER_DIR, exist_ok=True)
     shared = os.open(VERIFIER_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     os.unshare(CLONE_NEWNS)
     # Nothing mounted here may propagate back into the sandbox's namespace.
     _mount(None, "/", None, MS_REC | MS_PRIVATE)
-    _mount("tmpfs", VERIFIER_DIR, "tmpfs", MS_NOSUID | MS_NODEV, "mode=0755")
-    if os.listdir(VERIFIER_DIR):
-        raise RuntimeError("private verifier directory is not empty")
-    return shared
+    return shared, {VERIFIER_DIR: _private_tmpfs(VERIFIER_DIR)}
+
+
+def private_tests(source: str, manifest_sha256: str) -> str:
+    """Fill a private ``/tests`` with exactly the manifest's files, each verified as written."""
+    with open(source + TESTS_MANIFEST_SUFFIX, "rb") as stream:
+        raw = stream.read()
+    if hashlib.sha256(raw).hexdigest() != manifest_sha256:
+        raise RuntimeError("tests manifest differs from the host's")
+    manifest = json.loads(raw)
+    if os.path.islink(TESTS_DIR) or (os.path.lexists(TESTS_DIR) and not os.path.isdir(TESTS_DIR)):
+        os.unlink(TESTS_DIR)
+    os.makedirs(TESTS_DIR, exist_ok=True)
+    mount_id = _private_tmpfs(TESTS_DIR)
+    for directory in manifest["directories"]:
+        os.mkdir(os.path.join(TESTS_DIR, directory), 0o755)
+    for link in manifest["links"]:
+        os.symlink(link["target"], os.path.join(TESTS_DIR, link["path"]))
+    for entry in manifest["files"]:
+        digest, size = hashlib.sha256(), 0
+        target = os.path.join(TESTS_DIR, entry["path"])
+        with (
+            open(os.path.join(source, entry["path"]), "rb") as src,
+            open(
+                os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600), "wb"
+            ) as dst,
+        ):
+            while chunk := src.read(COPY_CHUNK):
+                digest.update(chunk)
+                size += len(chunk)
+                dst.write(chunk)
+        if size != entry["size"] or digest.hexdigest() != entry["sha256"]:
+            raise RuntimeError(f"staged test {entry['path']} differs from the task source")
+        os.chmod(target, entry["mode"])
+    return mount_id
+
+
+def detached(mounts: dict[str, str]) -> list[str]:
+    """Private mounts that are no longer where the command found them."""
+    current = _mount_ids()
+    return [path for path, mount_id in sorted(mounts.items()) if current.get(path) != mount_id]
 
 
 def _copy_out(shared: int, relative: str, data: bytes, mode: int) -> None:
@@ -134,13 +199,18 @@ def collect(shared: int | None) -> dict:
 
 
 def main(argv: list[str]) -> int:
+    tests = None
+    if len(argv) == 4 and argv[0] == "--tests":
+        tests, argv = (argv[1], argv[2]), argv[3:]
     if len(argv) != 1:
-        print("usage: private_verifier.py COMMAND", file=sys.stderr)
+        print("usage: private_verifier.py [--tests SOURCE MANIFEST_SHA256] COMMAND", file=sys.stderr)
         return SETUP_FAILED
     started = time.monotonic()
-    report: dict = {"schema": "private-verifier/v1", "setup": None, "exit_code": None}
+    report: dict = {"schema": "private-verifier/v1", "setup": None, "exit_code": None, "integrity": []}
     try:
-        shared = private_directory()
+        shared, mounts = private_directory()
+        if tests is not None:
+            mounts[TESTS_DIR] = private_tests(*tests)
     except BaseException as error:  # noqa: BLE001 - reported; the command never runs
         report["setup"] = f"{type(error).__name__}: {error}"
         sys.stdout.write(MARKER + json.dumps(report) + "\n")
@@ -151,6 +221,7 @@ def main(argv: list[str]) -> int:
     status = subprocess.call(["/bin/sh", "-c", argv[0]], stdin=subprocess.DEVNULL, stdout=2, stderr=2)
     report["command_s"] = round(time.monotonic() - command_started, 4)
     report["exit_code"] = status if status >= 0 else 128 - status
+    report["integrity"] = [f"private {path} was detached during the command" for path in detached(mounts)]
     collect_started = time.monotonic()
     report.update(collect(shared))
     report["collect_s"] = round(time.monotonic() - collect_started, 4)
