@@ -2,6 +2,13 @@
 
 A NeMo Gym resource server that integrates **VerifIF** (Verifiable Instruction Following) validators for comprehensive instruction-following evaluation in reinforcement learning training.
 
+English keyword checks count words enclosed in single quotes. Apostrophes and
+hyphens inside a word remain part of that word, so a keyword does not match a
+longer contraction or hyphenated compound. The same boundary applies to
+existence, frequency and forbidden-word checks; source/misalignment inversion
+and native aggregation are unchanged. Focused deterministic verification
+controls do not establish policy transfer or model-rollout qualification.
+
 ## Overview
 
 This resource server provides two types of validators:
