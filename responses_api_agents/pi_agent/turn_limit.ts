@@ -3,19 +3,19 @@
 /**
  * PiAgentConfig.max_turns for `pi --print`, which has no turn limit of its own. Every policy request
  * passes Pi's `context` event first. The request after the last allowed one is the cap request: it
- * carries a request-local message saying the turns are used up and is sent with tool calls forbidden
- * (`tool_choice: "none"`, tools still offered so the request extends the cached context), so the
- * policy's answer reaches the run as text, as Hermes' turn-cap summary and simple_agent's
- * `final_answer_after_max_steps` do. A tool call in that reply is blocked and ends the run, and any
- * later request is aborted before it is sent. The marker on stderr tells the Gym agent that this
- * extension, not a failure, stopped the run.
+ * carries a request-local message saying the turns are used up and asking for the final answer, and is
+ * sent with `tool_choice: "none"` (tools still offered, so the request extends the cached context), as
+ * Hermes' turn-cap summary and simple_agent's `final_answer_after_max_steps` do. An endpoint that does
+ * not honour `tool_choice` may still return a call; it runs, since the policy often answers by writing
+ * the task's answer file. Any later request is aborted before it is sent. The marker on stderr tells
+ * the Gym agent that this extension, not a failure, stopped the run.
  */
 export const MARKER = "pi_gym_turn_limit";
 
 export function capMessage(limit: number): string {
   return (
-    `You have used all ${limit} turns; tools no longer run. ` +
-    "Reply now with your final answer as text, in the format the task requires."
+    `You have used all ${limit} turns; no turn follows this reply. ` +
+    "Give your final answer now, in the format the task requires."
   );
 }
 
@@ -38,7 +38,4 @@ export default function turnLimit(pi: any) {
     if (requests !== limit + 1 || !event.payload || typeof event.payload !== "object") return undefined;
     return { ...event.payload, tool_choice: "none" };
   });
-  pi.on("tool_call", () =>
-    requests > limit ? { block: true, reason: `the ${limit}-turn limit is reached`, terminate: true } : undefined,
-  );
 }

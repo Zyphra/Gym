@@ -128,16 +128,16 @@ def _episode(monkeypatch, tmp_path, max_turns, extra="", text_from=None, **confi
 
 def test_max_turns_ends_after_the_last_turns_tools(monkeypatch, tmp_path):
     response, requests, ran = _episode(monkeypatch, tmp_path, max_turns=3)
-    # The tools of all three turns run; the cap request forbids tools, its call is blocked, and no
-    # fifth request is sent.
-    assert len(requests) == 4 and ran == ["1", "2", "3"]
+    # The tools of all three turns run; the cap request forbids tool calls, an endpoint that ignores
+    # that returns one anyway, it runs, and the fifth request is never sent.
+    assert len(requests) == 4 and ran == ["1", "2", "3", "4"]
     assert [request.get("tool_choice") for request in requests] == [None, None, None, "none"]
     assert requests[-1]["tools"] == requests[0]["tools"]
     assert response.error is None and response.status is None
     assert response.metadata == {
         "stop_reason": "max_iterations",
         "pi_stop_detail": "Pi reached max_turns=3",
-        "turn_cap_answer": "none",
+        "turn_cap_answer": "tool_call",
     }
     assert [item.type for item in response.output].count("function_call") == 4
     assert not _should_mask_sample(True, "max_iteration", False, None, "max_iterations")
@@ -150,7 +150,7 @@ def test_cap_request_answer_is_the_final_text(monkeypatch, tmp_path):
     assert requests[-1]["tool_choice"] == "none" and requests[-1]["tools"] == requests[0]["tools"]
     last = requests[-1]["messages"][-1]
     text = last["content"] if isinstance(last["content"], str) else last["content"][0]["text"]
-    assert last["role"] == "user" and text.startswith("You have used all 3 turns; tools no longer run.")
+    assert last["role"] == "user" and text.startswith("You have used all 3 turns; no turn follows this reply.")
     assert response.error is None and response.status is None
     assert response.metadata == {
         "stop_reason": "max_iterations",
@@ -173,7 +173,7 @@ def test_hidden_harness_mounts_are_empty_for_pi_bash(monkeypatch, tmp_path):
         listing = f"; ls -A {mount} | wc -l"
         response, _, ran = _episode(monkeypatch, tmp_path, 1, listing, hide_harness_mounts=True)
         output = [item.output for item in response.output if item.type == "function_call_output"]
-        assert ran == ["1"] and output[0].strip() == "0"
+        assert ran == ["1", "2"] and output[0].strip() == "0"
         (tmp_path / "plain").mkdir()
         response, _, _ = _episode(monkeypatch, tmp_path / "plain", 1, listing)
         output = [item.output for item in response.output if item.type == "function_call_output"]
