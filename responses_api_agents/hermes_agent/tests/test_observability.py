@@ -317,6 +317,50 @@ def test_compaction_is_explicit_and_hook_failures_do_not_break_execution():
     assert "compaction_tokens_after_unavailable" not in {gap.code for gap in bundle.gaps}
 
 
+def _turn(n):
+    return [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"call_{n}",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": json.dumps({"command": f"step {n}"})},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": f"call_{n}", "content": f"result {n}"},
+    ]
+
+
+def test_root_conversation_keeps_the_turns_each_compaction_dropped():
+    summary = {"role": "user", "content": "[CONTEXT COMPACTION] summary"}
+
+    class _CompactingAgent(_FakeAgent):
+        # Each compaction keeps the task, a summary and the newest turn; the run then appends.
+        def _compress_context(self, messages, system_message, **kwargs):
+            return [messages[0], summary, *messages[-2:]], system_message
+
+    agent = _CompactingAgent()
+    observer = HermesAgentObserver().instrument(agent)
+    messages = [{"role": "user", "content": "task"}, *_turn(1), *_turn(2)]
+    messages, _ = agent._compress_context(messages, "system")
+    messages += _turn(3) + _turn(4)
+    messages, _ = agent._compress_context(messages, "system")
+    messages += _turn(5) + [{"role": "assistant", "content": "final answer"}]
+    bundle = observer.finish({"completed": True, "messages": messages})
+
+    conversation = _invocation(bundle, "root").conversation
+    calls = [item.call_id for item in conversation if getattr(item, "type", None) == "function_call"]
+    assert calls == ["call_1", "call_2", "call_3", "call_4", "call_5"]
+    outputs = [item.output for item in conversation if getattr(item, "type", None) == "function_call_output"]
+    assert outputs == ["result 1", "result 2", "result 3", "result 4", "result 5"]
+    assert "summary" not in json.dumps([item.model_dump(mode="json") for item in conversation])
+    assert "final answer" in json.dumps(conversation[-1].model_dump(mode="json"))
+    assert len(_compactions(bundle)) == 2
+
+
 def test_failed_compaction_is_recorded_without_swallowing_the_error():
     agent = _FakeAgent()
     agent._compress_context = MagicMock(side_effect=RuntimeError("compression failed"))
