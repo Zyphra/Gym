@@ -56,7 +56,9 @@ settings. Hermes is configured only through its own `config.yaml` and constructo
 - `compression.threshold` / `target_ratio` from the fields below;
 - `auxiliary.title_generation.enabled: false` and no background review, so the compression
   summary is the only auxiliary request that reaches the policy;
-- `auxiliary.compression.timeout` from `api_timeout`.
+- `auxiliary.compression.timeout` from `api_timeout`, and `auxiliary.compression.extra_body.max_tokens`
+  from `compression_max_tokens`, else `max_tokens`. Hermes discards a summary cut at that budget
+  and keeps the uncompressed history, so a short turn budget needs its own summary budget.
 
 Hermes streams its compression request; the rollout endpoint serves whole completions only and
 refuses it, and Hermes repeats the request without streaming. When the endpoint ends an episode

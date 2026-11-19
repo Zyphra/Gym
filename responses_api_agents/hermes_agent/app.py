@@ -641,6 +641,10 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     # detailed session log to the summary request and a clamped tail; "legacy" keeps the structured
     # summary and the target_ratio tail. None keeps Hermes' default.
     compression_tail_mode: Literal["lean", "legacy"] | None = None
+    # Output budget of the compression summary call (auxiliary.compression extra_body max_tokens).
+    # Hermes discards a summary cut at it and keeps the full history, so a run whose turn budget
+    # (max_tokens) is short gives the summary its own. None uses max_tokens.
+    compression_max_tokens: int | None = Field(default=None, gt=0)
     api_key: Optional[str] = None
     delegation_max_iterations: int = 50
     checkpoints_enabled: bool = False
@@ -788,7 +792,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             # generation is switched off with its own setting, and the compression call gets the
             # run's request budget instead of Hermes' 120 s auxiliary default. Hermes sends its summary
             # call without max_tokens (its summary budget is only a target in the prompt, and reasoning
-            # is not counted against it), so the call states the run's per-request output budget.
+            # is not counted against it), so the call states its output budget: compression_max_tokens, else max_tokens.
             "auxiliary": {
                 "title_generation": {"enabled": False},
                 **({"compression": self._compression_aux_config()} if self._compression_aux_config() else {}),
@@ -814,8 +818,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
         aux: dict[str, Any] = {}
         if self.config.api_timeout:
             aux["timeout"] = self.config.api_timeout
-        if self.config.max_tokens:
-            aux["extra_body"] = {"max_tokens": self.config.max_tokens}
+        budget = self.config.compression_max_tokens or self.config.max_tokens
+        if budget:
+            aux["extra_body"] = {"max_tokens": budget}
         return aux
 
     def model_post_init(self, __context: Any) -> None:

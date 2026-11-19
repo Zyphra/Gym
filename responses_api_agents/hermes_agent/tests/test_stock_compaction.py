@@ -40,7 +40,7 @@ def _is_summary_request(body: dict) -> bool:
 class _PolicyFixture:
     """A local OpenAI-compatible policy server recording every request it serves."""
 
-    def __init__(self, summary: dict, main_turns: list[dict] | None = None):
+    def __init__(self, summary, main_turns: list[dict] | None = None):
         self.requests: list[tuple[str, dict]] = []
         self.probes: list[str] = []
         self.refused_streams: list[str] = []
@@ -72,7 +72,8 @@ class _PolicyFixture:
                 fixture.requests.append((self.path, body))
                 prompt_tokens = len(json.dumps(body["messages"])) // 4
                 if _is_summary_request(body):
-                    status, choice = summary["status"], summary.get("choice")
+                    served = summary(body) if callable(summary) else summary
+                    status, choice = served["status"], served.get("choice")
                 else:
                     status = 200
                     message = (
@@ -400,3 +401,51 @@ def test_compaction_trigger_counts_the_output_reserve_once(monkeypatch, tmp_path
     trigger = native.context_compressor.threshold_tokens
     assert trigger == int((CONTEXT_WINDOW - 32768) * 0.85) == 83558
     assert trigger + 32768 <= CONTEXT_WINDOW
+
+
+def _summary_needing(tokens: int):
+    """A summary that needs ``tokens`` output tokens: a smaller budget cuts it at the length limit."""
+
+    def serve(body: dict) -> dict:
+        if body["max_tokens"] >= tokens:
+            return _SUMMARY_OK
+        return {
+            "status": 200,
+            "choice": {
+                "message": {
+                    "role": "assistant",
+                    "content": "## Goal\nPartial",
+                    "reasoning_content": "fixture reasoning",
+                },
+                "finish_reason": "length",
+            },
+        }
+
+    return serve
+
+
+@pytest.mark.parametrize("summary_budget, compacted", [(None, False), (32768, True)])
+def test_a_summary_longer_than_the_turn_budget_needs_its_own_budget(monkeypatch, tmp_path, summary_budget, compacted):
+    """With 16,384-token turns, a 20,000-token summary is cut and discarded unless it has its own budget."""
+    native_agents: list = []
+    settings = {"compression_max_tokens": summary_budget} if summary_budget else {}
+    with _PolicyFixture(_summary_needing(20000), main_turns=[_todo_turn()]) as policy:
+        app = _agent(
+            tmp_path,
+            monkeypatch,
+            policy.server.server_port,
+            native_agents,
+            enabled_toolsets=["todo"],
+            max_tokens=16384,
+            **settings,
+        )
+        [response] = _run(app, _long_history_input(), "rollout-s")
+        summaries, mains = policy.summaries(), policy.mains()
+
+    assert response.status == "completed"
+    assert summaries and {body["max_tokens"] for _, body in summaries} == {summary_budget or 16384}
+    assert {body["max_tokens"] for _, body in mains} == {16384}
+    # A completed summary replaces the history; a cut one is discarded and the history kept.
+    last = json.dumps(mains[-1][1]["messages"])
+    assert ("Verified fixture summary." in last) is compacted
+    assert (last.count("history message ") == 34) is not compacted
