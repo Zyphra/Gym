@@ -29,6 +29,7 @@ import logging
 import os
 import posixpath
 import pwd
+import re
 import shlex
 import shutil
 import signal
@@ -190,6 +191,12 @@ class EnrootCreateConfig:
     # is intentionally required.
     bypass_entrypoint: bool = True
     init_command: str = DEFAULT_INIT_COMMAND
+    # "real": every sandbox gets its own user namespace mapped from the caller's
+    # subordinate IDs, and creation fails if that is not possible or a probe finds
+    # credential calls faked. "emulated": stock Enroot (one mapped uid, setgroups
+    # denied, chown/set*id reported done without effect). "auto": real when the
+    # prerequisites hold, else emulated; the choice and its reason are logged.
+    credentials: str = "auto"
     import_timeout_s: float | None = 1800
     create_timeout_s: float | None = 600
     start_timeout_s: float | None = 600
@@ -267,6 +274,7 @@ class _EnrootInstance:
     # Namespaces (``/proc/<pid>/ns`` names) the init does not share with this process.
     # Set at create; ``None`` before the init exists.
     entered_namespaces: tuple[str, ...] | None = None
+    credentials: str | None = None  # "real" or "emulated", as selected for this provider
 
 
 # Credential changes inside a sandbox must be real, as under Docker: Postfix ``smtpd``,
@@ -287,13 +295,16 @@ class _EnrootInstance:
 # joins the init's user namespace with ``nsenter`` and then the rest with
 # ``enroot-nsenter`` without ``--user``: ``enroot exec`` (Enroot's ``runtime::exec``)
 # minus the emulation, with the init's environment plus the named caller variables and
-# the init's working directory. Without a range (or when the provider already runs as
-# root), a sandbox whose init shares the provider's user namespace is entered the same
-# way, and any other keeps ``enroot exec`` unchanged.
+# the init's working directory. Without a range every sandbox keeps stock ``enroot exec``,
+# including one whose init shares the provider's user namespace: entered without
+# Enroot's namespace there, its root would hold the provider's capabilities over the
+# provider's own mounts.
 _SUBORDINATE_ID_MINIMUM = 65536
 _ROOTFS_COMMANDS = frozenset({"create", "start", "remove"})
 # Released by the provider once the ID maps are written; Enroot must not start before.
 _MAPPED_NAMESPACE_RELEASE = 'read -r _ || exit 125; exec "$@"'
+# Enroot's own rule for exec environment names (runtime.sh ``runtime::exec``).
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EXEC_NAMESPACE_FLAGS = (("pid", "--pid"), ("mnt", "--mount"), ("net", "--net"), ("ipc", "--ipc"), ("uts", "--uts"))
 _SHARED_USER_NAMESPACE_EXEC = r"""
 set -eu
@@ -350,6 +361,37 @@ def _subordinate_ids() -> _SubordinateIds | None:
     return _SubordinateIds(uid=uid, gid=gid, **tools)
 
 
+def _own_seccomp() -> int | None:
+    with contextlib.suppress(OSError, ValueError):
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Seccomp:"):
+                return int(line.split()[1])
+    return None
+
+
+def _select_credentials(requested: str) -> tuple[_SubordinateIds | None, str, str]:
+    """(ids, mode, reason) for ``create.credentials``; ``real`` raises instead of falling back."""
+    if requested not in ("auto", "real", "emulated"):
+        raise ValueError(f"create.credentials must be auto, real or emulated, not {requested!r}")
+    if requested == "emulated":
+        return None, "emulated", "requested"
+    ids, problem = _subordinate_ids(), None
+    if ids is None:
+        problem = (
+            "the provider runs as root"
+            if os.geteuid() == 0
+            else "no >= 65536 /etc/subuid and /etc/subgid range for the caller, or unshare/nsenter/newuidmap/newgidmap missing"
+        )
+    elif _own_seccomp() != 0:
+        problem = "the provider itself runs under a seccomp filter, which every sandbox would inherit"
+    if problem is None:
+        return ids, "real", "subordinate IDs " + ":".join(map(str, ids.uid))
+    if requested == "real":
+        raise EnrootCreateError(f"create.credentials=real is not possible here: {problem}")
+    LOGGER.warning("enroot sandbox credentials fall back to emulated: %s", problem)
+    return None, "emulated", problem
+
+
 def _manages_rootfs(binary: str, argv: list[str]) -> bool:
     """Whether ``argv`` (possibly behind a launcher prefix) creates, starts or removes a rootfs."""
     return any(argv[i] == binary and argv[i + 1] in _ROOTFS_COMMANDS for i in range(len(argv) - 1))
@@ -379,19 +421,30 @@ def _exec_argv(
     command: list[str],
     user_nsenter: str | None = None,
 ) -> list[str]:
-    """``enroot exec`` argv, or its no-emulation equivalent for a sandbox with real credentials.
+    """``enroot exec`` argv, or its no-emulation equivalent for a sandbox in its own mapped user namespace.
 
-    ``user_nsenter`` names the ``nsenter`` that joins a sandbox's own mapped user
-    namespace; without it an init in another user namespace keeps ``enroot exec``.
+    Only a sandbox whose init is in a different user namespace and a provider with a
+    mapped mode (``user_nsenter``) leave ``enroot exec``; everything else, including an
+    init that shares the provider's user namespace, keeps it.
     """
-    if entered is None or ("user" in entered and user_nsenter is None):
+    if entered is None or user_nsenter is None or "user" not in entered:
         return [binary, "exec", *flags, str(pid), *command]
     if len(flags) % 2 or any(flag != "-e" for flag in flags[::2]):
         raise ValueError(f"exec options other than -e NAME cannot enter without Enroot's emulation: {flags}")
     names = flags[1::2]
+    bad = [name for name in names if not _ENV_NAME.match(name)]
+    if bad:
+        raise ValueError(f"invalid environment variable names for a sandbox exec: {bad!r}")
     nsenter = str(Path(binary).parent / "enroot-nsenter")
     ns_flags = [flag for ns, flag in _EXEC_NAMESPACE_FLAGS if ns in entered]
-    argv = [
+    return [
+        str(user_nsenter),
+        "--target",
+        str(pid),
+        "--user",
+        # Keep the init's groups (nsenter would otherwise setgroups(0) every exec).
+        "--preserve-credentials",
+        "--",
         "/bin/bash",
         "-c",
         _SHARED_USER_NAMESPACE_EXEC,
@@ -404,9 +457,6 @@ def _exec_argv(
         "--",
         *command,
     ]
-    if "user" in entered:
-        argv = [str(user_nsenter), "--target", str(pid), "--user", "--", *argv]
-    return argv
 
 
 def is_exec_argv(binary: str, argv: list[str]) -> bool:
@@ -526,7 +576,8 @@ class EnrootProvider:
             # defaults this to "no"; we always force it on.
             "ENROOT_UNSHARE_PID": "yes",
         }
-        self._subordinate_ids = _subordinate_ids()
+        self._subordinate_ids, self.credentials_mode, reason = _select_credentials(self._create_config.credentials)
+        LOGGER.info("enroot sandbox credentials: %s (%s)", self.credentials_mode, reason)
         if self._subordinate_ids is not None:
             # Enroot runs as root of each sandbox's own mapped user namespace.
             self._enroot_env["ENROOT_ALLOW_SUPERUSER"] = "yes"
@@ -795,6 +846,9 @@ class EnrootProvider:
         try:
             instance.container_pid = await self._await_container_pid(instance, err_f)
             instance.entered_namespaces = _namespaces_not_shared(instance.container_pid)
+            instance.credentials = self.credentials_mode
+            if self.credentials_mode == "real":
+                await self._verify_real_credentials(handle)
             await self._verify_created_handle(handle)
         except Exception:
             await self._cleanup_failed_create_handle(handle)
@@ -925,6 +979,44 @@ class EnrootProvider:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(instance.start_pgid, sig)
 
+    async def _verify_real_credentials(self, handle: SandboxHandle) -> None:
+        """Fail the create unless the sandbox has its own namespace and chown/setuid really happen."""
+        instance = handle.raw
+        if instance.entered_namespaces is None or "user" not in instance.entered_namespaces:
+            raise EnrootCreateError(
+                f"sandbox {instance.name!r} is not in its own user namespace (entered={instance.entered_namespaces})"
+            )
+        probe = (
+            'f=$(mktemp) && chown 1:1 "$f"; echo "own=$(stat -c %u:%g "$f")"; rm -f "$f"; '
+            'if command -v setpriv >/dev/null 2>&1; then echo "uid=$(setpriv --reuid=1 --regid=1 --clear-groups id -u)"; fi; '
+            "grep '^Seccomp:' /proc/self/status"
+        )
+        result = await self.exec(handle, probe, timeout_s=self._exec_config.default_timeout_s)
+        facts = dict(
+            line.replace("Seccomp:", "seccomp=").replace("\t", "").split("=", 1)
+            for line in (result.stdout or "").splitlines()
+            if "=" in line or line.startswith("Seccomp:")
+        )
+        if facts.get("own") != "1:1" or facts.get("uid", "1") != "1" or facts.get("seccomp", "").strip() != "0":
+            raise EnrootCreateError(
+                f"sandbox {instance.name!r} credential probe failed (real credentials required): "
+                f"rc={result.return_code} facts={facts} err={(result.stderr or '')[-300:]!r}"
+            )
+
+    async def remove_tree(self, path: Path) -> None:
+        """Remove a host tree a sandbox wrote, including files its task accounts own."""
+        if not (path.exists() or path.is_symlink()):
+            return
+        if self._subordinate_ids is not None:
+            with contextlib.suppress(Exception):
+                await self._run(
+                    ["/bin/rm", "-rf", "--", str(path)],
+                    timeout_s=self._exec_config.default_timeout_s,
+                    namespaced=True,
+                )
+        if path.exists() or path.is_symlink():
+            _remove_staging_dir(path)
+
     async def _cleanup_failed_create_handle(self, handle: SandboxHandle) -> None:
         """Best-effort teardown of a sandbox that failed to start or verify."""
         instance = handle.raw
@@ -938,7 +1030,7 @@ class EnrootProvider:
                 timeout_s=self._exec_config.default_timeout_s,
             )
         with contextlib.suppress(OSError):
-            _remove_staging_dir(instance.staging_dir)
+            await self.remove_tree(instance.staging_dir)
 
     @staticmethod
     def _pid_has_container_marker(pid: int, name: str) -> bool:
@@ -1045,14 +1137,17 @@ class EnrootProvider:
         rel = _path_under_mount(instance.mount_point, target_path)
         if rel is not None:
             dest = instance.staging_dir / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.is_symlink():
-                raise RuntimeError(
-                    f"upload_file: refusing to write to {target_path!r} — "
-                    "destination is a symlink inside the sandbox mount"
-                )
-            dest.write_bytes(source_path.read_bytes())
-            return
+            try:
+                if dest.is_symlink():
+                    raise RuntimeError(
+                        f"upload_file: refusing to write to {target_path!r} — "
+                        "destination is a symlink inside the sandbox mount"
+                    )
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(source_path.read_bytes())
+                return
+            except PermissionError:
+                pass  # a task account owns the destination; write it from inside the sandbox
 
         tmp_name = uuid.uuid4().hex
         host_tmp = instance.staging_dir / tmp_name
@@ -1080,12 +1175,15 @@ class EnrootProvider:
         rel = _path_under_mount(instance.mount_point, source_path)
         if rel is not None:
             host_file = instance.staging_dir / rel
-            if host_file.is_symlink():
-                raise RuntimeError(
-                    f"download_file: refusing to read {source_path!r} — source is a symlink inside the sandbox mount"
-                )
-            target_path.write_bytes(host_file.read_bytes())
-            return
+            try:
+                if host_file.is_symlink():
+                    raise RuntimeError(
+                        f"download_file: refusing to read {source_path!r} — source is a symlink inside the sandbox mount"
+                    )
+                target_path.write_bytes(host_file.read_bytes())
+                return
+            except PermissionError:
+                pass  # a task account made it private; read it from inside the sandbox
 
         tmp_name = uuid.uuid4().hex
         host_tmp = instance.staging_dir / tmp_name
@@ -1145,17 +1243,9 @@ class EnrootProvider:
         except TimeoutError as e:
             remove_error = e
 
-        if self._subordinate_ids is not None and instance.staging_dir.exists():
-            # Sandbox accounts other than root own files here; only a mapped root can remove them.
-            with contextlib.suppress(Exception):
-                await self._run(
-                    ["rm", "-rf", "--", str(instance.staging_dir)],
-                    timeout_s=self._exec_config.default_timeout_s,
-                    namespaced=True,
-                )
         try:
-            if instance.staging_dir.exists() or instance.staging_dir.is_symlink():
-                _remove_staging_dir(instance.staging_dir)
+            # Sandbox accounts other than root may own files here; a mapped root removes them.
+            await self.remove_tree(instance.staging_dir)
         except OSError as e:
             LOGGER.warning("failed to remove staging dir %s: %s", instance.staging_dir, e)
 

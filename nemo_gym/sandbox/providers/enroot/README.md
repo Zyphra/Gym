@@ -105,9 +105,20 @@ sandbox has its own namespace, a child of the provider's: mounts it inherits sta
 locked, and its root has no capability over the provider. Host files a task account
 creates are owned by the corresponding subordinate ID.
 
-Without a range, stock Enroot behaviour applies: one mapped uid, `setgroups` denied,
-and credential calls emulated. A provider that already runs as namespace root of a
-full map starts sandboxes in its own namespace and enters them the same way.
+`create.credentials` selects the mode: `real` requires it (creation fails if the range,
+a tool or a filter-free provider is missing, or if a chown/setuid probe in the new
+sandbox reads back as faked), `emulated` is stock Enroot (one mapped uid, `setgroups`
+denied, credential calls reported done without effect), and `auto` (default) uses real
+when possible and logs the fallback reason. A sandbox whose init shares the
+provider's user namespace always keeps stock `enroot exec`.
+
+`setgroups` is allowed inside real-mode sandboxes (`newgidmap` maps a range), so a task
+account can drop the caller's group: files on a bind protected only by group bits or a
+group ACL are readable to it. Host files task accounts create belong to the caller's
+subordinate IDs; `remove_tree()` removes them through a mapped namespace (used for
+staging and failed creates). Subordinate IDs are only safe when they are unique across
+every host that shares a filesystem with the sandbox; do not bind shared filesystems
+into real-mode sandboxes otherwise.
 
 ## Selecting and configuring the provider
 
