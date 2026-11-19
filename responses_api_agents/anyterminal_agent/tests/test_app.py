@@ -20,6 +20,7 @@ harness install) are bypassed by calling staticmethods/properties directly rathe
 constructing the agent.
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -302,6 +303,27 @@ class TestExampleData:
 def _make_body(content: str = "solve this", **kwargs) -> NeMoGymResponseCreateParamsNonStreaming:
     return NeMoGymResponseCreateParamsNonStreaming(
         input=[{"role": "user", "content": content}], model="test-model", **kwargs
+    )
+
+
+async def _no_baseline() -> None:
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _verifier_writes_the_host_directory(monkeypatch):
+    """These fakes stand in for test.sh by writing ``verifier_dir`` directly.
+
+    The private ``/logs/verifier`` transport and the host-only grader directories are covered
+    in ``test_private_verifier.py``.
+    """
+    monkeypatch.setattr(app, "_private_verifier_command", lambda command, *_: command)
+    monkeypatch.setattr(app.RunTerminalAgent, "_record_startup_baseline", lambda self, sandbox, cfg: _no_baseline())
+    monkeypatch.setattr(app, "_write_private_outputs", lambda stdout, return_code, cfg: {"exit_code": return_code})
+    monkeypatch.setattr(
+        app.AnyTerminalInstanceConfig,
+        "host_only_dir",
+        lambda self, name: self.verifier_dir if name == "verifier" else self.persistent_dir / name,
     )
 
 
@@ -1073,7 +1095,7 @@ class TestBuildProvider:
         assert any(str(cfg.persistent_dir) in b and "/trajectories_mount" in b for b in binds)
         assert any(str(cfg.nemo_gym_root) in b and "/nemo_gym_mount" in b for b in binds)
         assert any(str(cfg.agent_deps_dir) in b and "/agent_deps_mount" in b for b in binds)
-        assert any(str(cfg.verifier_dir) in b and "/logs/verifier" in b for b in binds)
+        assert f"{cfg.sandbox_verifier_dir}:/logs/verifier" in binds
 
     def test_apptainer_writable_and_no_home(self, tmp_path: Path) -> None:
         provider = _build_provider(_make_instance_config(tmp_path, sandbox_provider={"apptainer": {}}))
@@ -1091,7 +1113,7 @@ class TestBuildProvider:
         cfg = _make_instance_config(tmp_path, sandbox_provider={"docker": {}})
         provider = _build_provider(cfg)
         assert any(str(cfg.persistent_dir) in a for a in provider._create_config.extra_run_args)
-        assert any(str(cfg.verifier_dir) in a for a in provider._create_config.extra_run_args)
+        assert f"{cfg.sandbox_verifier_dir}:/logs/verifier" in provider._create_config.extra_run_args
 
     def test_unknown_provider_returned_as_is(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path, sandbox_provider={"opensandbox": {"foo": "bar"}})
@@ -1350,6 +1372,11 @@ class TestRunAgentEnv:
         env = RunTerminalAgent(config=cfg)._agent_env(cfg)
         assert env["NGTB_MODEL_NAME"] == "my-model"
         assert json.loads(env["NGTB_AGENT_KWARGS"]) == {"model": "my-model"}
+
+    def test_task_agent_clock_forwarded(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        cfg.tb_agent_timeout = 3600
+        assert RunTerminalAgent(config=cfg)._agent_env(cfg)["NGTB_AGENT_TIMEOUT_S"] == "3600"
 
 
 class TestTerminalResponseLabels:
@@ -1666,6 +1693,7 @@ class TestProcessSingleDatapoint:
 
         metrics = app.TerminalBenchMetrics.model_validate_json(cfg.metrics_fpath.read_text())
         assert metrics.verifier_reward_unreadable is unreadable
+        assert metrics.mask_sample is unreadable
         assert metrics.reward(fractional=fractional) == expected_reward
 
     def test_fractional_reward_is_strict_and_default_off(self, tmp_path: Path) -> None:
@@ -1678,24 +1706,37 @@ class TestProcessSingleDatapoint:
         metrics.apply_timeout_policy(agent_timeout_is_failure=True)
         assert metrics.reward(fractional=True) == 0.0
 
-    async def test_unresolved_when_no_reward_file(self, tmp_path: Path) -> None:
-        cfg = _make_instance_config(tmp_path)
-        sandbox = SimpleNamespace(
-            start=AsyncMock(),
-            exec=AsyncMock(return_value=_sandbox_result()),
-            stop=AsyncMock(),
-        )
+    @pytest.mark.parametrize(
+        "return_code,reward,masked",
+        [(0, None, True), (1, None, True), (0, "0", False)],
+        ids=["missing-reward", "failed-judge", "graded-empty"],
+    )
+    async def test_missing_grade_is_masked_but_valid_zero_is_scored(
+        self, tmp_path: Path, return_code: int, reward: str | None, masked: bool
+    ) -> None:
+        cfg = _make_instance_config(tmp_path, fractional_reward=True)
+
+        async def verifier(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                if reward is not None:
+                    (cfg.verifier_dir / "reward.txt").write_text(reward)
+                return _sandbox_result(return_code=return_code)
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=verifier), stop=AsyncMock())
         with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
             with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
                 result = await RunTerminalAgent(config=cfg).process_single_datapoint()
 
         assert result is False
-        metrics = json.loads(cfg.metrics_fpath.read_text())
-        # test.sh writes 0 or 1: a completed eval without reward.txt is labelled, not masked.
-        assert metrics["verifier_reward_unreadable"] is True
-        assert metrics["mask_sample"] is False
+        response = app._terminal_response(cfg)
+        metrics = app.TerminalBenchMetrics.model_validate_json(response.metadata["metrics"])
+        assert metrics.verifier_reward_unreadable is masked
+        assert metrics.mask_sample is masked
+        assert metrics.verifier_return_code == return_code
+        assert metrics.verifier_reward == (None if masked else 0.0)
 
-    async def test_unparsable_reward_is_labelled_not_masked(self, tmp_path: Path, capsys) -> None:
+    async def test_unparsable_reward_is_unscored(self, tmp_path: Path, capsys) -> None:
         cfg = _make_instance_config(tmp_path)
 
         async def verifier(command, **kwargs):
@@ -1715,7 +1756,7 @@ class TestProcessSingleDatapoint:
         assert result is False
         metrics = json.loads(cfg.metrics_fpath.read_text())
         assert metrics["verifier_reward_unreadable"] is True
-        assert metrics["mask_sample"] is False
+        assert metrics["mask_sample"] is True
         assert "without a readable reward.txt: ValueError" in capsys.readouterr().out
 
     @pytest.mark.parametrize(
@@ -2249,7 +2290,7 @@ def test_pi_terminal_config_selects_the_pi_agent() -> None:
 
 
 class TestAgentTimeoutGradesWorkspace:
-    """An agent that hits its budget is graded on the workspace it left, never masked."""
+    """An agent at its wall keeps a valid workspace grade."""
 
     @pytest.fixture(autouse=True)
     def _no_provider(self):
@@ -2289,13 +2330,12 @@ class TestAgentTimeoutGradesWorkspace:
         assert metrics.verifier_reward == 0.4 and metrics.reward(fractional=True) == 0.4
         assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
 
-    async def test_unreadable_reward_is_flagged_and_scores_zero(self, tmp_path: Path) -> None:
+    async def test_unreadable_reward_is_masked_even_at_the_agent_wall(self, tmp_path: Path) -> None:
         cfg = _make_instance_config(tmp_path, agent_command_str="run-the-agent", agent_timeout_grades_workspace=True)
         result, metrics = await self._run_to_wall(cfg, None)
         assert result is False
         assert metrics.verifier_reward_unreadable is True
-        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is False
-        assert metrics.reward(fractional=True) == 0.0
+        assert metrics.agent_budget_exhausted is True and metrics.mask_sample is True
 
     @pytest.mark.parametrize("fault", ["container_timed_out", "sandbox_failed"])
     def test_infrastructure_stays_masked(self, fault) -> None:
@@ -2363,3 +2403,62 @@ async def test_episode_worker_module_selects_the_sandbox_worker(tmp_path, monkey
 def test_episode_worker_module_must_be_a_dotted_module_name():
     with pytest.raises(ValidationError):
         _config(episode_worker_module="not a module; rm -rf /")
+
+
+class _LocalShellSandbox:
+    """Runs sandbox commands in a local shell: a real process for the retained-state archive."""
+
+    async def exec(self, command, *, timeout_s=None, user=None, env=None, cwd=None):
+        import subprocess
+
+        proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=timeout_s)
+        return MagicMock(return_code=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+
+    async def download(self, remote, local):
+        import shutil
+
+        shutil.copyfile(remote, local)
+
+
+class TestRetainedTaskState:
+    def _cfg(self, tmp_path: Path, paths, **overrides):
+        cfg = _make_instance_config(tmp_path, retain_task_state=True, **overrides)
+        cfg.problem_info["retained_state_paths"] = json.dumps(paths)
+        return cfg
+
+    def test_archives_the_declared_paths_that_exist(self, tmp_path: Path) -> None:
+        import tarfile
+
+        state = tmp_path / "state"
+        (state / "output").mkdir(parents=True)
+        (state / "output" / "report.md").write_text("findings")
+        cfg = self._cfg(tmp_path, [str(state / "output"), str(state / "missing")])
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+
+        receipt = json.loads(cfg.metrics_fpath.read_text())["retained_task_state"]
+        assert receipt["archived"] == [str(state / "output").lstrip("/")]
+        archive = cfg.persistent_dir / "task-state.tgz"
+        assert receipt["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+        with tarfile.open(archive) as tar:
+            member = tar.extractfile(str(state / "output" / "report.md").lstrip("/"))
+            assert member.read() == b"findings"
+
+    def test_oversized_archive_is_recorded_not_kept(self, tmp_path: Path) -> None:
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / "big").write_bytes(os.urandom(4096))
+        cfg = self._cfg(tmp_path, [str(state)], retained_state_max_bytes=16)
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+        receipt = json.loads(cfg.metrics_fpath.read_text())["retained_task_state"]
+        assert "exceeds 16 bytes" in receipt["skipped"]
+        assert not (cfg.persistent_dir / "task-state.tgz").exists()
+
+    def test_relative_paths_are_refused_without_failing_the_episode(self, tmp_path: Path) -> None:
+        cfg = self._cfg(tmp_path, ["relative/path"])
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+        assert "absolute paths" in json.loads(cfg.metrics_fpath.read_text())["retained_task_state"]["error"]
+
+    def test_rows_without_paths_archive_nothing(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path, retain_task_state=True)
+        asyncio.run(RunTerminalAgent(config=cfg)._retain_task_state(_LocalShellSandbox(), cfg))
+        assert "retained_task_state" not in json.loads(cfg.metrics_fpath.read_text())

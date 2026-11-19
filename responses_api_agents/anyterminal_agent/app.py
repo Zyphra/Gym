@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import base64
 import hashlib
 import importlib
 import json
@@ -20,6 +21,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 import tarfile
 import tempfile
@@ -62,6 +64,7 @@ from responses_api_agents.anyterminal_agent.continue_until_timeout import (
     task_continues_until_timeout,
 )
 from responses_api_agents.anyterminal_agent.task_network import TaskNetwork
+from responses_api_agents.anyterminal_agent.verifier_integrity import VerifierIntegrityRefused
 
 
 # The harness runner's response.json carries its observation bundle under this key; the Agent Server
@@ -186,8 +189,7 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
     container_timed_out: bool = False
     sandbox_failed: bool = False
     mask_sample: bool = False
-    # Labels only, never a mask: a harness or verifier failure that still
-    # scores is named, so it is not indistinguishable from a policy miss.
+    # Harness outcome labels used alongside the verifier's grade.
     agent_exit_nonzero: bool = False
     agent_failed: bool = False
     agent_error: Optional[str] = None
@@ -237,8 +239,8 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
         `agent_timeout_is_failure` scores a timed-out agent 0. `agent_timeout_grades_workspace`
         keeps the verifier's grade of the workspace at the wall, as Harbor does after an
         AgentTimeoutError: the timeout becomes the `agent_budget_exhausted` label and the row's
-        reward is the verifier's. A missing or unreadable reward still scores 0 with its label;
-        verifier timeouts and sandbox failures stay masked. Idempotent.
+        reward is the verifier's. Missing or unreadable verifier rewards, verifier timeouts,
+        and sandbox failures stay masked. Idempotent.
         """
         if self.agent_timed_out and agent_timeout_grades_workspace:
             self.agent_timed_out = False
@@ -251,6 +253,7 @@ class TerminalBenchMetrics(SandboxMemoryEvents):
             self.mask_sample
             or self.container_timed_out
             or self.sandbox_failed
+            or self.verifier_reward_unreadable
             or (self.agent_timed_out and not agent_timeout_is_failure)
         )
 
@@ -610,6 +613,12 @@ class AnyTerminalAgentConfig(BaseResponsesAPIAgentConfig):
         ),
     )
     checkpoint_interval_s: int = Field(default=1800, gt=0)
+    # Archive the paths a row lists in its `retained_state_paths` metadata (a JSON list of absolute paths) from
+    # the instance after the agent and before grading, as `task-state.tgz` in the episode directory, so a grader
+    # that runs later (a deferred LLM judge) can re-run the task's verifier on the state it would have graded.
+    # A failed or oversized archive is recorded in the metrics and never changes the episode's grade.
+    retain_task_state: bool = Field(default=False, strict=True)
+    retained_state_max_bytes: int = Field(default=1 << 30, gt=0)
     # Report the verifier's reward.txt value (0 to 1) instead of 1.0 for any positive grade.
     # Needed by Harbor verifiers that award partial credit; a value outside [0, 1] is unreadable.
     fractional_reward: bool = Field(default=False, strict=True)
@@ -814,6 +823,20 @@ class AnyTerminalInstanceConfig(AnyTerminalAgentConfig, AnyTerminalServerConfig)
         return self.problem_info.get("task_name", self.problem_info.get("instance_id", "unknown"))
 
     @property
+    def sandbox_verifier_dir(self) -> Path:
+        """What sandbox processes see at ``/logs/verifier``; ``verifier_dir`` stays host-only."""
+        return self.persistent_dir.with_name(self.persistent_dir.name + ".sandbox-verifier")
+
+    def host_only_dir(self, name: str) -> Path:
+        """Where the episode's ``name`` directory lives until the sandbox stopped.
+
+        ``persistent_dir`` is the sandbox's ``/trajectories_mount``, so a sandbox process that
+        unmounts a cover there reaches anything below it. Grader outputs stay in this sibling
+        while the sandbox runs and are published below ``persistent_dir`` afterwards.
+        """
+        return self.persistent_dir.with_name(f"{self.persistent_dir.name}.{name}")
+
+    @property
     def instance_id(self) -> str:
         return self.problem_info.get("instance_id", self.task_name)
 
@@ -886,6 +909,182 @@ def _apt_root_sandbox(cfg: AnyTerminalInstanceConfig) -> str:
     )
 
 
+# test.sh runs through this program, from the read-only Gym and agent-runtime binds.
+PRIVATE_VERIFIER_PYTHON = "/agent_deps_mount/bin/python"
+PRIVATE_VERIFIER = "/nemo_gym_mount/responses_api_agents/anyterminal_agent/private_verifier.py"
+PRIVATE_VERIFIER_MARKER = "NEMO_GYM_PRIVATE_VERIFIER "
+PRIVATE_VERIFIER_RECEIPT = "private-verifier.json"
+AGENT_NO_PTRACE = Path(__file__).with_name("no_ptrace.py")
+
+
+def _without_ptrace(command: str) -> str:
+    """Run an agent command without ``CAP_SYS_PTRACE`` (``no_ptrace.py``).
+
+    No agent process, including one left running into grading, can then open the
+    verifier's ``/proc/<pid>/root``, ``environ`` or ``fd`` entries. The program is passed
+    inline so every provider runs it from the agent runtime's interpreter.
+    """
+    return (
+        f"{PRIVATE_VERIFIER_PYTHON} -I -S -c {shlex.quote(AGENT_NO_PTRACE.read_text())} "
+        f"/bin/sh -c {shlex.quote(command)}"
+    )
+
+
+STAGED_TESTS = "/trajectories_mount/staging/tests"
+
+
+STARTUP_BASELINE = "/trajectories_mount/staging/startup-baseline.json"
+
+
+def _private_verifier_command(
+    command: str, tests_manifest_sha256: Optional[str] = None, startup: Optional[tuple[str, str]] = None
+) -> str:
+    """``startup`` is the sha256 of the startup baseline and the task's working directory."""
+    tests = "" if tests_manifest_sha256 is None else f"--tests {STAGED_TESTS} {tests_manifest_sha256} "
+    if startup is not None:
+        tests += f"--startup {STARTUP_BASELINE} {startup[0]} {shlex.quote(startup[1])} "
+    return f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} {tests}{shlex.quote(command)}"
+
+
+def tests_manifest(source: Path, extra: Optional[dict[str, tuple[bytes, int]]] = None) -> bytes:
+    """The host's description of a task's tests, read from its pristine source.
+
+    The private verifier copies exactly these files into its own ``/tests`` and refuses any
+    whose staged bytes differ, so nothing a sandbox process staged reaches the grader.
+    ``extra`` adds host-held files (path -> bytes, mode) staged beside the source's.
+    """
+    directories, links, files = [], [], []
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source).as_posix()
+        if path.is_symlink():
+            links.append({"path": relative, "target": os.readlink(path)})
+        elif path.is_dir():
+            directories.append(relative)
+        else:
+            data = path.read_bytes()
+            mode = stat.S_IMODE(path.stat().st_mode)
+            files.append(
+                {"path": relative, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mode": mode}
+            )
+    for relative, (data, mode) in sorted((extra or {}).items()):
+        files.append({"path": relative, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "mode": mode})
+    return json.dumps({"directories": directories, "links": links, "files": files}, sort_keys=True).encode()
+
+
+def _relative_parts(path: str) -> list[str]:
+    parts = path.split("/")
+    if not path or path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        raise VerifierIntegrityRefused(f"verifier output path is not relative: {path!r}")
+    return parts
+
+
+def _open_beneath(root: Path, parts: list[str], flags: int, mode: int = 0o644, create_parents: bool = False) -> int:
+    """Open ``root/parts`` without following a link at any component."""
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for part in parts[:-1]:
+            if create_parents:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=directory)
+                except FileExistsError:
+                    pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        return os.open(parts[-1], flags | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=directory)
+    finally:
+        os.close(directory)
+
+
+def _write_private_outputs(stdout: Optional[str], return_code: Optional[int], cfg: AnyTerminalInstanceConfig) -> dict:
+    """Write the private ``/logs/verifier`` into ``verifier_dir`` from the verifier's own report.
+
+    The report is the helper's only if it is the one report on its stdout and the helper then
+    exited 0; a sandbox process that can reach the helper could print another one or kill it.
+    Small outputs come inline in the report. Larger ones were copied into the sandbox's
+    shared directory and are admitted only with the size and sha256 the report gives.
+    """
+    started = time.monotonic()
+    lines = [line for line in (stdout or "").splitlines() if line.startswith(PRIVATE_VERIFIER_MARKER)]
+    if len(lines) > 1:
+        raise VerifierIntegrityRefused(f"private verifier output carries {len(lines)} reports")
+    if not lines:
+        raise RuntimeError("private verifier wrote no report")
+    report = json.loads(lines[0][len(PRIVATE_VERIFIER_MARKER) :])
+    if report.get("setup") is not None:
+        raise RuntimeError(f"private verifier setup failed: {report['setup']}")
+    if return_code != 0:
+        raise RuntimeError(f"private verifier exited {return_code} after a report; it is not graded")
+    if report.get("integrity"):
+        raise VerifierIntegrityRefused("; ".join(report["integrity"]))
+    for entry in report["files"]:
+        parts = _relative_parts(entry["path"])
+        if "data" in entry:
+            data = base64.b64decode(entry["data"], validate=True)
+        else:
+            try:
+                fd = _open_beneath(cfg.sandbox_verifier_dir, parts, os.O_RDONLY)
+            except OSError as error:
+                raise VerifierIntegrityRefused(f"verifier output {entry['path']} is unreadable: {error}") from None
+            with os.fdopen(fd, "rb") as stream:
+                data = stream.read()
+        if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            raise VerifierIntegrityRefused(f"verifier output {entry['path']} differs from what test.sh wrote")
+        fd = _open_beneath(
+            cfg.verifier_dir, parts, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, entry["mode"] & 0o777, create_parents=True
+        )
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+    for link in report["links"]:
+        parts = _relative_parts(link["path"])
+        target = cfg.verifier_dir.joinpath(*parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        target.symlink_to(link["target"])
+    receipt = {key: value for key, value in report.items() if key != "files"}
+    receipt["files"] = [{key: value for key, value in entry.items() if key != "data"} for entry in report["files"]]
+    receipt["host_s"] = round(time.monotonic() - started, 4)
+    (cfg.verifier_dir / PRIVATE_VERIFIER_RECEIPT).write_text(json.dumps(receipt))
+    return receipt
+
+
+def interim_snapshot(cfg: AnyTerminalInstanceConfig, phase: int) -> Path:
+    """An interim verifier's outputs, host-only while the sandbox runs."""
+    return cfg.host_only_dir("interim_verifier") / f"phase-{phase:04d}"
+
+
+def _publish_host_only_outputs(cfg: AnyTerminalInstanceConfig) -> None:
+    """Move the host-only grader outputs to their episode paths once no sandbox process is left.
+
+    Whatever a sandbox process put at a published path is kept beside it as ``*.sandbox-written``.
+    """
+    for name, target in (
+        ("verifier", cfg.verifier_dir),
+        ("interim_verifier", cfg.persistent_dir / "interim_verifier"),
+    ):
+        source = cfg.host_only_dir(name)
+        if source == target or not source.is_dir() or source.is_symlink():
+            continue
+        if target.is_symlink() or target.exists():
+            if target.is_dir() and not target.is_symlink() and not any(target.iterdir()):
+                target.rmdir()
+            else:
+                os.replace(target, target.with_name(f"{target.name}.sandbox-written"))
+        os.replace(source, target)
+
+
+def _verifier_binds(params: AnyTerminalInstanceConfig) -> list[str]:
+    """Sandbox processes see a scratch directory at both sandbox paths of the verifier output.
+
+    ``test.sh`` writes its outputs in a private mount namespace (``private_verifier.py``) and
+    the host writes them into ``verifier_dir``, which no sandbox path reaches.
+    """
+    return [
+        f"{params.sandbox_verifier_dir}:/logs/verifier",
+        f"{params.sandbox_verifier_dir}:/trajectories_mount/verifier",
+    ]
+
+
 def _build_provider(params: AnyTerminalInstanceConfig):
     """Build a sandbox provider with the per-instance mounts the run needs.
 
@@ -903,7 +1102,7 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 f"{params.persistent_dir}:/trajectories_mount",
                 f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
                 f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-                f"{params.verifier_dir}:/logs/verifier",
+                *_verifier_binds(params),
                 *verifier_binds,
             ],
             task_network=params.task_network,
@@ -930,7 +1129,7 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 f"{params.persistent_dir}:/trajectories_mount",
                 f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
                 f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-                f"{params.verifier_dir}:/logs/verifier",
+                *_verifier_binds(params),
             ]
             + verifier_binds
         )
@@ -992,9 +1191,8 @@ def _build_provider(params: AnyTerminalInstanceConfig):
                 f"{params.nemo_gym_root}:/nemo_gym_mount:ro",
                 "-v",
                 f"{params.agent_deps_dir}:/agent_deps_mount:ro",
-                "-v",
-                f"{params.verifier_dir}:/logs/verifier",
             ]
+            + [arg for bind in _verifier_binds(params) for arg in ("-v", bind)]
             + [arg for bind in verifier_binds for arg in ("-v", bind)],
         ),
     )
@@ -1009,6 +1207,7 @@ class RunTerminalAgent(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
     config: AnyTerminalInstanceConfig
     _prepared_extension: Optional[dict] = PrivateAttr(default=None)
+    _startup_baseline: Optional[bytes] = PrivateAttr(default=None)
     _prepared_extension_bytes: Optional[bytes] = PrivateAttr(default=None)
 
     @staticmethod
@@ -1098,6 +1297,40 @@ class RunTerminalAgent(BaseModel):
         finally:
             archive.unlink(missing_ok=True)
 
+    async def _retain_task_state(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
+        """Archive the row's declared task-state paths before grading; record the outcome, never raise."""
+        raw = cfg.problem_info.get("retained_state_paths")
+        paths = json.loads(raw) if isinstance(raw, str) else (raw or [])
+        if not paths:
+            return
+        receipt: Dict[str, Any] = {"requested": paths}
+        remote = "/tmp/ng-task-state.tgz"
+        try:
+            if not all(isinstance(p, str) and p.startswith("/") and ".." not in p.split("/") for p in paths):
+                raise ValueError("retained_state_paths must be absolute paths without '..'")
+            present = " ".join(shlex.quote(p.lstrip("/")) for p in paths)
+            result = await sandbox.exec(
+                f'cd / && set -- && for p in {present}; do if [ -e "$p" ] || [ -L "$p" ]; then set -- "$@" "$p"; fi; done'
+                f" && printf '%s\\n' \"$@\" > {remote}.list && tar -czf {remote} --numeric-owner -C / -T {remote}.list"
+                f" && stat -c %s {remote} && cat {remote}.list",
+                timeout_s=setup_timeout_seconds(600),
+                user="root",
+            )
+            if result.return_code != 0:
+                raise RuntimeError((result.stderr or result.stdout or "tar failed")[-500:])
+            size, *archived = result.stdout.split()
+            receipt.update(archived=archived, bytes=int(size))
+            if int(size) > cfg.retained_state_max_bytes:
+                receipt["skipped"] = f"archive exceeds {cfg.retained_state_max_bytes} bytes"
+            else:
+                local = cfg.persistent_dir / "task-state.tgz"
+                await sandbox.download(remote, local)
+                receipt["sha256"] = hashlib.sha256(local.read_bytes()).hexdigest()
+            await sandbox.exec(f"rm -f {remote} {remote}.list", timeout_s=30, user="root")
+        except Exception as e:
+            receipt["error"] = f"{type(e).__name__}: {e}"[:500]
+        update_metrics(cfg.metrics_fpath, {"retained_task_state": receipt}, cfg.task_name)
+
     async def _collect_remote_outputs(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
         for remote, local in (
             ("/trajectories_mount/response.json", cfg.persistent_dir / "response.json"),
@@ -1126,6 +1359,8 @@ class RunTerminalAgent(BaseModel):
             env["NGTB_TASK_WORKDIR"] = str(cfg.problem_info["workdir"])
         if cfg.rollout_id:
             env["NGTB_ROLLOUT_ID"] = cfg.rollout_id
+        # The task's agent clock, for a harness that bounds its own run inside it (OpenClaw --timeout).
+        env["NGTB_AGENT_TIMEOUT_S"] = str(cfg.tb_agent_timeout)
         if (cfg.persistent_dir / "agent_overlay").is_dir():
             # The runner puts the shipped overlay first on its own sys.path; the harness's own Python
             # children (Pi's bash tool runs `python3 -m core.sandbox.command_process`) need it too,
@@ -1145,7 +1380,7 @@ class RunTerminalAgent(BaseModel):
             update_metrics(cfg.metrics_fpath, {"agent_started_at": time.time()}, cfg.task_name)
         try:
             result = await sandbox.exec(
-                _apt_root_sandbox(cfg) + (cfg.agent_command_str or ""),
+                _without_ptrace(_apt_root_sandbox(cfg) + (cfg.agent_command_str or "")),
                 timeout_s=cfg.tb_agent_timeout if timeout_s is None else timeout_s,
                 user="root",
                 env=self._agent_env(cfg),
@@ -1206,7 +1441,7 @@ class RunTerminalAgent(BaseModel):
                     reward = None
                 except OSError:
                     reward = None
-            snapshot = cfg.persistent_dir / "interim_verifier" / f"phase-{phase:04d}"
+            snapshot = interim_snapshot(cfg, phase)
             snapshot.parent.mkdir(exist_ok=True)
             shutil.copytree(cfg.verifier_dir, snapshot, symlinks=True, ignore_dangling_symlinks=True)
             (snapshot / "dispatch.json").write_text(
@@ -1355,6 +1590,45 @@ class RunTerminalAgent(BaseModel):
         if extension_runtime.sha256(target) != receipt["output_sha256"]:
             raise RuntimeError("restaged stock extension differs")
 
+    @staticmethod
+    def _task_workdir(cfg: AnyTerminalInstanceConfig) -> str:
+        return cfg.problem_info.get("workdir") or "/"
+
+    async def _record_startup_baseline(self, sandbox: AsyncSandbox, cfg: AnyTerminalInstanceConfig) -> None:
+        """Record the sandbox's startup files before the agent runs (``private_verifier.py --scan-startup``).
+
+        A task whose answer is such a file sets ``verifier_keeps_agent_startup_files``.
+        """
+        if cfg.problem_info.get("verifier_keeps_agent_startup_files"):
+            return
+        result = await sandbox.exec(
+            f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} --scan-startup {shlex.quote(self._task_workdir(cfg))}",
+            timeout_s=setup_timeout_seconds(60),
+            user="root",
+        )
+        if result.return_code != 0 or result.error_type:
+            raise RuntimeError(f"startup baseline failed: {result.error_type} {(result.stderr or '')[-500:]}")
+        json.loads(result.stdout)
+        self._startup_baseline = result.stdout.encode()
+
+    def _write_startup_baseline(self, cfg: AnyTerminalInstanceConfig) -> Optional[tuple[str, str]]:
+        if self._startup_baseline is None:
+            return None
+        (cfg.persistent_dir / "staging").mkdir(parents=True, exist_ok=True)
+        (cfg.persistent_dir / "staging" / "startup-baseline.json").write_bytes(self._startup_baseline)
+        return hashlib.sha256(self._startup_baseline).hexdigest(), self._task_workdir(cfg)
+
+    def _write_tests_manifest(self, cfg: AnyTerminalInstanceConfig) -> str:
+        """Describe the tests test.sh may run, from the host's own copies; return the digest."""
+        receipt = self._prepared_extension
+        extra = None
+        if receipt is not None:
+            extra = {receipt["output"].removeprefix("tests/"): (self._prepared_extension_bytes, 0o444)}
+        manifest = tests_manifest(Path(cfg.problem_info["task_dir"]) / "tests", extra)
+        (cfg.persistent_dir / "staging").mkdir(parents=True, exist_ok=True)
+        (cfg.persistent_dir / "staging" / "tests-manifest.json").write_bytes(manifest)
+        return hashlib.sha256(manifest).hexdigest()
+
     async def _exec_verifier(
         self, sandbox: AsyncSandbox, command: str, *, env: dict[str, str] | None, timeout_s: int | float
     ):
@@ -1476,16 +1750,19 @@ class RunTerminalAgent(BaseModel):
         task_env = task_verifier_environment(Path(cfg.problem_info["task_dir"]), cfg.verifier_environment)
         if task_env or cfg.verifier_forwarded_environment:
             verifier_env = {**cfg.verifier_forwarded_environment, **task_env, **(verifier_env or {})}
+        private = self._uses_bind_mounts(cfg)
+        # The private verifier brings its own verified /tests; others read the staged tree.
+        link_tests = "" if private else "rm -rf /tests && ln -s /trajectories_mount/staging/tests /tests && "
         test_cmd = (
             (
                 "readlink /proc/self/ns/net > /logs/verifier/network-namespace.txt && "
                 if cfg.task_network is not None
                 else ""
             )
-            + "rm -rf /tests && ln -s /trajectories_mount/staging/tests /tests && "
+            + link_tests
             # A minimal pytest.ini at / stops pytest from picking up Gym's pyproject.toml
             # (whose --pyargs breaks paths inside the sandbox).
-            "printf '[pytest]\\naddopts =\\n' > /pytest.ini && "
+            + "printf '[pytest]\\naddopts =\\n' > /pytest.ini && "
             "mkdir -p /logs/verifier && bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
         )
         if receipt is not None:
@@ -1514,21 +1791,40 @@ class RunTerminalAgent(BaseModel):
                 "NEMO_VERIFIER_ATTESTATION": json.dumps(attestation, sort_keys=True),
             }
             test_cmd = "bash /tests/test.sh > /logs/verifier/test-stdout.txt 2>&1"
-        result = await self._exec_verifier(
-            sandbox, _apt_root_sandbox(cfg) + test_cmd, timeout_s=cfg.tb_eval_timeout, env=verifier_env
-        )
-        if receipt is not None and result.return_code == 125:
+        command = _apt_root_sandbox(cfg) + test_cmd
+        if private:
+            # Agent processes may outlive the agent phase to serve the tests; none of them
+            # sees the directory test.sh writes its reward into or the tests it runs.
+            command = _private_verifier_command(
+                command, self._write_tests_manifest(cfg), self._write_startup_baseline(cfg)
+            )
+        result = await self._exec_verifier(sandbox, command, timeout_s=cfg.tb_eval_timeout, env=verifier_env)
+        return_code = result.return_code
+        if private and result.error_type is None:
+            # The helper exits 0 after its report; the report carries test.sh's own status.
+            return_code = _write_private_outputs(result.stdout, result.return_code, cfg)["exit_code"]
+        if receipt is not None and return_code == 125:
             raise RuntimeError("prepared stock interpreter attestation failed")
-        if result.return_code != 0:
-            print(f"[{cfg.task_name}] eval exit {result.return_code}: {(result.stderr or '')[-2000:]}", flush=True)
+        if return_code != 0:
+            print(f"[{cfg.task_name}] eval exit {return_code}: {(result.stderr or '')[-2000:]}", flush=True)
         return (
             time.time() - t0,
             result.error_type == "timeout",
-            result.return_code,
+            return_code,
             result.error_type,
         )
 
     async def process_single_datapoint(self) -> bool:
+        """Grade the episode into host-only directories; publish them after the sandbox stopped."""
+        cfg = self.config
+        self.config = cfg.model_copy(update={"verifier_dir": cfg.host_only_dir("verifier")})
+        try:
+            return await self._process_single_datapoint()
+        finally:
+            self.config = cfg
+            _publish_host_only_outputs(cfg)
+
+    async def _process_single_datapoint(self) -> bool:
         from core.sandbox.memory_evidence import memory_event_delta, sandbox_memory_snapshot
 
         from responses_api_agents.anyterminal_agent.verifier_integrity import (
@@ -1538,6 +1834,8 @@ class RunTerminalAgent(BaseModel):
 
         cfg = self.config
         cfg.verifier_dir.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(cfg.sandbox_verifier_dir, ignore_errors=True)
+        cfg.sandbox_verifier_dir.mkdir(parents=True)
         (cfg.persistent_dir / "staging").mkdir(parents=True, exist_ok=True)
         continues = cfg.continue_until_timeout and task_continues_until_timeout(Path(cfg.problem_info["task_dir"]))
         t0 = time.time()
@@ -1569,6 +1867,8 @@ class RunTerminalAgent(BaseModel):
             update_metrics(cfg.metrics_fpath, {"sandbox_ready_at": time.time()}, cfg.task_name)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_runtime(sandbox, cfg)
+            else:
+                await self._record_startup_baseline(sandbox, cfg)
             if cfg.problem_info.get("verifier_extension") is not None:
                 if not self._uses_bind_mounts(cfg):
                     raise ValueError("declared extension requires a local bind-mount provider")
@@ -1585,6 +1885,8 @@ class RunTerminalAgent(BaseModel):
                 agent_run_time, agent_timed_out, sandbox_failed, agent_return_code = await self._run_agent(
                     sandbox, cfg
                 )
+            if cfg.retain_task_state:
+                await self._retain_task_state(sandbox, cfg)
             await self._stage_tests(cfg)
             if not self._uses_bind_mounts(cfg):
                 await self._stage_remote_tests(sandbox, cfg)
@@ -1652,6 +1954,7 @@ class RunTerminalAgent(BaseModel):
                             integrity_problem = f"{type(e).__name__}: {e}"[:512]
                             print(f"[{cfg.task_name}] verifier receipt refused: {integrity_problem}", flush=True)
             shutil.rmtree(cfg.persistent_dir / "staging", ignore_errors=True)
+            shutil.rmtree(cfg.sandbox_verifier_dir, ignore_errors=True)
 
         total_run_time = time.time() - t0
         memory_events = sandbox_memory_events(sandbox)

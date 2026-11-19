@@ -80,11 +80,18 @@ model call. Model rollout and multi-segment training qualification are separate.
   (`nemo_gym/hidden_mounts.py`, as Hermes does). Pi's bash tool takes the hiding shell as its `shellPath`;
   an extension that spawns its own shell reads `PI_HIDE_HARNESS_MOUNTS=1`.
 - `max_turns`: assistant requests per run (Pi has none of its own). When set, the agent loads
-  `turn_limit.ts`, which aborts the request after the last allowed turn, once that turn's tools have run.
+  `turn_limit.ts`. The request after the last allowed turn is the cap request: it asks for the final
+  answer as text with `tool_choice: "none"`. A tool call in its reply (an endpoint that ignores
+  `tool_choice`) is blocked and the cap request is asked once more; a call in that reply is blocked and
+  ends the run. `metadata.turn_cap_answer` says how the cap was answered (`tool_free_reply`,
+  `reask_reply`, `tool_call` or `none`).
 - `request_tools`: offer the request's function tools (a row's `responses_create_params.tools`). The agent
   loads `request_tools.ts`, and each call is `POST /<tool name>` on the resources server in the episode's
   session, as `simple_agent` makes it. `extra_args: [--no-builtin-tools, --no-extensions, ...]` makes them
   Pi's only tools.
+- `answer_pattern`, `answer_files`: the answer the task declares (a regex on the final reply; files of
+  which one must exist non-empty and match the regex when one is set). An evaluation binding
+  declares one of these fields to enable the continuation below.
 - `extra_args`: extra flags appended to the `pi` command
 - `models_config`: written to `~/.pi/agent/models.json`
 - `pi_version`: npm version to pin on install (null means latest)
@@ -101,3 +108,28 @@ A run that ends on a budget reports it the way the OpenHands adapter does, with 
   own overflow recovery, or the last reply was cut where the context window ends.
 
 Any other non-zero exit stays a `failed` response with error `Pi process_exit_<code>`.
+
+## Task contract
+
+Every run loads `task_contract.ts`. Pi's compaction replaces the messages that carried the task with a
+summary, so after a compaction each request carries the original instruction again, right after the
+summary. This is request-local so a run that never compacts sends the same requests. With an explicit
+answer contract, an empty or untagged final reply can receive one continuation within `max_turns`.
+The stock training bindings leave these fields unset, so an empty final reply ends the episode.
+A reply cut at the output limit is retried by Pi's own length recovery and gets no second retry.
+
+The response metadata labels every run: `pi_compactions`, `pi_restated_requests`, `pi_continuation`
+(`none`, `empty_final_reply` or `answer_missing`) and `pi_command_timeouts`
+(`pi_gym_command_timeout` entries an extension appends for each shell command killed at its deadline).
+
+## Tool output budget
+
+Every run loads `tool_output_budget.ts`. Pi sizes each request from the last reply's real token usage plus
+4 characters per token for what was appended since, and caps a tool result at 50 KB. Dense JSON or numbers
+tokenize at about one token per byte, so one capped result can put a request tens of thousands of tokens
+above Pi's estimate: the endpoint rejects it as a context overflow, and the summary request of Pi's overflow
+recovery overruns the window too. Before a tool result enters the history, the extension counts it at one
+token per UTF-8 byte and cuts it (head, a notice, the last lines) so the next request fits whichever output
+budget Pi asks for: real context at most `context_window - max_output_tokens`, or real context within Pi's
+4096-token safety margin of its estimate. Results that fit are unchanged. `pi_cut_tool_results` counts the
+cut results (`pi_gym_tool_output_budget` entries).

@@ -139,3 +139,6 @@ prompt reaches that fraction of the window less the turn's output reserve (`max_
 floor of 0.75 for windows under 512K tokens. A threshold of `1.0` therefore compresses when the
 next turn could no longer receive its full `max_tokens`. `compression_target_ratio` is Hermes'
 `compression.target_ratio`; Hermes' default `lean` tail mode keeps a 10K-25K token recent tail.
+
+`file_read_max_chars` forwards Hermes' native per-read character cap into the
+episode configuration. Omit it to use the harness default.

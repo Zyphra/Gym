@@ -1154,7 +1154,8 @@ class AnySweSandboxRunner:
         # A runner exception outside the typed transport cases retains the old
         # task-zero behavior. Its partial patch is evidence, not a successful
         # harness completion; transient failures below remain native masks.
-        if saved is not None and (saved.metadata or {}).get("agent_wall_timeout") == "true":
+        runner_wall_timeout = saved is not None and (saved.metadata or {}).get("agent_wall_timeout") == "true"
+        if runner_wall_timeout:
             # The runner enforced the same agent deadline the exec timeout would.
             agent_timed_out = True
         elif saved is not None and (saved.metadata or {}).get("runner_exception") == "true" and harness_error is None:
@@ -1163,6 +1164,9 @@ class AnySweSandboxRunner:
         if agent_budget_exhausted:
             # The wall is the task's budget, not an infrastructure failure: the patch is graded below.
             agent_timed_out = False
+            if runner_wall_timeout:
+                # The runner stamped its own wall cancellation as a transport error.
+                harness_error = None
         if patch.strip() and error_kind is None:
             grading_started_at = time.time()
             update_metrics(params.metrics_fpath, {"grading_started_at": grading_started_at})

@@ -384,47 +384,67 @@ def _run_and_capture(agent, request, body, repo, index_path, baseline_tree, outp
     """Write response and patch even when a harness raises after editing files."""
     deadline_s = _agent_deadline_s()
     expired = threading.Event()
+    finished = threading.Event()
+    capture_lock = threading.Lock()
+
+    def timeout_response():
+        result = _exception_response(TimeoutError(f"agent wall timeout after {deadline_s}s"), body)
+        result.metadata = {**(result.metadata or {}), "agent_wall_timeout": "true"}
+        return result
+
+    def capture(response, *, exit_after: bool = False) -> None:
+        with capture_lock:
+            if finished.is_set():
+                return
+            finished.set()
+            if response is not None:
+                (output_dir / "response.json").write_text(response.model_dump_json())
+                print(f"agent finished: {len(response.output)} output items", flush=True)
+            reaped = _reap_agent_tree()
+            if reaped:
+                print(f"reaped {reaped} leftover agent processes", flush=True)
+            try:
+                patch = _extract_patch(repo, index_path, baseline_tree) if repo and baseline_tree else ""
+                (output_dir / "patch.diff").write_text(patch)
+                if repo:
+                    print(f"patch: {len(patch)} chars from {repo}", flush=True)
+            finally:
+                index_path.unlink(missing_ok=True)
+                if repo:
+                    shutil.rmtree(_baseline_git_dir(index_path))
+            if exit_after:
+                os._exit(0)
 
     def on_deadline() -> None:
-        # The tools, not the coroutine, are what block: killing them unblocks the
-        # agent even when its sandbox is in memory livelock.
         expired.set()
-        while not finished.wait(1.0):
+        # A blocked tool can be reaped. A harness that still has not yielded
+        # cannot own publication at the deadline.
+        with capture_lock:
+            if finished.is_set():
+                return
             _reap_agent_tree(timeout_s=1.0)
+        if not finished.wait(1.0):
+            capture(timeout_response(), exit_after=True)
 
-    finished = threading.Event()
     timer = threading.Timer(deadline_s, on_deadline) if deadline_s else None
     if timer is not None:
         timer.daemon = True
         timer.start()
+    response = None
     try:
-        try:
-            response = asyncio.run(asyncio.wait_for(agent.responses(request=request, body=body), timeout=deadline_s))
-        except Exception as exc:
-            if expired.is_set() or isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-                expired.set()
-                exc = TimeoutError(f"agent wall timeout after {deadline_s}s")
-            response = _exception_response(exc, body)
-            if expired.is_set():
-                response.metadata = {**(response.metadata or {}), "agent_wall_timeout": "true"}
-        (output_dir / "response.json").write_text(response.model_dump_json())
-        print(f"agent finished: {len(response.output)} output items", flush=True)
+        response = asyncio.run(asyncio.wait_for(agent.responses(request=request, body=body), timeout=deadline_s))
+        if expired.is_set():
+            response = timeout_response()
+    except Exception as exc:
+        response = (
+            timeout_response()
+            if expired.is_set() or isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+            else _exception_response(exc, body)
+        )
     finally:
-        finished.set()
         if timer is not None:
             timer.cancel()
-        reaped = _reap_agent_tree()
-        if reaped:
-            print(f"reaped {reaped} leftover agent processes", flush=True)
-        try:
-            patch = _extract_patch(repo, index_path, baseline_tree) if repo and baseline_tree else ""
-            (output_dir / "patch.diff").write_text(patch)
-            if repo:
-                print(f"patch: {len(patch)} chars from {repo}", flush=True)
-        finally:
-            index_path.unlink(missing_ok=True)
-            if repo:
-                shutil.rmtree(_baseline_git_dir(index_path))
+        capture(response)
 
 
 def main() -> None:

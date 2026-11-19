@@ -24,9 +24,31 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from responses_api_agents.anyterminal_agent import app
 from responses_api_agents.anyterminal_agent import continue_until_timeout as phases
 from responses_api_agents.anyterminal_agent.app import RunTerminalAgent, TerminalBenchMetrics
 from responses_api_agents.anyterminal_agent.tests.test_app import _make_instance_config, _sandbox_result
+
+
+async def _no_baseline() -> None:
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _verifier_writes_the_host_directory(monkeypatch):
+    """These fakes stand in for test.sh by writing ``verifier_dir`` directly.
+
+    The private ``/logs/verifier`` transport and the host-only grader directories are covered
+    in ``test_private_verifier.py``.
+    """
+    monkeypatch.setattr(app, "_private_verifier_command", lambda command, *_: command)
+    monkeypatch.setattr(app.RunTerminalAgent, "_record_startup_baseline", lambda self, sandbox, cfg: _no_baseline())
+    monkeypatch.setattr(app, "_write_private_outputs", lambda stdout, return_code, cfg: {"exit_code": return_code})
+    monkeypatch.setattr(
+        app.AnyTerminalInstanceConfig,
+        "host_only_dir",
+        lambda self, name: self.verifier_dir if name == "verifier" else self.persistent_dir / name,
+    )
 
 
 INSTRUCTION = "Build the thing.\n"

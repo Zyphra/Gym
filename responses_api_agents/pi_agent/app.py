@@ -70,6 +70,12 @@ LOG = logging.getLogger(__name__)
 _INTERNAL_OBSERVATIONS_KEY = "_ng_agent_observations"
 TURN_LIMIT_EXTENSION = Path(__file__).with_name("turn_limit.ts")
 REQUEST_TOOLS_EXTENSION = Path(__file__).with_name("request_tools.ts")
+TASK_CONTRACT_EXTENSION = Path(__file__).with_name("task_contract.ts")
+TASK_CONTRACT_LABEL = "pi_gym_task_contract"
+TOOL_OUTPUT_BUDGET_EXTENSION = Path(__file__).with_name("tool_output_budget.ts")
+TOOL_OUTPUT_BUDGET_LABEL = "pi_gym_tool_output_budget"
+# An extension that kills a shell command at its deadline appends one entry of this type per kill.
+COMMAND_TIMEOUT_LABEL = "pi_gym_command_timeout"
 TURN_LIMIT_MARKER = "pi_gym_turn_limit"
 # The model endpoint's context-overflow errors, as Pi's own overflow detection reads them.
 _CONTEXT_OVERFLOW = re.compile(
@@ -87,6 +93,83 @@ class _PiRunResult(NamedTuple):
     timed_out: bool = False
     stderr: str = ""
     budget_stop: Optional[tuple[str, str]] = None
+    labels: Optional[dict[str, str]] = None
+    turn_cap_answer: Optional[str] = None
+
+
+def pi_turn_cap_answer(stdout: str | bytes, max_turns: int) -> str:
+    """How the cap request (``turn_limit.ts``, the request after the last of ``max_turns``) was answered:
+    ``tool_free_reply`` (text), ``reask_reply`` (its reply was a tool call, which was blocked, and the one
+    re-ask was answered with text), ``tool_call`` (both replies were tool calls, from an endpoint that
+    ignores ``tool_choice``; both were blocked), or ``none`` (no reply, or an empty one)."""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    replies = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        message = event.get("message") if isinstance(event, dict) and event.get("type") == "message_end" else None
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            replies.append(message)
+
+    def answer(reply: dict) -> str:
+        parts = [part for part in reply.get("content") or [] if isinstance(part, dict)]
+        if any(part.get("type") == "toolCall" for part in parts):
+            return "tool_call"
+        text = "".join(str(part.get("text") or "") for part in parts if part.get("type") == "text")
+        return "tool_free_reply" if text.strip() else "none"
+
+    if len(replies) <= max_turns:
+        return "none"
+    first = answer(replies[max_turns])
+    if first != "tool_call" or len(replies) <= max_turns + 1:
+        return first
+    second = answer(replies[max_turns + 1])
+    return "reask_reply" if second == "tool_free_reply" else second
+
+
+def pi_episode_labels(stdout: str | bytes) -> dict[str, str]:
+    """What the harness did to the episode, from Pi's JSON events, as response metadata strings.
+
+    * ``pi_compactions``: completed context compactions (``compaction_end`` events).
+    * ``pi_restated_requests``: requests that carried the task again after a compaction (task_contract.ts).
+    * ``pi_continuation``: why task_contract.ts asked for the final answer once, or ``none``.
+    * ``pi_command_timeouts``: shell commands killed at their deadline (``pi_gym_command_timeout`` entries).
+    * ``pi_cut_tool_results``: tool results tool_output_budget.ts cut to keep the next request in the window.
+    """
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    compactions = timeouts = cuts = 0
+    contract: dict[str, Any] = {}
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, RecursionError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "compaction_end":
+            compactions += 1
+        entry = event.get("entry") if event.get("type") == "entry_appended" else None
+        if (
+            isinstance(entry, dict)
+            and entry.get("customType") == TASK_CONTRACT_LABEL
+            and isinstance(entry.get("data"), dict)
+        ):
+            contract = entry["data"]
+        elif isinstance(entry, dict) and entry.get("customType") == COMMAND_TIMEOUT_LABEL:
+            timeouts += 1
+        elif isinstance(entry, dict) and entry.get("customType") == TOOL_OUTPUT_BUDGET_LABEL:
+            cuts += 1
+    return {
+        "pi_compactions": str(compactions),
+        "pi_restated_requests": str(int(contract.get("restated_requests") or 0)),
+        "pi_continuation": str(contract.get("continuation") or "none"),
+        "pi_command_timeouts": str(timeouts),
+        "pi_cut_tool_results": str(cuts),
+    }
 
 
 def pi_budget_stop(
@@ -96,7 +179,8 @@ def pi_budget_stop(
 
     The reasons are the ones the OpenHands adapter reports, so AnySWE grades the partial patch the same way:
 
-    * ``max_iterations``: ``turn_limit.ts`` aborted the request after the last of ``max_turns`` turns.
+    * ``max_iterations``: the run used all ``max_turns`` turns and ``turn_limit.ts`` ended it on the
+      cap request or its re-ask (answered as text, a tool call blocked, or a later request aborted).
     * ``context_exhausted``: the last request failed on the context window and Pi's overflow recovery
       did not recover it, or the last reply was cut where the window ends.
     """
@@ -117,7 +201,10 @@ def pi_budget_stop(
         return None
     stop = last.get("stopReason")
     error = last.get("errorMessage") if isinstance(last.get("errorMessage"), str) else ""
-    if stop == "aborted" and max_turns is not None and TURN_LIMIT_MARKER in stderr:
+    # A blocked call in the re-ask ends the run on "toolUse"; a request after the re-ask is aborted, which
+    # Pi reports as stopReason "aborted" or as an "error" whose message says the operation was aborted.
+    aborted = stop == "aborted" or (stop == "error" and "aborted" in error.lower())
+    if (aborted or stop in ("stop", "toolUse")) and max_turns is not None and TURN_LIMIT_MARKER in stderr:
         return "max_iterations", f"Pi reached max_turns={max_turns}"
     if stop == "error" and _CONTEXT_OVERFLOW.search(error):
         return "context_exhausted", error[:500]
@@ -551,6 +638,11 @@ class PiAgentConfig(BaseResponsesAPIAgentConfig):
     # run each call as simple_agent does: POST /<tool name> on the resources server in the episode's
     # session. `extra_args: [--no-builtin-tools, ...]` makes them Pi's only tools.
     request_tools: bool = False
+    # The answer the task declares, for task_contract.ts's one continuation: a regex the final reply must
+    # match, and/or files of which one must exist non-empty (matching the regex when one is set).
+    # A binding must declare one of these fields for the continuation.
+    answer_pattern: Optional[str] = None
+    answer_files: list[str] = []
 
     @property
     def command_parts(self) -> list[str]:
@@ -714,6 +806,10 @@ class PiAgent(SimpleResponsesAPIAgent):
         if self.config.max_turns is not None:
             cmd += ["--extension", str(TURN_LIMIT_EXTENSION)]
             env["PI_GYM_MAX_TURNS"] = str(self.config.max_turns)
+        cmd += ["--extension", str(TASK_CONTRACT_EXTENSION)]
+        cmd += ["--extension", str(TOOL_OUTPUT_BUDGET_EXTENSION)]
+        env["PI_GYM_ANSWER_PATTERN"] = self.config.answer_pattern or ""
+        env["PI_GYM_ANSWER_FILES"] = json.dumps(self.config.answer_files)
         if self.config.request_tools:
             cmd += ["--extension", str(REQUEST_TOOLS_EXTENSION)]
             env["PI_GYM_REQUEST_TOOLS"] = str(self._write_request_tools(home, request_tools, cookies or {}))
@@ -762,6 +858,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                         proc.returncode,
                         True,
                         stderr.decode(errors="replace"),
+                        labels=pi_episode_labels(stdout),
                     )
             else:
                 output_task = asyncio.create_task(proc.communicate(piped_instruction))
@@ -781,6 +878,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                         proc.returncode,
                         True,
                         (stderr or b"").decode(errors="replace"),
+                        labels=pi_episode_labels(stdout),
                     )
 
             if collect_observations and stdin_task is not None:
@@ -799,6 +897,12 @@ class PiAgent(SimpleResponsesAPIAgent):
                 proc.returncode,
                 stderr=stderr.decode(errors="replace"),
                 budget_stop=budget_stop,
+                labels=pi_episode_labels(stdout),
+                turn_cap_answer=(
+                    pi_turn_cap_answer(stdout, self.config.max_turns)
+                    if budget_stop is not None and budget_stop[0] == "max_iterations"
+                    else None
+                ),
             )
         finally:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -878,12 +982,20 @@ class PiAgent(SimpleResponsesAPIAgent):
             ),
             error=(ResponseError(code="server_error", message=f"Pi {process_error}") if process_error else None),
             metadata=(
-                {"agent_error": process_error, "pi_return_code": str(result.return_code)}
-                if process_error
-                else {"stop_reason": result.budget_stop[0], "pi_stop_detail": result.budget_stop[1]}
-                if result.budget_stop
-                else None
-            ),
+                (
+                    {"agent_error": process_error, "pi_return_code": str(result.return_code)}
+                    if process_error
+                    else {
+                        "stop_reason": result.budget_stop[0],
+                        "pi_stop_detail": result.budget_stop[1],
+                        **({"turn_cap_answer": result.turn_cap_answer} if result.turn_cap_answer is not None else {}),
+                    }
+                    if result.budget_stop
+                    else {}
+                )
+                | (result.labels or {})
+            )
+            or None,
             tool_choice=body.tool_choice,
             tools=body.tools,
             parallel_tool_calls=body.parallel_tool_calls,
