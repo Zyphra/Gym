@@ -90,6 +90,36 @@ The `enroot` client and the container init start from the allow-listed environme
 calling process's. `spec.env` is added on top of it and handed to the container with
 `-e NAME`, so every variable a container needs must be named in `spec.env`.
 
+## Credentials
+
+Credential changes inside a sandbox are real, as under Docker, whenever the caller
+owns a subordinate ID range: an entry of at least 65,536 IDs for its user name or uid
+in `/etc/subuid` and `/etc/subgid`, with the setuid `newuidmap`/`newgidmap` and
+util-linux `unshare`/`nsenter` on `PATH`. Each `enroot create`, `start` and `remove`
+then runs as root of its own new user namespace that maps the caller to 0 and the
+range to 1..N, and Enroot runs as that namespace's root (`ENROOT_ALLOW_SUPERUSER`).
+`exec` joins the sandbox's namespace with `nsenter` and enters the rest with
+`enroot-nsenter` without `--user`, so Enroot's seccomp filter, which reports `chown(2)`
+and the credential setters as done without doing them, is never installed. Every
+sandbox has its own namespace, a child of the provider's: mounts it inherits stay
+locked, and its root has no capability over the provider. Host files a task account
+creates are owned by the corresponding subordinate ID.
+
+`create.credentials` selects the mode: `real` requires it (creation fails if the range,
+a tool or a filter-free provider is missing, or if a chown/setuid probe in the new
+sandbox reads back as faked), `emulated` is stock Enroot (one mapped uid, `setgroups`
+denied, credential calls reported done without effect), and `auto` (default) uses real
+when possible and logs the fallback reason. A sandbox whose init shares the
+provider's user namespace always keeps stock `enroot exec`.
+
+`setgroups` is allowed inside real-mode sandboxes (`newgidmap` maps a range), so a task
+account can drop the caller's group: files on a bind protected only by group bits or a
+group ACL are readable to it. Host files task accounts create belong to the caller's
+subordinate IDs; `remove_tree()` removes them through a mapped namespace (used for
+staging and failed creates). Subordinate IDs are only safe when they are unique across
+every host that shares a filesystem with the sandbox; do not bind shared filesystems
+into real-mode sandboxes otherwise.
+
 ## Selecting and configuring the provider
 
 The provider config is a single-key mapping: `{"enroot": {<kwargs>}}`. The kwargs

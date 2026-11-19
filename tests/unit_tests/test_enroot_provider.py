@@ -114,6 +114,8 @@ def _make_handle(
 @pytest.fixture
 def fake_binary(monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setattr(enroot_provider, "_require_enroot", lambda: FAKE_BINARY)
+    # These tests read the stock argv; a host's subordinate IDs would wrap rootfs commands.
+    monkeypatch.setattr(enroot_provider, "_subordinate_ids", lambda: None)
     return FAKE_BINARY
 
 
