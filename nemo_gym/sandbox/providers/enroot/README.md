@@ -90,6 +90,25 @@ The `enroot` client and the container init start from the allow-listed environme
 calling process's. `spec.env` is added on top of it and handed to the container with
 `-e NAME`, so every variable a container needs must be named in `spec.env`.
 
+## Credentials
+
+Credential changes inside a sandbox are real, as under Docker, whenever the caller
+owns a subordinate ID range: an entry of at least 65,536 IDs for its user name or uid
+in `/etc/subuid` and `/etc/subgid`, with the setuid `newuidmap`/`newgidmap` and
+util-linux `unshare`/`nsenter` on `PATH`. Each `enroot create`, `start` and `remove`
+then runs as root of its own new user namespace that maps the caller to 0 and the
+range to 1..N, and Enroot runs as that namespace's root (`ENROOT_ALLOW_SUPERUSER`).
+`exec` joins the sandbox's namespace with `nsenter` and enters the rest with
+`enroot-nsenter` without `--user`, so Enroot's seccomp filter, which reports `chown(2)`
+and the credential setters as done without doing them, is never installed. Every
+sandbox has its own namespace, a child of the provider's: mounts it inherits stay
+locked, and its root has no capability over the provider. Host files a task account
+creates are owned by the corresponding subordinate ID.
+
+Without a range, stock Enroot behaviour applies: one mapped uid, `setgroups` denied,
+and credential calls emulated. A provider that already runs as namespace root of a
+full map starts sandboxes in its own namespace and enters them the same way.
+
 ## Selecting and configuring the provider
 
 The provider config is a single-key mapping: `{"enroot": {<kwargs>}}`. The kwargs

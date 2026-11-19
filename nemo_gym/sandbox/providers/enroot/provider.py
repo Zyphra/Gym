@@ -28,6 +28,7 @@ import hashlib
 import logging
 import os
 import posixpath
+import pwd
 import shlex
 import shutil
 import signal
@@ -263,6 +264,154 @@ class _EnrootInstance:
     container_pid: int | None = None  # host PID of the container init (for exec)
     start_pgid: int | None = None  # process group of the detached `enroot start`
     proc: Any = None  # asyncio subprocess handle for the detached start
+    # Namespaces (``/proc/<pid>/ns`` names) the init does not share with this process.
+    # Set at create; ``None`` before the init exists.
+    entered_namespaces: tuple[str, ...] | None = None
+
+
+# Credential changes inside a sandbox must be real, as under Docker: Postfix ``smtpd``,
+# OpenSSH privilege separation and verifiers that run a submission as another uid all
+# drop root. Stock unprivileged Enroot cannot provide that. ``enroot start`` gives the
+# container a user namespace that maps only the caller's uid (``setgroups`` denied),
+# and ``enroot exec`` always enters through ``enroot-nsenter --user``, which registers
+# Enroot's seccomp filter that reports chown(2) and the credential setters as done
+# without performing them.
+#
+# When the caller owns a subordinate ID range (``/etc/subuid`` and ``/etc/subgid``,
+# applied by the setuid ``newuidmap``/``newgidmap``), every command that creates, starts
+# or removes a rootfs runs as root of its own new user namespace mapping the caller to 0
+# and the range to 1..N; Enroot then runs as that namespace's root
+# (``ENROOT_ALLOW_SUPERUSER``) and adds no namespace or filter of its own. Each sandbox
+# init gets its own such namespace, a child of the provider's, so mounts it inherits
+# stay locked and a sandbox's root holds no capability over the provider. ``exec``
+# joins the init's user namespace with ``nsenter`` and then the rest with
+# ``enroot-nsenter`` without ``--user``: ``enroot exec`` (Enroot's ``runtime::exec``)
+# minus the emulation, with the init's environment plus the named caller variables and
+# the init's working directory. Without a range (or when the provider already runs as
+# root), a sandbox whose init shares the provider's user namespace is entered the same
+# way, and any other keeps ``enroot exec`` unchanged.
+_SUBORDINATE_ID_MINIMUM = 65536
+_ROOTFS_COMMANDS = frozenset({"create", "start", "remove"})
+# Released by the provider once the ID maps are written; Enroot must not start before.
+_MAPPED_NAMESPACE_RELEASE = 'read -r _ || exit 125; exec "$@"'
+_EXEC_NAMESPACE_FLAGS = (("pid", "--pid"), ("mnt", "--mount"), ("net", "--net"), ("ipc", "--ipc"), ("uts", "--uts"))
+_SHARED_USER_NAMESPACE_EXEC = r"""
+set -eu
+nsenter=$1; pid=$2; shift 2
+names=(); while [ "$1" != -- ]; do names+=("$1"); shift; done; shift
+flags=(); while [ "$1" != -- ]; do flags+=("$1"); shift; done; shift
+kill -0 "$pid" 2>/dev/null || { echo "Process not found: $pid" >&2; exit 1; }
+exec {fd}< <(
+  tr '\0' '\n' < "/proc/$pid/environ"
+  for name in ${names[@]+"${names[@]}"}; do printf '%s=%s\n' "$name" "${!name-}"; done
+)
+exec "$nsenter" --target "$pid" ${flags[@]+"${flags[@]}"} --envfd "$fd" --workdir "/proc/$pid/cwd" "$@"
+"""
+
+
+@dataclass(frozen=True)
+class _SubordinateIds:
+    """The caller's subordinate ID ranges and the tools that apply them."""
+
+    uid: tuple[int, int]  # (first id, count)
+    gid: tuple[int, int]
+    unshare: str
+    newuidmap: str
+    newgidmap: str
+    nsenter: str
+
+
+def _subordinate_range(path: str, names: set[str]) -> tuple[int, int] | None:
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        fields = line.strip().split(":")
+        if len(fields) == 3 and fields[0] in names and fields[1].isdigit() and fields[2].isdigit():
+            if int(fields[2]) >= _SUBORDINATE_ID_MINIMUM:
+                return int(fields[1]), int(fields[2])
+    return None
+
+
+def _subordinate_ids() -> _SubordinateIds | None:
+    """The caller's subordinate ID ranges, or ``None`` when sandboxes cannot be mapped from them."""
+    if os.geteuid() == 0:
+        return None
+    tools = {name: shutil.which(name) for name in ("unshare", "newuidmap", "newgidmap", "nsenter")}
+    if not all(tools.values()):
+        return None
+    names = {str(os.getuid())}
+    with contextlib.suppress(KeyError):
+        names.add(pwd.getpwuid(os.getuid()).pw_name)
+    uid, gid = _subordinate_range("/etc/subuid", names), _subordinate_range("/etc/subgid", names)
+    if uid is None or gid is None:
+        return None
+    return _SubordinateIds(uid=uid, gid=gid, **tools)
+
+
+def _manages_rootfs(binary: str, argv: list[str]) -> bool:
+    """Whether ``argv`` (possibly behind a launcher prefix) creates, starts or removes a rootfs."""
+    return any(argv[i] == binary and argv[i + 1] in _ROOTFS_COMMANDS for i in range(len(argv) - 1))
+
+
+def _namespaces_not_shared(pid: int) -> tuple[str, ...] | None:
+    """Names of the ``/proc/<pid>/ns`` entries that differ from this process's, or ``None`` if unreadable.
+
+    ``None`` keeps ``enroot exec``: an init whose namespaces cannot be read is never
+    entered without Enroot's own user-namespace handling.
+    """
+    differ = []
+    try:
+        for name in ("user", *(ns for ns, _ in _EXEC_NAMESPACE_FLAGS)):
+            if os.readlink(f"/proc/{pid}/ns/{name}") != os.readlink(f"/proc/self/ns/{name}"):
+                differ.append(name)
+    except OSError:
+        return None
+    return tuple(differ)
+
+
+def _exec_argv(
+    binary: str,
+    pid: int,
+    entered: tuple[str, ...] | None,
+    flags: list[str],
+    command: list[str],
+    user_nsenter: str | None = None,
+) -> list[str]:
+    """``enroot exec`` argv, or its no-emulation equivalent for a sandbox with real credentials.
+
+    ``user_nsenter`` names the ``nsenter`` that joins a sandbox's own mapped user
+    namespace; without it an init in another user namespace keeps ``enroot exec``.
+    """
+    if entered is None or ("user" in entered and user_nsenter is None):
+        return [binary, "exec", *flags, str(pid), *command]
+    if len(flags) % 2 or any(flag != "-e" for flag in flags[::2]):
+        raise ValueError(f"exec options other than -e NAME cannot enter without Enroot's emulation: {flags}")
+    names = flags[1::2]
+    nsenter = str(Path(binary).parent / "enroot-nsenter")
+    ns_flags = [flag for ns, flag in _EXEC_NAMESPACE_FLAGS if ns in entered]
+    argv = [
+        "/bin/bash",
+        "-c",
+        _SHARED_USER_NAMESPACE_EXEC,
+        "enroot-exec",
+        nsenter,
+        str(pid),
+        *names,
+        "--",
+        *ns_flags,
+        "--",
+        *command,
+    ]
+    if "user" in entered:
+        argv = [str(user_nsenter), "--target", str(pid), "--user", "--", *argv]
+    return argv
+
+
+def is_exec_argv(binary: str, argv: list[str]) -> bool:
+    """Whether ``argv`` is a sandbox exec built by this provider, in any form."""
+    return (len(argv) > 1 and argv[0] == binary and argv[1] == "exec") or _SHARED_USER_NAMESPACE_EXEC in argv
 
 
 def _translate_docker_uri(image: str) -> str:
@@ -377,6 +526,10 @@ class EnrootProvider:
             # defaults this to "no"; we always force it on.
             "ENROOT_UNSHARE_PID": "yes",
         }
+        self._subordinate_ids = _subordinate_ids()
+        if self._subordinate_ids is not None:
+            # Enroot runs as root of each sandbox's own mapped user namespace.
+            self._enroot_env["ENROOT_ALLOW_SUPERUSER"] = "yes"
         # Serializes concurrent imports of the same image within this process.
         self._import_locks: dict[str, asyncio.Lock] = {}
 
@@ -388,6 +541,7 @@ class EnrootProvider:
         stdin: bytes | None = None,
         capture_facts: dict[str, int | bool] | None = None,
         environment: Mapping[str, str] | None = None,
+        namespaced: bool = False,
     ) -> tuple[int, str, str]:
         """Run an enroot CLI command. Returns (return_code, stdout, stderr).
 
@@ -396,22 +550,30 @@ class EnrootProvider:
         shared semaphore. Decodes output with errors="replace". Every call runs
         with the pinned ENROOT_* environment.
         """
+        mapped = self._subordinate_ids is not None and (namespaced or _manages_rootfs(self._binary, argv))
+        if mapped:
+            if stdin is not None:
+                raise ValueError("a command run in a mapped user namespace takes no input")
+            argv = self._in_mapped_namespace(argv)
         async with self._semaphore:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 # Without explicit input the command reads EOF (like a non-interactive `docker exec`),
                 # never the worker's own stdin, which an interactive prompt would block on forever.
-                stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if stdin is not None or mapped else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
                 env={**self._enroot_env, **(environment or {})},
             )
+
+            async def complete() -> tuple[bytes, bytes]:
+                if mapped:
+                    await self._map_and_release(proc)
+                return await proc.communicate(input=stdin)
+
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(input=stdin),
-                    timeout=timeout_s,
-                )
+                stdout_b, stderr_b = await asyncio.wait_for(complete(), timeout=timeout_s)
             except asyncio.TimeoutError as e:
                 notify_exec_timeout()
                 with contextlib.suppress(ProcessLookupError):
@@ -444,15 +606,60 @@ class EnrootProvider:
         """
         out_f = tempfile.TemporaryFile()
         err_f = tempfile.TemporaryFile()
+        mapped = self._subordinate_ids is not None and _manages_rootfs(self._binary, argv)
         proc = await asyncio.create_subprocess_exec(
-            *argv,
-            stdin=asyncio.subprocess.DEVNULL,
+            *(self._in_mapped_namespace(argv) if mapped else argv),
+            stdin=asyncio.subprocess.PIPE if mapped else asyncio.subprocess.DEVNULL,
             stdout=out_f,
             stderr=err_f,
             start_new_session=True,
             env=self._enroot_env,
         )
+        if mapped:
+            try:
+                await asyncio.wait_for(self._map_and_release(proc), timeout=self._create_config.start_timeout_s)
+            except BaseException:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                raise
         return proc, out_f, err_f
+
+    def _in_mapped_namespace(self, argv: list[str]) -> list[str]:
+        """``argv`` as root of a new user namespace that the provider maps before releasing it."""
+        assert self._subordinate_ids is not None
+        return [self._subordinate_ids.unshare, "--user", "--", "/bin/sh", "-c", _MAPPED_NAMESPACE_RELEASE, "sh", *argv]
+
+    async def _map_and_release(self, proc: Any) -> None:
+        """Map the caller to 0 and its subordinate ranges to 1..N in ``proc``'s new namespace, then release it."""
+        ids = self._subordinate_ids
+        assert ids is not None
+        own = os.readlink("/proc/self/ns/user")
+        while True:
+            if proc.returncode is not None:
+                raise EnrootCreateError(f"mapped user namespace command exited early (code={proc.returncode})")
+            with contextlib.suppress(OSError):
+                if os.readlink(f"/proc/{proc.pid}/ns/user") != own:
+                    break
+            await asyncio.sleep(0.005)
+        for tool, outer, (first, count) in (
+            (ids.newgidmap, os.getegid(), ids.gid),
+            (ids.newuidmap, os.geteuid(), ids.uid),
+        ):
+            mapper = await asyncio.create_subprocess_exec(
+                tool,
+                *map(str, (proc.pid, 0, outer, 1, 1, first, count)),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _out, err = await mapper.communicate()
+            if mapper.returncode != 0:
+                raise EnrootCreateError(
+                    f"{tool} failed (code={mapper.returncode}): {err.decode(errors='replace').strip()}"
+                )
+        proc.stdin.write(b"\n")
+        await proc.stdin.drain()
+        proc.stdin.close()
 
     def _resolve_image(self, image: str) -> tuple[str | None, Path | None]:
         """Return (import_uri, sqsh_path). Exactly one is non-None.
@@ -587,6 +794,7 @@ class EnrootProvider:
 
         try:
             instance.container_pid = await self._await_container_pid(instance, err_f)
+            instance.entered_namespaces = _namespaces_not_shared(instance.container_pid)
             await self._verify_created_handle(handle)
         except Exception:
             await self._cleanup_failed_create_handle(handle)
@@ -793,15 +1001,14 @@ class EnrootProvider:
         if user is not None and not is_root:
             effective_command = f"su -s /bin/sh -c {shlex.quote(effective_command)} {shlex.quote(str(user))}"
 
-        argv = [
+        argv = _exec_argv(
             self._binary,
-            "exec",
-            *flags,
-            str(instance.container_pid),
-            self._exec_config.exec_shell,
-            "-c",
-            effective_command,
-        ]
+            instance.container_pid,
+            instance.entered_namespaces,
+            flags,
+            [self._exec_config.exec_shell, "-c", effective_command],
+            self._subordinate_ids.nsenter if self._subordinate_ids is not None else None,
+        )
         effective_timeout = timeout_s if timeout_s is not None else self._exec_config.default_timeout_s
 
         capture_facts: dict[str, int | bool] = {}
@@ -938,8 +1145,17 @@ class EnrootProvider:
         except TimeoutError as e:
             remove_error = e
 
+        if self._subordinate_ids is not None and instance.staging_dir.exists():
+            # Sandbox accounts other than root own files here; only a mapped root can remove them.
+            with contextlib.suppress(Exception):
+                await self._run(
+                    ["rm", "-rf", "--", str(instance.staging_dir)],
+                    timeout_s=self._exec_config.default_timeout_s,
+                    namespaced=True,
+                )
         try:
-            _remove_staging_dir(instance.staging_dir)
+            if instance.staging_dir.exists() or instance.staging_dir.is_symlink():
+                _remove_staging_dir(instance.staging_dir)
         except OSError as e:
             LOGGER.warning("failed to remove staging dir %s: %s", instance.staging_dir, e)
 
