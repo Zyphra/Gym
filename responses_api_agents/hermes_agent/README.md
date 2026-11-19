@@ -113,6 +113,9 @@ The serving endpoint ends an episode with an empty assistant message, `finish_re
 stop's name as `stop_reason`, before sampling (turn cap, exhausted context) or on the turn it just
 sampled (a guard). After that stop the agent answers Hermes' own retries with the same stop instead of
 sending them to the ended episode, and the run's outcome is the endpoint's stop, not a Hermes failure.
+When a compaction summary receives the stop through the auxiliary client, the primary client may
+first see the endpoint's typed `episode_terminated` refusal. The adapter treats that refusal as the
+same endpoint stop and retains the completed work for verification.
 
 Hermes replays every stored assistant turn on each request, and a rollout endpoint continues an
 episode only on the turns it served. The agent therefore replays each turn as the policy sampled
