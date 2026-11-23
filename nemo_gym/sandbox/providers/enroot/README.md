@@ -83,6 +83,14 @@ gym eval run --no-serve \
     --max-output-tokens 2048
 ```
 
+## Image imports
+
+A registry image is imported once per `sqsh_cache_dir`: concurrent creates of the same
+image, from any process sharing that directory, wait on a per-image file lock and then
+reuse the cached squashfs. An import the registry refuses with HTTP 429 (Docker Hub
+throttles bursts, including the unauthenticated permission probe Enroot sends first)
+is retried with backoff while that lock is held; any other import failure raises at once.
+
 ## Environments
 
 The `enroot` client and the container init start from the allow-listed environment of
@@ -108,6 +116,9 @@ enroot:
     rw: true
     remap_root: false
     start_timeout_s: 600
+    import_rate_limit_retries: 5        # retries of an import the registry answered with HTTP 429
+    import_rate_limit_backoff_s: 15     # first backoff; doubles per retry, jittered
+    import_rate_limit_backoff_max_s: 240
   exec:
     default_timeout_s: 180
     concurrency: 32

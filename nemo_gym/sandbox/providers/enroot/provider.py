@@ -24,10 +24,13 @@ liveness, ``#``-registry URIs, pinned ``ENROOT_*`` paths).
 
 import asyncio
 import contextlib
+import fcntl
 import hashlib
 import logging
 import os
 import posixpath
+import random
+import re
 import shlex
 import shutil
 import signal
@@ -84,6 +87,11 @@ ENROOT_MISSING_CONTAINER_MARKERS = ("does not exist", "no such", "not found")
 # than passed as enroot's REGISTRY fragment) so enroot uses its configured Hub
 # default — the real Hub registry API is registry-1.docker.io, not "docker.io".
 DOCKER_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
+# Enroot reports every failed registry request as ``URL <url> returned error code: <code>``
+# (lib/enroot/common.sh). Only 429 marks a transient throttle worth waiting out.
+ENROOT_RATE_LIMITED = re.compile(r"returned error code: 429\b")
+# Poll interval while another process on this node imports the same image.
+IMPORT_LOCK_POLL_S = 0.5
 
 
 class EnrootCreateError(SandboxCreateError):
@@ -190,6 +198,12 @@ class EnrootCreateConfig:
     bypass_entrypoint: bool = True
     init_command: str = DEFAULT_INIT_COMMAND
     import_timeout_s: float | None = 1800
+    # A registry answering HTTP 429 is throttling a burst, not refusing the image.
+    # Such an import is retried with exponential, jittered backoff while the
+    # node-wide import lock is held, so waiting sandboxes add no requests.
+    import_rate_limit_retries: int = 5
+    import_rate_limit_backoff_s: float = 15.0
+    import_rate_limit_backoff_max_s: float = 240.0
     create_timeout_s: float | None = 600
     start_timeout_s: float | None = 600
     start_poll_s: float = 0.5
@@ -204,6 +218,10 @@ class EnrootCreateConfig:
                 raise ValueError(f"create.{attr} must be > 0")
         if self.start_poll_s <= 0:
             raise ValueError("create.start_poll_s must be > 0")
+        if self.import_rate_limit_retries < 0:
+            raise ValueError("create.import_rate_limit_retries must be >= 0")
+        if not 0 < self.import_rate_limit_backoff_s <= self.import_rate_limit_backoff_max_s:
+            raise ValueError("create.import_rate_limit_backoff_s must be > 0 and <= import_rate_limit_backoff_max_s")
         if not self.mount_point.startswith("/"):
             raise ValueError("create.mount_point must be an absolute path")
 
@@ -286,6 +304,31 @@ def _translate_docker_uri(image: str) -> str:
     if sep and ("." in first or ":" in first or first == "localhost"):
         return f"docker://{first}#{rest}"
     return f"docker://{image}"
+
+
+def _is_rate_limited(stderr: str) -> bool:
+    return ENROOT_RATE_LIMITED.search(stderr) is not None
+
+
+@contextlib.asynccontextmanager
+async def _node_import_lock(path: Path):
+    """Hold an exclusive flock on ``path`` without blocking the event loop.
+
+    Providers are per sandbox and often per process, so an in-process lock does not stop
+    every concurrent sandbox on a node from importing the same image. The lock file
+    lives beside the shared squashfs cache; the kernel releases it if its holder dies.
+    """
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(IMPORT_LOCK_POLL_S)
+        yield
+    finally:
+        os.close(fd)
 
 
 def _resource_gpu_env(resources: SandboxResources) -> dict[str, str]:
@@ -479,27 +522,43 @@ class EnrootProvider:
         target = self._sqsh_cache_dir / f"{key}.sqsh"
 
         lock = self._import_locks.setdefault(key, asyncio.Lock())
-        async with lock:
+        # The in-process lock queues this provider's own creates; the node lock makes
+        # every other sandbox on the node wait for this import and then hit the cache.
+        async with lock, _node_import_lock(self._sqsh_cache_dir / f".{key}.lock"):
             if target.exists():
                 st = target.stat()
                 if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and st.st_size > 0:
                     return target
                 # Symlink, wrong owner, or zero-length: discard and re-import.
                 target.unlink(missing_ok=True)
-            # Import to a unique temp path then atomically rename so concurrent
-            # (cross-process) creates never observe a half-written squashfs.
-            tmp = self._sqsh_cache_dir / f".{key}.{uuid.uuid4().hex}.tmp"
-            argv = [self._binary, "import", "-o", str(tmp), *self._create_config.extra_import_args, import_uri]
-            try:
-                code, _out, err = await self._run(argv, timeout_s=self._create_config.import_timeout_s)
-            except TimeoutError as e:
+            cfg = self._create_config
+            for attempt in range(cfg.import_rate_limit_retries + 1):
+                # Import to a unique temp path then atomically rename so a reader
+                # never observes a half-written squashfs.
+                tmp = self._sqsh_cache_dir / f".{key}.{uuid.uuid4().hex}.tmp"
+                argv = [self._binary, "import", "-o", str(tmp), *cfg.extra_import_args, import_uri]
+                try:
+                    code, _out, err = await self._run(argv, timeout_s=cfg.import_timeout_s)
+                except TimeoutError as e:
+                    tmp.unlink(missing_ok=True)
+                    raise EnrootCreateError(f"enroot import timed out for image={image!r}: {e}") from e
+                if code == 0 and tmp.exists():
+                    os.replace(tmp, target)
+                    return target
                 tmp.unlink(missing_ok=True)
-                raise EnrootCreateError(f"enroot import timed out for image={image!r}: {e}") from e
-            if code != 0 or not tmp.exists():
-                tmp.unlink(missing_ok=True)
-                raise EnrootCreateError(f"enroot import failed (code={code}) for image={image!r}: {err.strip()}")
-            os.replace(tmp, target)
-            return target
+                if not _is_rate_limited(err) or attempt == cfg.import_rate_limit_retries:
+                    break
+                delay = min(cfg.import_rate_limit_backoff_max_s, cfg.import_rate_limit_backoff_s * 2**attempt)
+                delay *= random.uniform(0.5, 1.0)
+                LOGGER.warning(
+                    "registry rate-limited enroot import of %r (attempt %d/%d); retrying in %.0fs",
+                    image,
+                    attempt + 1,
+                    cfg.import_rate_limit_retries + 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            raise EnrootCreateError(f"enroot import failed (code={code}) for image={image!r}: {err.strip()}")
 
     async def create(self, spec: SandboxSpec) -> SandboxHandle:
         """Import/create the rootfs, launch a detached init, and return a ready handle."""
