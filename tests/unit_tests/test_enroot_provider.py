@@ -560,7 +560,7 @@ RATE_LIMITED_IMPORTS = {
     "layer": (
         _AUTHENTICATED + "[INFO] Fetching image manifest list\n[INFO] Fetching image manifest\n"
         "[INFO] Downloading 1 missing layers...\n"
-        f"[ERROR] URL {_HUB}/blobs/sha256:{'a' * 64} returned error code: 429"
+        "curl: (22) The requested URL returned error: 429"
     ),
 }
 FAST_BACKOFF = {"import_rate_limit_backoff_s": 0.001, "import_rate_limit_backoff_max_s": 0.002}

@@ -87,9 +87,10 @@ ENROOT_MISSING_CONTAINER_MARKERS = ("does not exist", "no such", "not found")
 # than passed as enroot's REGISTRY fragment) so enroot uses its configured Hub
 # default — the real Hub registry API is registry-1.docker.io, not "docker.io".
 DOCKER_HUB_HOSTS = frozenset({"docker.io", "index.docker.io", "registry-1.docker.io"})
-# Enroot reports every failed registry request as ``URL <url> returned error code: <code>``
-# (lib/enroot/common.sh). Only 429 marks a transient throttle worth waiting out.
-ENROOT_RATE_LIMITED = re.compile(r"returned error code: 429\b")
+# Enroot reports a failed registry request as ``URL <url> returned error code: <code>``
+# (common::curl), except layer downloads, where curl itself prints ``The requested URL
+# returned error: <code>``. Only 429 marks a transient throttle worth waiting out.
+ENROOT_RATE_LIMITED = re.compile(r"returned error(?: code)?: 429\b")
 # Poll interval while another process on this node imports the same image.
 IMPORT_LOCK_POLL_S = 0.5
 
@@ -201,9 +202,9 @@ class EnrootCreateConfig:
     # A registry answering HTTP 429 is throttling a burst, not refusing the image.
     # Such an import is retried with exponential, jittered backoff while the
     # node-wide import lock is held, so waiting sandboxes add no requests.
-    import_rate_limit_retries: int = 5
+    import_rate_limit_retries: int = 4
     import_rate_limit_backoff_s: float = 15.0
-    import_rate_limit_backoff_max_s: float = 240.0
+    import_rate_limit_backoff_max_s: float = 120.0
     create_timeout_s: float | None = 600
     start_timeout_s: float | None = 600
     start_poll_s: float = 0.5
