@@ -239,10 +239,13 @@ def test_stock_summary_request_goes_to_each_rollouts_own_policy(monkeypatch, tmp
     record_property("refused_streams", len(policy.refused_streams))
     assert len(summaries) == 2 and sorted(policy.refused_streams) == sorted(path for path, _ in summaries)
     for _, body in summaries:
-        # Upstream's own request: one user message, no tools and no sampling parameters, so the
-        # rollout endpoint samples it at the policy's temperature; its output budget is the run's.
-        assert [message["role"] for message in body["messages"]] == ["user"]
-        assert "TASK BEING WORKED ON" not in body["messages"][0]["content"]
+        # Upstream's own request: its instructions and the turns to summarize (one user message; since
+        # v0.23 a system message with the instructions, then the turns as one user message in legacy
+        # mode or as typed turns in lean mode), no tools and no sampling parameters, so the rollout
+        # endpoint samples it at the policy's temperature; its output budget is the run's.
+        roles = [message["role"] for message in body["messages"]]
+        assert roles == ["user"] or (roles[0] == "system" and roles[1] == "user")
+        assert not any("TASK BEING WORKED ON" in message["content"] for message in body["messages"])
         assert "tools" not in body and "tool_choice" not in body
         assert body["max_tokens"] == 8192 and "max_completion_tokens" not in body
         assert not {"temperature", "top_p", "top_k"} & body.keys()
