@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import io
 import os
 import shlex
@@ -531,6 +532,134 @@ async def test_ensure_image_import_timeout_raises(
     provider, _rec, _sr = _make_provider(monkeypatch, responder, tmp_path)
     with pytest.raises(enroot_provider.EnrootCreateError, match="timed out"):
         await provider._ensure_image("ubuntu:22.04")
+
+
+_HUB = "https://registry-1.docker.io/v2/xiaomimimo/mimo-v2.6-rl-oss"
+_DIGEST = "sha256:1e7d53594b588f114a17977d7b1931c17bb338bb36ad47b17616d7108dabe9c7"
+_AUTHENTICATED = (
+    "[INFO] Querying registry for permission grant\n"
+    "[INFO] Authenticating with user: someone\n"
+    "[INFO] Using credentials from file: /home/someone/.config/enroot/.credentials\n"
+    "[INFO] Authentication succeeded\n"
+)
+# Enroot's stderr for a 429 at each registry request of one import, as recorded by a
+# training run whose first wave imported hundreds of images at once.
+RATE_LIMITED_IMPORTS = {
+    "anonymous_probe": (
+        "[INFO] Querying registry for permission grant\n"
+        f"[ERROR] URL {_HUB}/manifests/{_DIGEST} returned error code: 429"
+    ),
+    "manifest_list": (
+        _AUTHENTICATED + "[INFO] Fetching image manifest list\n"
+        f"[ERROR] URL {_HUB}/manifests/{_DIGEST} returned error code: 429"
+    ),
+    "manifest": (
+        _AUTHENTICATED + "[INFO] Fetching image manifest list\n[INFO] Fetching image manifest\n"
+        f"[ERROR] URL {_HUB}/manifests/{_DIGEST} returned error code: 429"
+    ),
+    "layer": (
+        _AUTHENTICATED + "[INFO] Fetching image manifest list\n[INFO] Fetching image manifest\n"
+        "[INFO] Downloading 1 missing layers...\n"
+        "curl: (22) The requested URL returned error: 429"
+    ),
+}
+FAST_BACKOFF = {"import_rate_limit_backoff_s": 0.001, "import_rate_limit_backoff_max_s": 0.002}
+
+
+def _importer(failures: list[str]) -> Callable[[list[str]], tuple[int, str, str]]:
+    """Fail the first imports with the given stderr, then write the -o target."""
+    pending = list(failures)
+
+    def responder(argv: list[str]) -> tuple[int, str, str]:
+        if pending:
+            return (1, "", pending.pop(0))
+        Path(argv[argv.index("-o") + 1]).write_bytes(b"imported")
+        return (0, "", "")
+
+    return responder
+
+
+def _imports(rec: RunRecorder) -> int:
+    return sum("import" in c["argv"] for c in rec.calls)
+
+
+@pytest.mark.parametrize("stderr", RATE_LIMITED_IMPORTS.values(), ids=RATE_LIMITED_IMPORTS.keys())
+async def test_ensure_image_retries_registry_rate_limit(
+    stderr: str, fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider, rec, _sr = _make_provider(monkeypatch, _importer([stderr, stderr]), tmp_path, create=FAST_BACKOFF)
+    image = f"docker.io/xiaomimimo/mimo-v2.6-rl-oss@{_DIGEST}"
+    target = await provider._ensure_image(image)
+    assert target.read_bytes() == b"imported"
+    assert _imports(rec) == 3
+    assert rec.calls[-1]["argv"][-1] == f"docker://xiaomimimo/mimo-v2.6-rl-oss@{_DIGEST}"
+    assert not list(target.parent.glob("*.tmp"))
+
+
+async def test_ensure_image_rate_limit_retries_are_bounded(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stderr = RATE_LIMITED_IMPORTS["anonymous_probe"]
+    provider, rec, _sr = _make_provider(
+        monkeypatch,
+        _importer([stderr] * 10),
+        tmp_path,
+        create={**FAST_BACKOFF, "import_rate_limit_retries": 2},
+    )
+    with pytest.raises(enroot_provider.EnrootCreateError, match="returned error code: 429"):
+        await provider._ensure_image("ubuntu:22.04")
+    assert _imports(rec) == 3
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        f"[INFO] Querying registry for permission grant\n[ERROR] URL {_HUB}/manifests/{_DIGEST} returned error code: 404",
+        "[ERROR] URL https://example.test/v2/x/manifests/latest returned error code: 4290",
+        "pull denied",
+    ],
+)
+async def test_ensure_image_other_failures_are_not_retried(
+    stderr: str, fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider, rec, _sr = _make_provider(monkeypatch, _importer([stderr]), tmp_path, create=FAST_BACKOFF)
+    with pytest.raises(enroot_provider.EnrootCreateError, match="import failed"):
+        await provider._ensure_image("ubuntu:22.04")
+    assert _imports(rec) == 1
+
+
+async def test_ensure_image_imports_once_per_node_across_providers(
+    fake_binary: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Sandboxes own separate providers; one shared cache must still import an image once."""
+    imports: list[list[str]] = []
+
+    async def slow_import(argv: list[str], *, timeout_s: float | None, stdin: bytes | None = None):
+        imports.append(list(argv))
+        await asyncio.sleep(0.05)
+        Path(argv[argv.index("-o") + 1]).write_bytes(b"imported")
+        return (0, "", "")
+
+    cache = {"sqsh_cache_dir": str(tmp_path / "sqsh")}
+    providers = []
+    for index in range(4):
+        provider, _rec, _sr = _make_provider(
+            monkeypatch, lambda argv: (0, "", ""), tmp_path / str(index), create=cache
+        )
+        monkeypatch.setattr(provider, "_run", slow_import)
+        providers.append(provider)
+    targets = await asyncio.gather(*(p._ensure_image("ubuntu:22.04") for p in providers))
+    assert len(imports) == 1
+    assert len(set(targets)) == 1 and targets[0].read_bytes() == b"imported"
+
+
+def test_rate_limit_backoff_config_validated() -> None:
+    with pytest.raises(ValueError, match="import_rate_limit_retries"):
+        enroot_provider.EnrootCreateConfig(import_rate_limit_retries=-1)
+    with pytest.raises(ValueError, match="import_rate_limit_backoff_s"):
+        enroot_provider.EnrootCreateConfig(import_rate_limit_backoff_s=0)
+    with pytest.raises(ValueError, match="import_rate_limit_backoff_s"):
+        enroot_provider.EnrootCreateConfig(import_rate_limit_backoff_s=10, import_rate_limit_backoff_max_s=5)
 
 
 # --------------------------------------------------------------------------- #
