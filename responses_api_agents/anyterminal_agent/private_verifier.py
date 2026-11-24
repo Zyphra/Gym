@@ -44,6 +44,7 @@ import ctypes
 import hashlib
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -59,6 +60,10 @@ SETUP_FAILED = 125
 # Inline outputs keep the report well under a provider's 1 MiB exec output capture.
 INLINE_FILE_BYTES = 64 * 1024
 INLINE_TOTAL_BYTES = 384 * 1024
+# What a command stopped by its timeout had written is copied out within these bounds, inside the
+# provider's grace period between SIGTERM and SIGKILL.
+UNADMITTED_BYTES = 64 << 20
+UNADMITTED_SECONDS = 10.0
 
 CLONE_NEWNS = 0x00020000
 MS_NOSUID, MS_NODEV, MS_BIND, MS_REC, MS_PRIVATE = 0x2, 0x4, 0x1000, 0x4000, 0x40000
@@ -315,20 +320,58 @@ def collect(shared: int | None) -> dict:
     return {"files": files, "links": links, "problems": problems}
 
 
+class _Terminated(Exception):
+    """SIGTERM arrived while the command ran."""
+
+
+def _terminated(signum, frame) -> None:
+    raise _Terminated
+
+
+def keep_unfinished(shared: int) -> None:
+    """Copy the regular files the stopped command wrote into the shared directory, within bounds.
+
+    Links and other special files are neither followed nor copied. The host never grades these.
+    """
+    deadline = time.monotonic() + UNADMITTED_SECONDS
+    left = UNADMITTED_BYTES
+    for root, directories, names in os.walk(VERIFIER_DIR):
+        directories.sort()
+        for name in sorted(names):
+            if time.monotonic() > deadline:
+                return
+            path = os.path.join(root, name)
+            try:
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > left:
+                    continue
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                with os.fdopen(fd, "rb") as stream:
+                    data = stream.read(left + 1)
+                if len(data) > left:
+                    continue
+                _copy_out(shared, os.path.relpath(path, VERIFIER_DIR), data, stat.S_IMODE(info.st_mode))
+                left -= len(data)
+            except OSError:
+                continue
+
+
 def main(argv: list[str]) -> int:
     if len(argv) == 2 and argv[0] == "--scan-startup":
         sys.stdout.write(json.dumps(startup_files(argv[1]), sort_keys=True))
         return 0
-    tests = startup = None
-    while len(argv) > 1 and argv[0] in ("--tests", "--startup"):
+    tests = startup = snapshot_after = None
+    while len(argv) > 1 and argv[0] in ("--tests", "--startup", "--snapshot-after"):
         if argv[0] == "--tests":
             tests, argv = (argv[1], argv[2]), argv[3:]
+        elif argv[0] == "--snapshot-after":
+            snapshot_after, argv = float(argv[1]), argv[2:]
         else:
             startup, argv = (argv[1], argv[2], argv[3]), argv[4:]
     if len(argv) != 1:
         print(
-            "usage: private_verifier.py [--tests SOURCE SHA256] [--startup BASELINE SHA256 WORKDIR] COMMAND"
-            " | --scan-startup WORKDIR",
+            "usage: private_verifier.py [--tests SOURCE SHA256] [--startup BASELINE SHA256 WORKDIR]"
+            " [--snapshot-after SECONDS] COMMAND | --scan-startup WORKDIR",
             file=sys.stderr,
         )
         return SETUP_FAILED
@@ -348,16 +391,35 @@ def main(argv: list[str]) -> int:
         return SETUP_FAILED
     report["setup_s"] = round(time.monotonic() - started, 4)
     command_started = time.monotonic()
-    # The command's output must not mix with the report on stdout.
-    status = subprocess.call(["/bin/sh", "-c", argv[0]], stdin=subprocess.DEVNULL, stdout=2, stderr=2, env=env)
-    report["command_s"] = round(time.monotonic() - command_started, 4)
-    report["exit_code"] = status if status >= 0 else 128 - status
-    report["integrity"] = [f"private {path} was detached during the command" for path in detached(mounts)]
-    collect_started = time.monotonic()
-    report.update(collect(shared))
-    report["collect_s"] = round(time.monotonic() - collect_started, 4)
-    sys.stdout.write(MARKER + json.dumps(report) + "\n")
-    sys.stdout.flush()
+    # Until the report is out, a SIGTERM (the provider's timeout) leaves the outputs, not a report.
+    signal.signal(signal.SIGTERM, _terminated)
+    process = None
+    try:
+        # The command's output must not mix with the report on stdout.
+        process = subprocess.Popen(["/bin/sh", "-c", argv[0]], stdin=subprocess.DEVNULL, stdout=2, stderr=2, env=env)
+        try:
+            status = process.wait(timeout=snapshot_after)
+        except subprocess.TimeoutExpired:
+            # Near the host's timeout, a provider that kills without a grace period leaves no
+            # chance later: copy what the command wrote so far and let it run on.
+            keep_unfinished(shared)
+            status = process.wait()
+        report["command_s"] = round(time.monotonic() - command_started, 4)
+        report["exit_code"] = status if status >= 0 else 128 - status
+        report["integrity"] = [f"private {path} was detached during the command" for path in detached(mounts)]
+        collect_started = time.monotonic()
+        report.update(collect(shared))
+        report["collect_s"] = round(time.monotonic() - collect_started, 4)
+        sys.stdout.write(MARKER + json.dumps(report) + "\n")
+        sys.stdout.flush()
+    except _Terminated:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if process is not None and process.poll() is None:
+            process.kill()
+        # This namespace and its private directory remain until this program exits.
+        keep_unfinished(shared)
+        return 128 + signal.SIGTERM
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     return 0
 
 
