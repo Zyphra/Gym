@@ -2065,6 +2065,82 @@ class TestProcessSingleDatapoint:
         assert metrics["mask_sample"] is True
         sandbox.stop.assert_awaited_once()
 
+    async def test_verifier_timeout_keeps_its_outputs_unadmitted_and_ungraded(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+        extraction = b'{"answers": ["partial"]}'
+
+        async def exec_(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                # What the private verifier copies out when the exec timeout stops it.
+                (cfg.sandbox_verifier_dir / "judge-details.extraction.json").write_bytes(extraction)
+                (cfg.sandbox_verifier_dir / "reward.txt").write_text("1")
+                return _sandbox_result(return_code=-1, error_type="timeout")
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=exec_), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                assert await RunTerminalAgent(config=cfg).process_single_datapoint() is False
+
+        metrics = json.loads(cfg.metrics_fpath.read_text())
+        assert metrics["container_timed_out"] is True and metrics["verifier_error_type"] == "timeout"
+        assert metrics["mask_sample"] is True and metrics["resolved"] is False
+        assert metrics.get("verifier_reward") is None
+        assert not (cfg.verifier_dir / "reward.txt").exists()  # nothing reached the admitted outputs
+        kept = cfg.verifier_dir / app.UNADMITTED_VERIFIER_DIR
+        assert (kept / "files" / "judge-details.extraction.json").read_bytes() == extraction
+        receipt = json.loads((kept / "receipt.json").read_text())
+        assert receipt["admitted"] is False and receipt["reason"] == "verifier exec timeout"
+        assert {entry["path"]: (entry["size"], entry["sha256"]) for entry in receipt["files"]} == {
+            "judge-details.extraction.json": (len(extraction), hashlib.sha256(extraction).hexdigest()),
+            "reward.txt": (1, hashlib.sha256(b"1").hexdigest()),
+        }
+        assert not cfg.sandbox_verifier_dir.exists()
+
+    async def test_an_admitted_verifier_keeps_nothing_unadmitted(self, tmp_path: Path) -> None:
+        cfg = _make_instance_config(tmp_path)
+
+        async def exec_(command, **kwargs):
+            if "bash /tests/test.sh" in command:
+                (cfg.sandbox_verifier_dir / "pytest.log").write_text("copied out with its digest")
+                (cfg.verifier_dir / "reward.txt").write_text("1")
+                (cfg.verifier_dir / app.PRIVATE_VERIFIER_RECEIPT).write_text("{}")
+            return _sandbox_result()
+
+        sandbox = SimpleNamespace(start=AsyncMock(), exec=AsyncMock(side_effect=exec_), stop=AsyncMock())
+        with patch("responses_api_agents.anyterminal_agent.app.AsyncSandbox", return_value=sandbox):
+            with patch.object(RunTerminalAgent, "_stage_tests", new=AsyncMock(return_value=None)):
+                assert await RunTerminalAgent(config=cfg).process_single_datapoint() is True
+        assert not (cfg.verifier_dir / app.UNADMITTED_VERIFIER_DIR).exists()
+
+
+def test_unadmitted_verifier_output_is_bounded_and_never_follows_links(tmp_path: Path) -> None:
+    cfg = _make_instance_config(tmp_path, unadmitted_verifier_max_bytes=1024)
+    shared = cfg.sandbox_verifier_dir
+    (shared / "nested").mkdir(parents=True)
+    (shared / "nested" / "small.json").write_bytes(b"{}")
+    (shared / "large.log").write_bytes(b"x" * 1025)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_text("host file")
+    (shared / "secret-link").symlink_to(outside / "secret")
+    (shared / "dir-link").symlink_to(outside)
+    os.mkfifo(shared / "pipe")
+
+    receipt = app._keep_unadmitted_outputs(cfg, "verifier exec timeout")
+
+    kept = cfg.verifier_dir / app.UNADMITTED_VERIFIER_DIR / "files"
+    assert sorted(str(path.relative_to(kept)) for path in kept.rglob("*")) == ["nested", "nested/small.json"]
+    assert [entry["path"] for entry in receipt["files"]] == ["nested/small.json"]
+    assert {entry["path"]: entry["reason"] for entry in receipt["skipped"]} == {
+        "dir-link": "symlink not followed",
+        "large.log": "byte limit",
+        "pipe": "not a regular file",
+        "secret-link": "symlink not followed",
+    }
+    assert receipt["bytes"] == 2 and receipt["error"] is None
+    assert json.loads((kept.parent / "receipt.json").read_text()) == receipt
+
 
 # ── RunTerminalAgent._stage_tests ────────────────────────────────────────────────
 

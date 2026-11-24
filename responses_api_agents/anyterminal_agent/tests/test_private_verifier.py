@@ -210,6 +210,47 @@ def test_a_left_behind_writer_cannot_change_the_reported_reward(tmp_path):
 
 
 @pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
+def test_a_command_stopped_by_its_timeout_leaves_its_outputs_but_no_report(tmp_path, monkeypatch):
+    shared = tmp_path / "logs-verifier"
+    shared.mkdir()
+    started = tmp_path / "started"
+    driver = textwrap.dedent(
+        """
+        import runpy, sys
+        module = runpy.run_path(sys.argv[1], run_name="private_verifier")
+        module["main"].__globals__["VERIFIER_DIR"] = sys.argv[2]
+        module["main"].__globals__["UNADMITTED_BYTES"] = 1024
+        raise SystemExit(module["main"](sys.argv[3:]))
+        """
+    )
+    command = (
+        f'mkdir -p "{shared}/rubrics" && printf partial > "{shared}/rubrics/extraction.json" && '
+        f'head -c 2048 /dev/zero > "{shared}/large.log" && ln -s /etc/hostname "{shared}/link" && '
+        f'touch "{started}" && exec sleep 60'
+    )
+    helper = subprocess.Popen(
+        ["unshare", "-rm", sys.executable, "-I", "-S", "-c", driver, str(HELPER), str(shared), command],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 30
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert started.exists()
+        helper.terminate()  # what the provider's exec timeout sends first
+        stdout, stderr = helper.communicate(timeout=30)
+    finally:
+        helper.kill()
+    assert helper.returncode == 128 + 15, stderr
+    assert private_verifier.MARKER not in stdout  # nothing the host could grade
+    assert (shared / "rubrics" / "extraction.json").read_text() == "partial"
+    assert not (shared / "large.log").exists()  # beyond the bound
+    assert not (shared / "link").exists() and not (shared / "link").is_symlink()
+
+
+@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
 def test_setup_failure_is_reported_and_the_command_never_runs(tmp_path):
     marker = tmp_path / "ran"
     (tmp_path / "file").write_text("")
