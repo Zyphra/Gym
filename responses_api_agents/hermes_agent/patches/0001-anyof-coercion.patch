@@ -1,0 +1,20 @@
+--- a/tools/arg_coercion.py	2026-11-11 13:24:06.311483579 +0000
++++ b/tools/arg_coercion.py	2026-11-11 13:24:18.782601804 +0000
+@@ -43,6 +43,17 @@
+             continue
+         prop_schema = resolve_local_schema_ref(prop_schema, parameters)
+         expected = prop_schema.get("type")
++        if expected is None:
++            # A union written as anyOf/oneOf has no top-level "type" (terminal.notify is
++            # boolean | array of string): coerce against its non-null branch types, in order.
++            branch_types = [
++                branch["type"]
++                for union_key in ("anyOf", "oneOf")
++                for branch in (prop_schema.get(union_key) or [])
++                if isinstance(branch, dict) and isinstance(branch.get("type"), str) and branch["type"] != "null"
++            ]
++            # A string already satisfies a union with a string branch: leave it as sent.
++            expected = None if "string" in branch_types else (branch_types or None)
+         is_container = isinstance(value, (list, tuple))
+ 
+         # Bare non-list value for an array schema. Strings go through

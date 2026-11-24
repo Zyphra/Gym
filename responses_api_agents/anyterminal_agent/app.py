@@ -482,7 +482,8 @@ class GymAgentHarnessProcessor(BaseModel):
         shared = self._parent / "setup_scripts" / "_portable_python.sh"
         reqs = agent_dir / "requirements.txt"
 
-        recipe_src = b"".join(p.read_bytes() for p in (script, shared, reqs) if p.exists()) or b"no-script"
+        patches = sorted((agent_dir / "patches").glob("*.patch"))
+        recipe_src = b"".join(p.read_bytes() for p in (script, shared, reqs, *patches) if p.exists()) or b"no-script"
         recipe = hashlib.sha256(recipe_src).hexdigest()
         if sentinel.exists() and sentinel.read_text().strip() == recipe:
             print(f"Agent deps already at {deps_dir}", flush=True)
