@@ -3,10 +3,12 @@
 """A process left in the sandbox cannot reach the directory the reward is read from."""
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -209,10 +211,10 @@ def test_a_left_behind_writer_cannot_change_the_reported_reward(tmp_path):
     assert not (shared / "reward.txt").exists()  # the writer never saw the reward file
 
 
-@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
-def test_a_command_stopped_by_its_timeout_leaves_its_outputs_but_no_report(tmp_path, monkeypatch):
+def _start_unfinished_verifier(tmp_path: Path, *options: str) -> tuple[subprocess.Popen, Path]:
+    """The real helper running a command that wrote outputs and then hangs, in its own process group."""
     shared = tmp_path / "logs-verifier"
-    shared.mkdir()
+    shared.mkdir(parents=True)
     started = tmp_path / "started"
     driver = textwrap.dedent(
         """
@@ -226,28 +228,58 @@ def test_a_command_stopped_by_its_timeout_leaves_its_outputs_but_no_report(tmp_p
     command = (
         f'mkdir -p "{shared}/rubrics" && printf partial > "{shared}/rubrics/extraction.json" && '
         f'head -c 2048 /dev/zero > "{shared}/large.log" && ln -s /etc/hostname "{shared}/link" && '
-        f'touch "{started}" && exec sleep 60'
+        f'touch "{started}" && sleep 60'
     )
     helper = subprocess.Popen(
-        ["unshare", "-rm", sys.executable, "-I", "-S", "-c", driver, str(HELPER), str(shared), command],
+        ["unshare", "-rm", sys.executable, "-I", "-S", "-c", driver, str(HELPER), str(shared), *options, command],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
-    try:
-        deadline = time.monotonic() + 30
-        while not started.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert started.exists()
-        helper.terminate()  # what the provider's exec timeout sends first
-        stdout, stderr = helper.communicate(timeout=30)
-    finally:
-        helper.kill()
-    assert helper.returncode == 128 + 15, stderr
-    assert private_verifier.MARKER not in stdout  # nothing the host could grade
+    deadline = time.monotonic() + 30
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+    return helper, shared
+
+
+def _assert_kept_within_bounds(shared: Path) -> None:
     assert (shared / "rubrics" / "extraction.json").read_text() == "partial"
     assert not (shared / "large.log").exists()  # beyond the bound
     assert not (shared / "link").exists() and not (shared / "link").is_symlink()
+
+
+@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
+def test_a_command_stopped_by_its_timeout_leaves_its_outputs_but_no_report(tmp_path):
+    # The provider's timeout signals the whole group, so the command may end before the helper
+    # handles its own SIGTERM; either order must leave the outputs and no report.
+    for attempt in range(20):
+        helper, shared = _start_unfinished_verifier(tmp_path / str(attempt))
+        try:
+            os.killpg(helper.pid, signal.SIGTERM)
+            stdout, stderr = helper.communicate(timeout=30)
+        finally:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(helper.pid, signal.SIGKILL)
+        assert helper.returncode == 128 + signal.SIGTERM, stderr
+        assert private_verifier.MARKER not in stdout  # nothing the host could grade
+        _assert_kept_within_bounds(shared)
+
+
+@pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")
+def test_outputs_are_copied_before_a_timeout_that_kills_without_grace(tmp_path):
+    helper, shared = _start_unfinished_verifier(tmp_path, "--snapshot-after", "0.2")
+    try:
+        deadline = time.monotonic() + 30
+        while not (shared / "rubrics" / "extraction.json").exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert helper.poll() is None  # the command runs on after the copy
+    finally:
+        os.killpg(helper.pid, signal.SIGKILL)  # what a provider without a grace period does
+        stdout, _ = helper.communicate(timeout=30)
+    assert private_verifier.MARKER not in stdout
+    _assert_kept_within_bounds(shared)
 
 
 @pytest.mark.skipif(not _namespaces_available(), reason="needs unprivileged user and mount namespaces")

@@ -15,6 +15,7 @@ import asyncio
 import base64
 import hashlib
 import importlib
+import itertools
 import json
 import math
 import os
@@ -939,15 +940,27 @@ STAGED_TESTS = "/trajectories_mount/staging/tests"
 
 
 STARTUP_BASELINE = "/trajectories_mount/staging/startup-baseline.json"
+# How long before the verifier exec's timeout the private helper copies what test.sh wrote so far.
+UNADMITTED_SNAPSHOT_MARGIN_S = 30.0
 
 
 def _private_verifier_command(
-    command: str, tests_manifest_sha256: Optional[str] = None, startup: Optional[tuple[str, str]] = None
+    command: str,
+    tests_manifest_sha256: Optional[str] = None,
+    startup: Optional[tuple[str, str]] = None,
+    timeout_s: Optional[float] = None,
 ) -> str:
-    """``startup`` is the sha256 of the startup baseline and the task's working directory."""
+    """``startup`` is the sha256 of the startup baseline and the task's working directory.
+
+    With the exec's ``timeout_s`` the helper copies what the command wrote so far into the shared
+    directory shortly before it, so a provider that kills without a grace period still leaves the
+    outputs of a timed-out verifier (kept unadmitted, never graded).
+    """
     tests = "" if tests_manifest_sha256 is None else f"--tests {STAGED_TESTS} {tests_manifest_sha256} "
     if startup is not None:
         tests += f"--startup {STARTUP_BASELINE} {startup[0]} {shlex.quote(startup[1])} "
+    if timeout_s is not None:
+        tests += f"--snapshot-after {timeout_s - min(UNADMITTED_SNAPSHOT_MARGIN_S, timeout_s / 10):g} "
     return f"{PRIVATE_VERIFIER_PYTHON} -I -S {PRIVATE_VERIFIER} {tests}{shlex.quote(command)}"
 
 
@@ -1055,7 +1068,13 @@ def _write_private_outputs(stdout: Optional[str], return_code: Optional[int], cf
 
 UNADMITTED_VERIFIER_DIR = "unadmitted"
 UNADMITTED_VERIFIER_MAX_FILES = 1000
+UNADMITTED_VERIFIER_MAX_ENTRIES = 10000
 UNADMITTED_VERIFIER_MAX_DEPTH = 16
+UNADMITTED_VERIFIER_RECORDED_SKIPS = 128
+
+
+class _UnadmittedEntryLimit(Exception):
+    """The shared verifier directory holds more entries than are walked."""
 
 
 def _keep_unadmitted_outputs(cfg: AnyTerminalInstanceConfig, reason: str) -> Optional[dict]:
@@ -1064,26 +1083,38 @@ def _keep_unadmitted_outputs(cfg: AnyTerminalInstanceConfig, reason: str) -> Opt
     Call only after the sandbox stopped. The copy goes to ``verifier/unadmitted/files`` with
     ``verifier/unadmitted/receipt.json``, apart from the admitted outputs: any sandbox process could
     have written the shared directory, so nothing here is a grade. Regular files only, within
-    ``unadmitted_verifier_max_bytes`` and the file and depth limits; links are recorded, not followed.
+    ``unadmitted_verifier_max_bytes`` and the file, entry and depth limits; links are recorded,
+    not followed.
     """
     files: list[dict] = []
     skipped: list[dict] = []
     left = cfg.unadmitted_verifier_max_bytes
+    entries_left = UNADMITTED_VERIFIER_MAX_ENTRIES
     target = cfg.verifier_dir / UNADMITTED_VERIFIER_DIR
+    skipped_count = 0
+
+    def skip(entry: dict) -> None:
+        nonlocal skipped_count
+        skipped_count += 1
+        if len(skipped) < UNADMITTED_VERIFIER_RECORDED_SKIPS:
+            skipped.append(entry)
 
     def walk(directory: int, prefix: list[str]) -> None:
-        nonlocal left
+        nonlocal left, entries_left
         with os.scandir(directory) as entries:
-            names = sorted(entry.name for entry in entries)
+            names = sorted(itertools.islice((entry.name for entry in entries), entries_left + 1))
         for name in names:
+            if entries_left <= 0:
+                raise _UnadmittedEntryLimit
+            entries_left -= 1
             parts = prefix + [name]
             relative = "/".join(parts)
             info = os.stat(name, dir_fd=directory, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
-                skipped.append({"path": relative, "reason": "symlink not followed"})
+                skip({"path": relative, "reason": "symlink not followed"})
             elif stat.S_ISDIR(info.st_mode):
                 if len(parts) >= UNADMITTED_VERIFIER_MAX_DEPTH:
-                    skipped.append({"path": relative, "reason": "directory deeper than the limit"})
+                    skip({"path": relative, "reason": "directory deeper than the limit"})
                     continue
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
                 try:
@@ -1091,18 +1122,18 @@ def _keep_unadmitted_outputs(cfg: AnyTerminalInstanceConfig, reason: str) -> Opt
                 finally:
                     os.close(child)
             elif not stat.S_ISREG(info.st_mode):
-                skipped.append({"path": relative, "reason": "not a regular file"})
+                skip({"path": relative, "reason": "not a regular file"})
             elif len(files) >= UNADMITTED_VERIFIER_MAX_FILES:
-                skipped.append({"path": relative, "size": info.st_size, "reason": "file count limit"})
+                skip({"path": relative, "size": info.st_size, "reason": "file count limit"})
             else:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
                 with os.fdopen(fd, "rb") as stream:
                     # The entry could have been swapped for a FIFO or device since it was listed.
                     data = stream.read(left + 1) if stat.S_ISREG(os.fstat(stream.fileno()).st_mode) else None
                 if data is None:
-                    skipped.append({"path": relative, "reason": "not a regular file"})
+                    skip({"path": relative, "reason": "not a regular file"})
                 elif len(data) > left:
-                    skipped.append({"path": relative, "size": info.st_size, "reason": "byte limit"})
+                    skip({"path": relative, "size": info.st_size, "reason": "byte limit"})
                 else:
                     left -= len(data)
                     out = _open_beneath(
@@ -1131,6 +1162,8 @@ def _keep_unadmitted_outputs(cfg: AnyTerminalInstanceConfig, reason: str) -> Opt
         error = None
         try:
             walk(source, [])
+        except _UnadmittedEntryLimit:
+            error = f"stopped after {UNADMITTED_VERIFIER_MAX_ENTRIES} entries"
         except OSError as e:
             error = f"{type(e).__name__}: {e}"[:500]
     finally:
@@ -1144,6 +1177,7 @@ def _keep_unadmitted_outputs(cfg: AnyTerminalInstanceConfig, reason: str) -> Opt
         "bytes": sum(entry["size"] for entry in files),
         "files": files,
         "skipped": skipped,
+        "skipped_count": skipped_count,
         "error": error,
     }
     (target / "receipt.json").write_text(json.dumps(receipt))
@@ -1898,7 +1932,7 @@ class RunTerminalAgent(BaseModel):
             # Agent processes may outlive the agent phase to serve the tests; none of them
             # sees the directory test.sh writes its reward into or the tests it runs.
             command = _private_verifier_command(
-                command, self._write_tests_manifest(cfg), self._write_startup_baseline(cfg)
+                command, self._write_tests_manifest(cfg), self._write_startup_baseline(cfg), cfg.tb_eval_timeout
             )
         result = await self._exec_verifier(sandbox, command, timeout_s=cfg.tb_eval_timeout, env=verifier_env)
         return_code = result.return_code
